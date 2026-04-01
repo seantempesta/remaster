@@ -612,6 +612,19 @@ def _run_profile(
         else:
             psnr_db = float("inf")
 
+    # Save sample frames to volume for visual quality inspection
+    sample_dir = f"{VOL_MOUNT}/samples"
+    os.makedirs(sample_dir, exist_ok=True)
+    if first_output is not None:
+        import cv2
+        tag = f"{gpu_name}_bs{batch_size}"
+        cv2.imwrite(f"{sample_dir}/{tag}_input.png", cv2.cvtColor(first_input, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(f"{sample_dir}/{tag}_output.png", cv2.cvtColor(first_output, cv2.COLOR_RGB2BGR))
+        # Side-by-side (input | output)
+        side_by_side = np.concatenate([first_input, first_output], axis=1)
+        cv2.imwrite(f"{sample_dir}/{tag}_compare.png", cv2.cvtColor(side_by_side, cv2.COLOR_RGB2BGR))
+        print(f"Saved sample frames to {sample_dir}/{tag}_*.png")
+
     # Cost estimate: 61K frames for a Firefly episode
     cost_ep = 61000 / fps / 3600 * gpu_hourly_rate if fps > 0 else 999.0
 
@@ -753,5 +766,20 @@ def main(
         raise ValueError(f"Unsupported GPU: {gpu}. Choose from: {list(gpu_funcs.keys())}")
 
     result = fn.remote(**kwargs)
+
+    # Download sample images for visual inspection
+    tag = f"{gpu}_bs{batch_size}"
+    sample_dir = pathlib.Path("bench/speed-opt/samples")
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    for suffix in ["input", "output", "compare"]:
+        vol_path = f"/samples/{tag}_{suffix}.png"
+        local_path = sample_dir / f"{tag}_{suffix}.png"
+        try:
+            with open(local_path, "wb") as f:
+                for chunk in vol.read_file(vol_path):
+                    f.write(chunk)
+            print(f"  Downloaded {local_path}")
+        except Exception:
+            pass  # sample may not exist if run crashed
 
     print(f"\nDone. Result: {result}")
