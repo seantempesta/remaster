@@ -4,3 +4,4 @@ baseline	0.78	3.2	39.61	$17.38	L4	1	keep	eager + bs=1 + L4
 -	2.56	2.0	39.61	$5.29	L4	1	keep	compile(reduce-overhead) + bs=1 + L4 + channels_last + cudnn.bench
 -	2.21	2.0	39.61	$6.14	L4	1	discard	compile(reduce-overhead) + bs=1 + L4 (no channels_last)
 -	12.43	2.0	39.61	$3.79	A100	1	keep	compile(reduce-overhead) + bs=1 + A100 + channels_last + cudnn.bench
+-	10.91	14.3	39.61	$4.32	A100	8	discard	compile(reduce-overhead) + bs=8 + A100 (steady-state 13.4 but warmup recompile dragged avg down)
