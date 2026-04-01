@@ -7,20 +7,22 @@ Maximize NAFNet-width64 inference fps at 1080p on Modal while maintaining qualit
 ## How to Run an Experiment
 
 1. Read `bench/speed-opt/results.tsv` — understand what's been tried and what the current best is
-2. **Do web research FIRST** before trying anything new. Use WebSearch/WebFetch to look up:
+2. Read `bench/speed-opt/research.md` — check what previous agents have already researched
+3. **Do web research FIRST** before trying anything new. Use WebSearch/WebFetch to look up:
    - Current best practices for the optimization you're attempting (e.g. "torch_tensorrt NAFNet CNN inference optimization 2025")
    - Known issues and compatibility problems (e.g. "torch_tensorrt custom LayerNorm ONNX export")
    - Benchmark data from others doing similar work
    - Do NOT guess from memory — APIs change, versions matter, and wrong assumptions waste expensive GPU time
-3. **Think hard** about the best next experiment. Consider:
+   - **Write your findings to `bench/speed-opt/research.md`** — append a dated section with what you learned, links, and conclusions. Future agents depend on this.
+4. **Think hard** about the best next experiment. Consider:
    - What is the current bottleneck? (memory bandwidth? compute? batch utilization? GPU choice?)
    - What does the data suggest? (e.g. if peak VRAM is 2 GB on a 40 GB GPU, increase batch size!)
    - Don't just increment one variable — make the smartest move given ALL available information
-4. Run: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_profile.py [flags]`
-5. Verify results from Modal logs: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal app list` then `... -m modal app logs <app-id>`
-6. Record results in `bench/speed-opt/results.tsv`
-7. If fps improved and quality held: **keep** — commit and build on it
-8. If not: **discard** — record it and try something different
+5. Run: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_profile.py [flags]`
+6. Verify results from Modal logs: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal app list` then `... -m modal app logs <app-id>`
+7. Record results in `bench/speed-opt/results.tsv`
+8. If fps improved and quality held: **keep** — commit and build on it
+9. If not: **discard** — record it and try something different
 
 ## Profiling Script Flags
 
