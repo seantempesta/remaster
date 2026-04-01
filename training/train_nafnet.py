@@ -37,6 +37,7 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 from torch.utils.data import Dataset, DataLoader
 
 # Add project root to path
@@ -68,6 +69,71 @@ class PSNRLoss(nn.Module):
     def forward(self, pred, target):
         mse = ((pred - target) ** 2).mean(dim=(1, 2, 3))
         return self.scale * torch.log(mse + 1e-8).mean()
+
+
+class VGGFeatureExtractor(nn.Module):
+    """Extract multi-layer features from VGG19 for perceptual loss.
+
+    Adapted from KAIR (github.com/cszn/KAIR). Extracts features at
+    conv layers [2, 7, 16, 25, 34] (one per VGG block), applies
+    ImageNet normalization, and freezes all weights.
+    """
+    def __init__(self, feature_layers=[2, 7, 16, 25, 34]):
+        super().__init__()
+        vgg = torchvision.models.vgg19(weights=torchvision.models.VGG19_Weights.IMAGENET1K_V1)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer('mean', mean)
+        self.register_buffer('std', std)
+
+        # Split VGG into sub-networks ending at each feature layer
+        self.features = nn.Sequential()
+        prev = -1
+        for i, layer in enumerate(feature_layers):
+            self.features.add_module(
+                f'block{i}',
+                nn.Sequential(*list(vgg.features.children())[(prev + 1):(layer + 1)])
+            )
+            prev = layer
+
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        x = (x - self.mean) / self.std
+        feats = []
+        for block in self.features.children():
+            x = block(x)
+            feats.append(x.clone())
+        return feats
+
+
+class VGGPerceptualLoss(nn.Module):
+    """VGG-based perceptual loss for image restoration.
+
+    Computes weighted L1 distance between VGG19 feature maps of
+    prediction and target. Runs in eval mode with frozen weights.
+    Must be called in fp32 (not inside AMP autocast).
+    """
+    def __init__(self, weights=[0.1, 0.1, 1.0, 1.0, 1.0]):
+        super().__init__()
+        self.vgg = VGGFeatureExtractor()
+        self.weights = weights
+        self.criterion = nn.L1Loss()
+        self.eval()
+
+    def forward(self, pred, target):
+        pred_feats = self.vgg(pred)
+        with torch.no_grad():
+            target_feats = self.vgg(target)
+        loss = 0.0
+        for w, pf, tf in zip(self.weights, pred_feats, target_feats):
+            loss += w * self.criterion(pf, tf)
+        return loss
+
+    def train(self, mode=True):
+        # Always stay in eval mode (BN stats, dropout)
+        return super().train(False)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
