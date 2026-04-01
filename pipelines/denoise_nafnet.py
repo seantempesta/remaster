@@ -163,9 +163,9 @@ def denoise_video(
             "-movflags", "+faststart", output_path,
         ]
 
-    # Threaded IO
-    frame_queue = Queue(maxsize=batch_size * 4)
-    result_queue = Queue(maxsize=batch_size * 4)
+    # Threaded IO — large queues to decouple decode/encode from GPU
+    frame_queue = Queue(maxsize=batch_size * 8)
+    result_queue = Queue(maxsize=batch_size * 8)
     SENTINEL = object()
     WRITER_DONE = object()
 
@@ -197,7 +197,7 @@ def denoise_video(
     reader_t.start()
     writer_t.start()
 
-    # Batched inference
+    # Double-buffered inference: prepare next batch on CPU while GPU processes current
     print(f"\nProcessing: batch_size={batch_size}, {'fp16' if fp16 else 'fp32'}, "
           f"{'compiled' if use_compile else 'eager'}")
     print(f"Encoding: {encoder} CRF {crf}")
@@ -205,71 +205,66 @@ def denoise_video(
     start = time.time()
     processed = 0
     errors = 0
-    done = False
 
-    while not done:
-        # Collect batch
-        batch_frames = []
+    def collect_batch():
+        """Collect up to batch_size frames from reader queue."""
+        frames = []
         for _ in range(batch_size):
             frame = frame_queue.get()
             if frame is SENTINEL:
-                done = True
-                break
-            batch_frames.append(frame)
+                return frames, True
+            frames.append(frame)
+        return frames, False
 
-        if not batch_frames:
-            break
+    def prepare_tensor(frames):
+        """Convert numpy frames to GPU tensor (CPU work)."""
+        batch_np = np.stack(frames)
+        batch_t = torch.from_numpy(batch_np.transpose(0, 3, 1, 2).copy()) / 255.0
+        if fp16:
+            batch_t = batch_t.half()
+        return batch_t.to(DEVICE, memory_format=torch.channels_last, non_blocking=True)
 
-        try:
-            batch_np = np.stack(batch_frames)
-            batch_t = torch.from_numpy(batch_np.transpose(0, 3, 1, 2).copy()) / 255.0
-            if fp16:
-                batch_t = batch_t.half()
-            batch_t = batch_t.to(DEVICE, memory_format=torch.channels_last)
+    # Pre-collect first batch while GPU is idle after warmup
+    cur_frames, done = collect_batch()
+    if cur_frames:
+        cur_tensor = prepare_tensor(cur_frames)
 
-            with torch.no_grad():
-                out_t = model(batch_t)
-            torch.cuda.synchronize()
+    while cur_frames:
+        # Start GPU inference on current batch
+        with torch.no_grad():
+            out_t = model(cur_tensor)
 
-            out_np = (out_t.clamp(0, 1) * 255).byte().cpu().numpy().transpose(0, 2, 3, 1)
-            del batch_t, out_t
+        # While GPU is working, collect and prepare next batch on CPU
+        if not done:
+            next_frames, done = collect_batch()
+            if next_frames:
+                next_tensor = prepare_tensor(next_frames)
+        else:
+            next_frames = []
 
-            for i in range(len(batch_frames)):
-                result_queue.put(out_np[i])
+        # Now sync GPU and get results
+        torch.cuda.synchronize()
+        out_np = (out_t.clamp(0, 1) * 255).byte().cpu().numpy().transpose(0, 2, 3, 1)
 
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                torch.cuda.empty_cache()
-                print(f"  OOM at batch_size={len(batch_frames)}, processing one at a time")
-                for frame in batch_frames:
-                    try:
-                        img_t = torch.from_numpy(frame.transpose(2, 0, 1).copy()).unsqueeze(0) / 255.0
-                        if fp16:
-                            img_t = img_t.half()
-                        img_t = img_t.to(DEVICE)
-                        with torch.no_grad():
-                            out_t = model(img_t)
-                        out = (out_t.squeeze(0).clamp(0, 1) * 255).byte().cpu().numpy().transpose(1, 2, 0)
-                        result_queue.put(out)
-                        del img_t, out_t
-                    except RuntimeError:
-                        result_queue.put(frame)
-                        errors += 1
-                        torch.cuda.empty_cache()
-            else:
-                for frame in batch_frames:
-                    result_queue.put(frame)
-                    errors += 1
-                print(f"  ERROR: {e}")
+        # Write results as contiguous block
+        for i in range(len(cur_frames)):
+            result_queue.put(out_np[i])
 
-        processed += len(batch_frames)
-        if processed % max(batch_size * 10, 50) == 0 or processed == len(batch_frames):
+        del cur_tensor, out_t
+        processed += len(cur_frames)
+
+        if processed % max(batch_size * 10, 50) == 0 or processed == len(cur_frames):
             elapsed = time.time() - start
             fps_actual = processed / elapsed
             eta_min = (total_frames - processed) / max(fps_actual, 0.01) / 60
             vram = torch.cuda.memory_allocated() / 1024**2
             print(f"  [{processed}/{total_frames}] {fps_actual:.1f} fps, "
                   f"VRAM: {vram:.0f}MB, ETA: {eta_min:.1f}min, errors: {errors}")
+
+        # Swap to next batch
+        cur_frames = next_frames
+        if cur_frames:
+            cur_tensor = next_tensor
 
     result_queue.put(WRITER_DONE)
     writer_t.join()
