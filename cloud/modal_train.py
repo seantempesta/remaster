@@ -219,8 +219,7 @@ def main(
         try:
             print(f"Downloading {name}...")
             with open(local_path, "wb") as f:
-                for chunk in vol.read_file(vol_path):
-                    f.write(chunk)
+                vol.read_file_into_fileobj(vol_path, f)
             size_mb = os.path.getsize(local_path) / 1024**2
             print(f"  Saved: {local_path} ({size_mb:.1f} MB)")
         except Exception as e:
