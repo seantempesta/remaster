@@ -39,6 +39,46 @@ Sources: [Saving models](https://docs.pytorch.org/TensorRT/user_guide/saving_mod
 
 **Action item**: Switch from `torch_tensorrt.compile()` to `torch.compile(backend="torch_tensorrt", cache_built_engines=True, reuse_cached_engines=True)` in modal_profile.py. This caches engines automatically.
 
+## 2026-04-01: TensorRT attempts — BLOCKED on version mismatch
+
+**Problem**: We're on PyTorch 2.5.1 + torch-tensorrt 2.5.0. The APIs have changed significantly since then. Latest is torch-tensorrt 2.10.0 + PyTorch 2.10.
+
+**What we tried and failed:**
+1. `torch_tensorrt.compile()` (old API) — engine built in 467s, then crashed on input shape mismatch (1080 vs 1088 padded). Fixed the shape issue but this API doesn't support engine caching.
+2. `torch.compile(backend="torch_tensorrt")` with `immutable_weights=False` — fails with "Engine caching requires make_refittable to be set to True". The `immutable_weights` option is from v2.12 docs; v2.5.0 uses `make_refittable`.
+3. `torch.compile(backend="torch_tensorrt")` with `make_refittable=True` — NOT TESTED YET.
+
+**Key findings from the failed TRT run (old API, no caching):**
+- TRT engine built successfully in **467.8 seconds** on A100
+- Engine warmup worked — inference ran but crashed on shape mismatch
+- The model IS TRT-compatible after swapping LayerNorm2d → LayerNorm2dExport
+- Shape fix: must pad input to multiple of 16 BEFORE passing to TRT model (NAFNet's internal padding is baked into the TRT graph)
+
+**Decision needed: UPGRADE PyTorch + torch-tensorrt**
+- Current: PyTorch 2.5.1 + torch-tensorrt 2.5.0 + CUDA 12.1
+- Target: PyTorch 2.7+ + torch-tensorrt 2.7+ (or latest stable)
+- This unblocks: proper engine caching, newer Inductor, AOTInductor exports, better TRT op coverage
+- Risk: might break existing torch.compile results (need to re-baseline)
+- The Modal image pip_install lines need updating in both modal_profile.py and modal_denoise.py
+
+**Correct v2.5.0 API for engine caching (untested):**
+```python
+model = torch.compile(
+    model,
+    backend="torch_tensorrt",
+    dynamic=False,
+    options={
+        "enabled_precisions": {torch.float, torch.half},
+        "use_python_runtime": True,
+        "make_refittable": True,  # v2.5.0 name (NOT immutable_weights)
+        "cache_built_engines": True,
+        "reuse_cached_engines": True,
+        "engine_cache_dir": "/mnt/data/trt_engine_cache",
+        "min_block_size": 1,
+    },
+)
+```
+
 ## 2026-04-01: INT8 quantization research for NAFNet
 
 ### Summary
