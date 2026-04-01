@@ -83,7 +83,7 @@ app = modal.App("denoise-video", image=image)
 
 
 @app.function(
-    gpu="L4",
+    gpu="H100",
     volumes={VOL_MOUNT: vol},
     timeout=14400,  # 4 hours max
     memory=16384,   # 16GB RAM for ffmpeg encode buffer
@@ -108,6 +108,7 @@ def denoise_remote(
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
     os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
+    os.environ["TORCHINDUCTOR_FREEZING"] = "1"
 
     # Ensure volume is synced with latest uploads
     vol.reload()
@@ -131,7 +132,7 @@ def denoise_remote(
             checkpoint_path=checkpoint_path,
             batch_size=batch_size,
             crf=crf,
-            encoder="hevc_nvenc",
+            encoder="libx265",
             max_frames=max_frames,
             fp16=True,
             use_compile=use_compile,
@@ -216,10 +217,9 @@ def main(
         if not os.path.exists(checkpoint):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
-    # NAFNet uses more intermediate memory per frame (full-res convolutions)
-    # than SCUNet (windowed attention), so default to smaller batches
+    # NAFNet bs=8 is the sweet spot for torch.compile + CUDA graphs
     if batch_size == 6 and model == "nafnet":
-        batch_size = 2
+        batch_size = 8
 
     if not output:
         p = pathlib.Path(input_path)

@@ -30,7 +30,9 @@ from queue import Queue
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from lib.nafnet_arch import NAFNet
+import torch._inductor.config
+torch._inductor.config.conv_1x1_as_mm = True
+from lib.nafnet_arch import NAFNet, swap_layernorm_for_compile
 from lib.ffmpeg_utils import get_ffmpeg, get_video_info
 
 DEVICE = "cuda"
@@ -52,9 +54,19 @@ def load_nafnet(checkpoint_path, device="cuda", fp16=True, use_compile=False):
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
+
+    # Replace LayerNorm2d with compile-friendly F.layer_norm wrapper
+    if use_compile:
+        model = swap_layernorm_for_compile(model)
+        print("  Swapped LayerNorm2d -> LayerNorm2dCompile")
+
     model = model.to(device)
     if fp16:
         model = model.half()
+
+    # channels_last for better cuDNN conv performance
+    model = model.to(memory_format=torch.channels_last)
+    torch.backends.cudnn.benchmark = True
 
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"  NAFNet-width64: {params_m:.1f}M params, VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
@@ -79,21 +91,28 @@ def denoise_video(
     # Load model
     model = load_nafnet(checkpoint_path, device=DEVICE, fp16=fp16, use_compile=use_compile)
 
-    # Warmup (important for torch.compile)
-    if use_compile:
-        print("  Warming up compiled model...")
-        dummy = torch.randn(1, 3, 256, 256, device=DEVICE)
-        if fp16:
-            dummy = dummy.half()
-        with torch.no_grad():
-            _ = model(dummy)
-        del dummy
-        torch.cuda.empty_cache()
-
-    # Video info
+    # Video info (need dimensions before warmup)
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
     w, h, fps, total_frames, duration = get_video_info(input_path)
+
+    # Warmup at actual video resolution (important for torch.compile + CUDA graphs)
+    if use_compile:
+        h_pad = h + (16 - h % 16) % 16
+        w_pad = w + (16 - w % 16) % 16
+        print(f"  Warming up compiled model at {w_pad}x{h_pad}...")
+        dummy = torch.randn(batch_size, 3, h_pad, w_pad, device=DEVICE)
+        if fp16:
+            dummy = dummy.half()
+        dummy = dummy.to(memory_format=torch.channels_last)
+        t0 = time.time()
+        with torch.no_grad():
+            _ = model(dummy)
+            _ = model(dummy)  # second pass for CUDA graph recording
+        torch.cuda.synchronize()
+        print(f"  Compile warmup: {time.time() - t0:.1f}s")
+        del dummy
+        torch.cuda.empty_cache()
     if max_frames > 0:
         total_frames = min(total_frames, max_frames)
     print(f"\nInput: {input_path}")
@@ -197,7 +216,7 @@ def denoise_video(
             batch_t = torch.from_numpy(batch_np.transpose(0, 3, 1, 2).copy()) / 255.0
             if fp16:
                 batch_t = batch_t.half()
-            batch_t = batch_t.to(DEVICE)
+            batch_t = batch_t.to(DEVICE, memory_format=torch.channels_last)
 
             with torch.no_grad():
                 out_t = model(batch_t)
