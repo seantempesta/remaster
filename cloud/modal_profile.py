@@ -316,6 +316,17 @@ def _run_profile(
     model_mb = torch.cuda.memory_allocated() / 1024**2
     print(f"Model loaded: {model_mb:.0f} MB VRAM")
 
+    # --- Probe video dimensions (needed for engine builds) ---
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", clip_path],
+        capture_output=True, text=True,
+    )
+    w, h = [int(x) for x in probe.stdout.strip().split(",")]
+    h_pad = h + (16 - h % 16) % 16
+    w_pad = w + (16 - w % 16) % 16
+    print(f"Video: {w}x{h} (padded to {w_pad}x{h_pad})")
+
     # --- Compile or TensorRT ---
     if use_tensorrt:
         try:
@@ -327,7 +338,7 @@ def _run_profile(
             model = swap_layernorm_for_export(model)
 
             # Use torch.compile with TRT backend — enables engine caching
-            print(f"Building TensorRT engine via torch.compile backend (batch_size={batch_size}, fp16, 1920x1088)...")
+            print(f"Building TensorRT engine via torch.compile backend (bs={batch_size}, fp16, {w_pad}x{h_pad})...")
             print(f"  Engine cache dir: {cache_dir}")
             t0 = time.time()
             model = torch.compile(
@@ -342,8 +353,8 @@ def _run_profile(
                 },
             )
 
-            # Warmup — triggers engine build on first run, loads from cache on subsequent runs
-            example_input = torch.randn(batch_size, 3, 1088, 1920, device="cuda", dtype=torch.float16)
+            # Warmup with padded dimensions — triggers engine build (first run) or cache load
+            example_input = torch.randn(batch_size, 3, h_pad, w_pad, device="cuda", dtype=torch.float16)
             if use_channels_last:
                 example_input = example_input.to(memory_format=torch.channels_last)
             print("  TRT warmup (first run builds engine, cached for future runs)...")
@@ -367,10 +378,9 @@ def _run_profile(
             print("  Falling back to eager")
             use_tensorrt = False
     elif use_compile:
-        print(f"torch.compile mode={compile_mode}, warming up at 1920x1088...")
+        print(f"torch.compile mode={compile_mode}, warming up at {w_pad}x{h_pad}...")
         model = torch.compile(model, mode=compile_mode)
-        # Warmup at actual resolution (critical — different shapes = different compilations)
-        dummy = torch.randn(batch_size, 3, 1088, 1920, device="cuda", dtype=torch.float16)
+        dummy = torch.randn(batch_size, 3, h_pad, w_pad, device="cuda", dtype=torch.float16)
         if use_channels_last:
             dummy = dummy.to(memory_format=torch.channels_last)
         t0 = time.time()
@@ -388,13 +398,6 @@ def _run_profile(
 
     # --- Extract frames from clip ---
     print(f"\nExtracting {num_frames} frames from {clip_path}...")
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", clip_path],
-        capture_output=True, text=True,
-    )
-    w, h = [int(x) for x in probe.stdout.strip().split(",")]
-    print(f"  Video: {w}x{h}")
 
     frame_bytes = w * h * 3
     read_cmd = [
@@ -448,6 +451,16 @@ def _run_profile(
             batch_np = np.stack(batch_frames)
             batch_t = torch.from_numpy(batch_np.transpose(0, 3, 1, 2).copy()).half() / 255.0
             batch_t = batch_t.cuda()
+
+            # TRT engines have fixed input shapes — pad to multiple of 16 to match
+            # the shape used during engine build (NAFNet's check_image_size does this
+            # internally for eager/compile, but TRT bakes shapes at build time)
+            _, _, fh, fw = batch_t.shape
+            pad_h = (16 - fh % 16) % 16
+            pad_w = (16 - fw % 16) % 16
+            if pad_h > 0 or pad_w > 0:
+                batch_t = torch.nn.functional.pad(batch_t, (0, pad_w, 0, pad_h))
+
             if use_channels_last:
                 batch_t = batch_t.to(memory_format=torch.channels_last)
 
@@ -471,6 +484,9 @@ def _run_profile(
             print(f"  batch {batch_idx}: {len(batch_frames)} frames in {elapsed:.3f}s "
                   f"({len(batch_frames)/elapsed:.1f} fps this batch, "
                   f"{fps_so_far:.1f} fps avg, peak {peak_so_far:.1f} GB)")
+
+            # Crop back to original dimensions (undo padding)
+            out_t = out_t[:, :, :h, :w]
 
             # Save first output for PSNR
             if first_output is None:
