@@ -1,0 +1,45 @@
+# Data files — too large for git
+data/
+*.mp4
+*.mkv
+*.npy
+*.png
+*.jpg
+
+# Model checkpoints
+*.pth
+*.pt
+*.bin
+*.safetensors
+model_zoo/
+checkpoints/
+models.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Cloned repos (submodules or vendored)
+RAFT/
+Video-Depth-Anything/
+mmagic/
+BasicVSR_PlusPlus/
+SCUNet/
