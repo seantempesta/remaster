@@ -1,4 +1,10 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Quick test: 1 frame, check GPU usage and speed."""
+from lib.paths import DATA_DIR
+
 import time, cv2, torch
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -18,7 +24,7 @@ upsampler = RealESRGANer(
     gpu_id=0,
 )
 
-img = cv2.imread(r'C:\Users\sean\src\upscale-experiment\data\frames_480p\frame_00001.png', cv2.IMREAD_COLOR)
+img = cv2.imread(str(DATA_DIR / "frames_480p" / "frame_00001.png"), cv2.IMREAD_COLOR)
 print(f"Input shape: {img.shape}")
 print(f"GPU mem before: {torch.cuda.memory_allocated()/1024**2:.0f}MB")
 

@@ -1,6 +1,10 @@
-"""Generate temporally consistent depth maps using Video Depth Anything (vits for 6GB VRAM)."""
 import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\Video-Depth-Anything')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+"""Generate temporally consistent depth maps using Video Depth Anything (vits for 6GB VRAM)."""
+from lib.paths import add_depth_to_path, resolve_depth_dir, DATA_DIR
+add_depth_to_path()
 
 import os
 import torch
@@ -12,14 +16,14 @@ from utils.dc_utils import read_video_frames, save_video
 DEVICE = 'cuda'
 
 def main():
-    data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+    data_dir = str(DATA_DIR)
     input_video = os.path.join(data_dir, 'clip_480p.mp4')
     output_dir = os.path.join(data_dir, 'depth_output')
     os.makedirs(output_dir, exist_ok=True)
 
     # Use vits (small) model to fit comfortably in 6GB VRAM
     model_config = {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}
-    checkpoint = r'C:\Users\sean\src\upscale-experiment\Video-Depth-Anything\checkpoints\video_depth_anything_vits.pth'
+    checkpoint = str(resolve_depth_dir() / "checkpoints" / "video_depth_anything_vits.pth")
 
     print("Loading Video Depth Anything (vits)...")
     model = VideoDepthAnything(**model_config)

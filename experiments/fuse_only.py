@@ -1,11 +1,17 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Phase 1 of Test A: Warp and fuse frames using RAFT flow (CPU only, no GPU needed)."""
+from lib.paths import DATA_DIR
+
 import os, glob, time
 import numpy as np
 import cv2
 import torch
 import torch.nn.functional as F
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+data_dir = str(DATA_DIR)
 frames_dir = os.path.join(data_dir, 'frames_480p')
 flow_dir = os.path.join(data_dir, 'flow_npy')
 fused_dir = os.path.join(data_dir, 'frames_fused_480p')

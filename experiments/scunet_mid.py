@@ -1,6 +1,10 @@
-"""SCUNet on the mid-episode clip — direct inference (no tiling) for speed."""
 import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\SCUNet')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+"""SCUNet on the mid-episode clip — direct inference (no tiling) for speed."""
+from lib.paths import add_scunet_to_path, resolve_scunet_dir, DATA_DIR
+add_scunet_to_path()
 
 import os, glob, time
 import numpy as np
@@ -12,11 +16,11 @@ import imageio_ffmpeg
 DEVICE = 'cuda'
 MAX_FRAMES = 150
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+data_dir = str(DATA_DIR)
 input_dir = os.path.join(data_dir, 'frames_mid_1080p')
 output_dir = os.path.join(data_dir, 'frames_mid_scunet')
 MODEL_NAME = 'scunet_color_real_psnr'
-model_path = os.path.join(r'C:\Users\sean\src\upscale-experiment\SCUNet\model_zoo', f'{MODEL_NAME}.pth')
+model_path = str(resolve_scunet_dir() / "model_zoo" / f'{MODEL_NAME}.pth')
 
 # Clear old output
 os.makedirs(output_dir, exist_ok=True)
@@ -29,7 +33,7 @@ model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=Tr
 model.eval()
 for p in model.parameters():
     p.requires_grad = False
-model = model.to(DEVICE).half()  # fp16 — halves VRAM for direct inference
+model = model.to(DEVICE).half()
 print(f"  Model VRAM: {torch.cuda.memory_allocated()/1024**2:.0f}MB")
 
 frames = sorted(glob.glob(os.path.join(input_dir, '*.png')))[:MAX_FRAMES]

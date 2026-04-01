@@ -1,9 +1,14 @@
 """Extract a 30-second clip from the middle of the episode — calmer scene."""
-import imageio_ffmpeg, subprocess, os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import imageio_ffmpeg, subprocess, os, glob
+from lib.paths import DATA_DIR
 
 ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 src = r'E:\plex\tv\Firefly (2002) Season 1 S01 (1080p BluRay x265 HEVC 10bit AAC Silence)\Firefly (2002) - S01E01 - Serenity (1080p x265 Silence).mkv'
-outdir = r'C:\Users\sean\src\upscale-experiment\data'
+outdir = str(DATA_DIR)
 
 # ~30 minutes in — should be a dialogue/interior scene on Serenity
 print("Extracting 30s clip from 30:00...")
@@ -18,6 +23,5 @@ print("Extracting frames...")
 subprocess.run([ffmpeg, '-y', '-i', os.path.join(outdir, 'clip_mid_1080p.mp4'),
     os.path.join(frames_dir, 'frame_%05d.png')], check=True)
 
-import glob
 n = len(glob.glob(os.path.join(frames_dir, '*.png')))
 print(f"Done! {n} frames extracted to {frames_dir}")

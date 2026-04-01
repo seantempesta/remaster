@@ -1,6 +1,10 @@
 """Quick benchmark: test batch sizes and measure fps + VRAM."""
 import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\SCUNet')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.paths import add_scunet_to_path, resolve_scunet_dir
+add_scunet_to_path()
 
 import time
 import torch
@@ -8,7 +12,7 @@ import numpy as np
 from models.network_scunet import SCUNet as net
 
 DEVICE = 'cuda'
-model_path = r'C:\Users\sean\src\upscale-experiment\SCUNet\model_zoo\scunet_color_real_psnr.pth'
+model_path = str(resolve_scunet_dir() / 'model_zoo' / 'scunet_color_real_psnr.pth')
 
 model = net(in_nc=3, config=[4,4,4,4,4,4,4], dim=64)
 model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True), strict=True)

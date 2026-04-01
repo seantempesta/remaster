@@ -1,9 +1,15 @@
 """Fix partial mp4 using recover_mp4 approach — rebuild moov from mdat."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import imageio_ffmpeg, subprocess, os, struct
+from lib.paths import DATA_DIR
+
 ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
-inp = r'C:\Users\sean\src\upscale-experiment\data\Firefly_S01E02_denoised - Copy.mp4'
-out = r'C:\Users\sean\src\upscale-experiment\data\Firefly_S01E02_denoised_preview.mp4'
+inp = str(DATA_DIR / 'Firefly_S01E02_denoised - Copy.mp4')
+out = str(DATA_DIR / 'Firefly_S01E02_denoised_preview.mp4')
 
 # The issue: ffmpeg writes mp4 with moov at the end. Since the stream is
 # still open, the copy has mdat but no moov.
@@ -11,8 +17,8 @@ out = r'C:\Users\sean\src\upscale-experiment\data\Firefly_S01E02_denoised_previe
 # from a few frames, then use that moov as a template.
 
 # First, create a short reference clip with same settings
-ref = r'C:\Users\sean\src\upscale-experiment\data\temp_ref.mp4'
-mid_clip = r'C:\Users\sean\src\upscale-experiment\data\clip_mid_scunet.mp4'
+ref = str(DATA_DIR / 'temp_ref.mp4')
+mid_clip = str(DATA_DIR / 'clip_mid_scunet.mp4')
 
 # Actually simpler: just read the broken file as a pipe with known params
 # The mdat in the file IS valid h264 in mp4 mdat boxes. We need to extract it properly.
@@ -44,7 +50,7 @@ with open(inp, 'rb') as f:
 
 # Extract raw h264 from mdat and wrap properly
 print("\nExtracting h264 from mdat...")
-raw_h264 = r'C:\Users\sean\src\upscale-experiment\data\temp_raw.h264'
+raw_h264 = str(DATA_DIR / 'temp_raw.h264')
 with open(inp, 'rb') as fi, open(raw_h264, 'wb') as fo:
     fi.seek(mdat_offset)
     remaining = mdat_size
@@ -77,8 +83,8 @@ else:
     print(f"\nDirect mux failed, trying Annex B conversion...")
     # The mdat contains h264 in AVCC format (length-prefixed NALUs),
     # not Annex B (start-code prefixed). Convert.
-    raw_h264 = r'C:\Users\sean\src\upscale-experiment\data\temp_raw.h264'
-    annexb = r'C:\Users\sean\src\upscale-experiment\data\temp_annexb.h264'
+    raw_h264 = str(DATA_DIR / 'temp_raw.h264')
+    annexb = str(DATA_DIR / 'temp_annexb.h264')
 
     with open(inp, 'rb') as fi, open(annexb, 'wb') as fo:
         fi.seek(mdat_offset)

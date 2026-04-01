@@ -1,6 +1,10 @@
 """Test SDPA replacement in SCUNet attention — verify correctness + measure speedup."""
 import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\SCUNet')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.paths import add_scunet_to_path, resolve_scunet_dir
+add_scunet_to_path()
 
 import time
 import torch
@@ -9,7 +13,7 @@ import numpy as np
 from models.network_scunet import SCUNet as net, WMSA
 
 DEVICE = 'cuda'
-model_path = r'C:\Users\sean\src\upscale-experiment\SCUNet\model_zoo\scunet_color_real_psnr.pth'
+model_path = str(resolve_scunet_dir() / 'model_zoo' / 'scunet_color_real_psnr.pth')
 
 # Monkey-patch WMSA.forward with SDPA version
 original_forward = WMSA.forward

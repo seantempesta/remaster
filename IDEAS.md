@@ -1,36 +1,7 @@
-# Ideas, Experiments, and Results
+# Ideas and Future Work
 
-## What We've Tried
-
-### 1. Real-ESRGAN Frame-by-Frame Upscaling (480p -> 1080p)
-- **Status:** Done, works
-- **Result:** Looks great perceptually but scores worse than bicubic on PSNR/SSIM because it hallucinates detail
-- **Speed:** ~0.19 fps (4x upscale with tiling on 6GB)
-- **Verdict:** Good for upscaling, not useful for denoising at native resolution
-
-### 2. RAFT Optical Flow + Warp-Fuse + Real-ESRGAN
-- **Status:** Done, disappointing
-- **Result:** Flow fusion introduced blur and artifacts. Scored worse than plain Real-ESRGAN
-- **Problem:** Hand-crafted pixel averaging fundamentally can't distinguish noise from detail. Even with occlusion masking, soft consistency weighting, and motion-aware blending, the result was blurry
-- **Verdict:** Warp-fuse is not a viable denoising approach without a learned component
-
-### 3. SCUNet Learned Denoiser (current best)
-- **Status:** Working, deployed as streaming pipeline
-- **Result:** Noticeably cleaner frames, removes compression artifacts well
-- **Speed:** ~0.52 fps fp16 direct inference, 3.1GB VRAM
-- **Model:** `scunet_color_real_psnr` — trained on synthetic real-world degradations including JPEG compression
-- **Optimization:** SDPA attention replacement gives 10% speedup + 260MB less VRAM
-- **Verdict:** Best approach so far. Quality is good but speed is the bottleneck for full episodes
-
-### 4. Video Depth Anything
-- **Status:** Working (vits model at 364 input size)
-- **Result:** Produces temporally consistent depth maps. Looks cool but not yet integrated into any pipeline
-- **Speed:** Very fast with small model (~30s for 720 frames)
-
-### 5. Real-ESRGAN Roundtrip Denoiser (4x up + downscale back)
-- **Status:** Partially tested, interrupted
-- **Concept:** Upscale to 4K then downscale back to 1080p — the model removes artifacts as a side effect
-- **Verdict:** Untested at scale
+> Completed experiment results have moved to [docs/experiments-log.md](docs/experiments-log.md).
+> See [docs/approaches.md](docs/approaches.md) for the comparison table.
 
 ## Ideas Not Yet Tried
 

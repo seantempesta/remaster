@@ -1,9 +1,13 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """
 SCUNet Denoiser — trained on real-world degradations including compression artifacts.
 Robust version with profiling, VRAM monitoring, error handling, and resume support.
 """
-import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\SCUNet')
+from lib.paths import add_scunet_to_path, resolve_scunet_dir, DATA_DIR
+add_scunet_to_path()
 
 import os, glob, time
 import numpy as np
@@ -16,11 +20,11 @@ import imageio_ffmpeg
 DEVICE = 'cuda'
 MAX_FRAMES = 150
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+data_dir = str(DATA_DIR)
 input_dir = os.path.join(data_dir, 'frames_1080p_src')
 output_dir = os.path.join(data_dir, 'frames_1080p_scunet')
 MODEL_NAME = 'scunet_color_real_psnr'
-model_path = os.path.join(r'C:\Users\sean\src\upscale-experiment\SCUNet\model_zoo', f'{MODEL_NAME}.pth')
+model_path = str(resolve_scunet_dir() / "model_zoo" / f'{MODEL_NAME}.pth')
 
 
 def vram_mb():

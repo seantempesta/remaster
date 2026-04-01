@@ -1,12 +1,18 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Option 1: Real-ESRGAN roundtrip denoiser — 4x upscale then downscale back to 1080p.
 The model removes compression artifacts as a side effect of learned upscaling."""
+from lib.paths import DATA_DIR
+
 import os, glob, time
 import cv2
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
 import imageio_ffmpeg
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+data_dir = str(DATA_DIR)
 input_dir = os.path.join(data_dir, 'frames_1080p_src')
 output_dir = os.path.join(data_dir, 'frames_1080p_realesrgan_denoise')
 os.makedirs(output_dir, exist_ok=True)
@@ -31,15 +37,9 @@ start = time.time()
 for i, frame_path in enumerate(frames):
     img = cv2.imread(frame_path, cv2.IMREAD_COLOR)
     h, w = img.shape[:2]
-
-    # Upscale 4x (model cleans artifacts during upscaling)
     output, _ = upsampler.enhance(img, outscale=4)
-
-    # Downscale back to original resolution with high-quality filter
     output = cv2.resize(output, (w, h), interpolation=cv2.INTER_LANCZOS4)
-
     cv2.imwrite(os.path.join(output_dir, f'frame_{i+1:05d}.png'), output)
-
     if i == 0:
         print(f"  First frame: {time.time()-start:.1f}s")
     if (i + 1) % 25 == 0:
@@ -50,7 +50,6 @@ for i, frame_path in enumerate(frames):
 elapsed = time.time() - start
 print(f"\nDone! {len(frames)} frames in {elapsed:.1f}s ({len(frames)/elapsed:.2f} fps)")
 
-# Encode video
 print("Encoding video...")
 ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 import subprocess

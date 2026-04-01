@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """
 1080p Flow-Fusion Denoising Pipeline (Optimized)
 Takes original 1080p video, uses RAFT optical flow to warp-fuse neighbors,
@@ -9,8 +13,8 @@ Optimizations:
 - raft-sintel model (better for live action than raft-things)
 - Fusion uses float32 accumulation for precision
 """
-import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\RAFT\core')
+from lib.paths import add_raft_to_path, resolve_raft_dir, DATA_DIR
+add_raft_to_path()
 
 import os, glob, time, argparse
 import numpy as np
@@ -23,7 +27,7 @@ from utils.utils import InputPadder
 import imageio_ffmpeg
 
 DEVICE = 'cuda'
-MAX_FRAMES = 150  # set to -1 for full clip
+MAX_FRAMES = 150
 
 
 def extract_frames(video_path, output_dir, max_frames=-1):
@@ -40,7 +44,7 @@ def extract_frames(video_path, output_dir, max_frames=-1):
 
 def load_raft():
     args = argparse.Namespace(
-        model=r'C:\Users\sean\src\upscale-experiment\RAFT\models\raft-sintel.pth',
+        model=str(resolve_raft_dir() / "models" / "raft-sintel.pth"),
         small=False,
         mixed_precision=True,
         alternate_corr=False,
@@ -51,7 +55,7 @@ def load_raft():
     return model
 
 
-FLOW_SCALE = 0.5  # compute flow at half res, upscale to full — saves ~60% VRAM
+FLOW_SCALE = 0.5
 
 
 def load_image_tensor(path, scale=1.0):
@@ -64,47 +68,34 @@ def load_image_tensor(path, scale=1.0):
 
 
 def upscale_flow(flow_half, target_h, target_w):
-    """Upscale flow field from half to full resolution."""
     flow_up = cv2.resize(flow_half.astype(np.float32), (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-    flow_up *= (1.0 / FLOW_SCALE)  # scale flow vectors proportionally
+    flow_up *= (1.0 / FLOW_SCALE)
     return flow_up.astype(np.float16)
 
 
 def compute_and_save_flows(model, frames, flow_dir):
-    """Compute flows at half res, upscale to full res, save to disk."""
     os.makedirs(flow_dir, exist_ok=True)
     n = len(frames) - 1
-
-    # Get full resolution from first frame
     first = np.array(Image.open(frames[0]))
     full_h, full_w = first.shape[:2]
     del first
-
     print(f"  Computing {n} flow pairs at {FLOW_SCALE}x res, upscaling to {full_w}x{full_h}...")
-
     start = time.time()
     for i in range(n):
         img1 = load_image_tensor(frames[i], scale=FLOW_SCALE)
         img2 = load_image_tensor(frames[i + 1], scale=FLOW_SCALE)
         padder = InputPadder(img1.shape)
         img1p, img2p = padder.pad(img1, img2)
-
         with torch.no_grad(), torch.cuda.amp.autocast():
             _, flow_fwd = model(img1p, img2p, iters=24, test_mode=True)
             _, flow_bwd = model(img2p, img1p, iters=24, test_mode=True)
-
         flow_fwd = padder.unpad(flow_fwd)[0].permute(1, 2, 0).cpu().numpy()
         flow_bwd = padder.unpad(flow_bwd)[0].permute(1, 2, 0).cpu().numpy()
-
-        # Upscale flow to full resolution
         flow_fwd = upscale_flow(flow_fwd, full_h, full_w)
         flow_bwd = upscale_flow(flow_bwd, full_h, full_w)
-
         np.save(os.path.join(flow_dir, f'fwd_{i:05d}.npy'), flow_fwd)
         np.save(os.path.join(flow_dir, f'bwd_{i:05d}.npy'), flow_bwd)
-
         del img1, img2, img1p, img2p, flow_fwd, flow_bwd
-
         if i == 0:
             peak = torch.cuda.max_memory_allocated() / 1024**2
             print(f"  Peak VRAM: {peak:.0f}MB")
@@ -112,13 +103,11 @@ def compute_and_save_flows(model, frames, flow_dir):
             elapsed = time.time() - start
             fps = (i + 1) / elapsed
             print(f"  [{i+1}/{n}] {fps:.1f} pairs/s, ETA: {(n-i-1)/fps:.0f}s")
-
     elapsed = time.time() - start
     print(f"  Flow complete: {n} pairs in {elapsed:.1f}s ({n/elapsed:.1f} pairs/s)")
 
 
 def warp_frame_cpu(frame_np, flow_np):
-    """Warp on CPU to leave GPU free."""
     H, W = frame_np.shape[:2]
     flow = flow_np.astype(np.float32)
     grid_y, grid_x = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -128,8 +117,6 @@ def warp_frame_cpu(frame_np, flow_np):
 
 
 def soft_consistency_weight(flow_fwd, flow_bwd):
-    """Soft forward-backward consistency — returns 0..1 weight, NOT a binary mask.
-    Low error = high confidence = high weight. Smooth gaussian falloff."""
     fwd = flow_fwd.astype(np.float32)
     bwd = flow_bwd.astype(np.float32)
     H, W = fwd.shape[:2]
@@ -139,75 +126,55 @@ def soft_consistency_weight(flow_fwd, flow_bwd):
     warped_bwd_x = cv2.remap(bwd[..., 0], map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     warped_bwd_y = cv2.remap(bwd[..., 1], map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     diff = np.sqrt((fwd[..., 0] + warped_bwd_x)**2 + (fwd[..., 1] + warped_bwd_y)**2)
-    # Gaussian falloff: sigma=0.5 means weight drops to ~0.1 at diff=1.0
     return np.exp(-0.5 * (diff / 0.5)**2).astype(np.float32)
 
 
-CENTER_WEIGHT = 10.0    # center frame strongly dominates (~90%)
-NEIGHBOR_WEIGHT = 0.5   # neighbors are very subtle
-FLOW_MAG_CUTOFF = 20.0  # conservative: reject even moderate motion
+CENTER_WEIGHT = 10.0
+NEIGHBOR_WEIGHT = 0.5
+FLOW_MAG_CUTOFF = 20.0
 
 
 def fuse_frames(frames, flow_dir, output_dir):
-    """Conservative fusion — soft consistency weighting, no sharpening."""
     os.makedirs(output_dir, exist_ok=True)
     n = len(frames)
     print(f"  Fusing {n} frames (center={CENTER_WEIGHT}, neighbor={NEIGHBOR_WEIGHT})...")
-
     start = time.time()
     for i in range(n):
         center = cv2.imread(frames[i], cv2.IMREAD_COLOR)
         H, W = center.shape[:2]
         weight_sum = np.full((H, W, 1), CENTER_WEIGHT, dtype=np.float32)
         pixel_sum = center.astype(np.float32) * CENTER_WEIGHT
-
         for offset in [-1, 1]:
             nb_idx = i + offset
             if nb_idx < 0 or nb_idx >= n:
                 continue
-
             neighbor = cv2.imread(frames[nb_idx], cv2.IMREAD_COLOR)
             flow_idx = min(i, nb_idx)
             fwd_path = os.path.join(flow_dir, f'fwd_{flow_idx:05d}.npy')
             bwd_path = os.path.join(flow_dir, f'bwd_{flow_idx:05d}.npy')
-
             if not (os.path.exists(fwd_path) and os.path.exists(bwd_path)):
                 continue
-
             flow_fwd = np.load(fwd_path)
             flow_bwd = np.load(bwd_path)
-
             if offset == 1:
                 flow = flow_bwd
             else:
                 flow = flow_fwd
-
-            # Soft consistency — smooth falloff instead of binary cutoff
             confidence = soft_consistency_weight(flow_fwd, flow_bwd)
-
-            # Down-weight fast motion (flow errors scale with magnitude)
             flow_mag = np.sqrt(flow[..., 0].astype(np.float32)**2 + flow[..., 1].astype(np.float32)**2)
-            motion_weight = np.clip(1.0 - flow_mag / FLOW_MAG_CUTOFF, 0, 1) ** 2  # squared for steeper falloff
-
-            # Also check pixel similarity — reject warped pixels that differ too much
+            motion_weight = np.clip(1.0 - flow_mag / FLOW_MAG_CUTOFF, 0, 1) ** 2
             warped = warp_frame_cpu(neighbor, flow)
             pixel_diff = np.mean(np.abs(warped.astype(np.float32) - center.astype(np.float32)), axis=-1)
-            similarity = np.exp(-0.5 * (pixel_diff / 15.0)**2)  # sigma=15 intensity levels
-
-            # Combined weight: all three must agree
+            similarity = np.exp(-0.5 * (pixel_diff / 15.0)**2)
             combined = confidence * motion_weight * similarity * NEIGHBOR_WEIGHT
             weight = combined[..., np.newaxis]
-
             pixel_sum += warped.astype(np.float32) * weight
             weight_sum += weight
-
         fused = (pixel_sum / weight_sum).clip(0, 255).astype(np.uint8)
         cv2.imwrite(os.path.join(output_dir, f'frame_{i+1:05d}.png'), fused)
-
         if (i + 1) % 50 == 0:
             elapsed = time.time() - start
             print(f"  [{i+1}/{n}] {(i+1)/elapsed:.1f} fps")
-
     print(f"  Fusion complete in {time.time()-start:.1f}s")
 
 
@@ -223,14 +190,11 @@ def frames_to_video(frames_dir, output_path, fps=23.976):
 
 
 def main():
-    data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+    data_dir = str(DATA_DIR)
     src_video = os.path.join(data_dir, 'clip_1080p.mp4')
-
     frames_dir = os.path.join(data_dir, 'frames_1080p_src')
     flow_dir = os.path.join(data_dir, 'flow_1080p')
     output_dir = os.path.join(data_dir, 'frames_1080p_denoised')
-
-    # Step 1: Extract frames
     print("=" * 60)
     print("Step 1: Extract 1080p frames")
     print("=" * 60)
@@ -241,8 +205,6 @@ def main():
         print(f"  Using {len(frames)} existing frames")
     else:
         frames = extract_frames(src_video, frames_dir, max_frames=MAX_FRAMES)
-
-    # Step 2: RAFT optical flow (GPU) — skip if already computed
     print("\n" + "=" * 60)
     print("Step 2: RAFT optical flow at 1080p")
     print("=" * 60)
@@ -256,14 +218,10 @@ def main():
         compute_and_save_flows(raft_model, frames, flow_dir)
         del raft_model
         torch.cuda.empty_cache()
-
-    # Step 3: Warp-fuse (CPU)
     print("\n" + "=" * 60)
     print("Step 3: Occlusion-aware fusion")
     print("=" * 60)
     fuse_frames(frames, flow_dir, output_dir)
-
-    # Step 4: Encode video
     print("\n" + "=" * 60)
     print("Step 4: Encode output")
     print("=" * 60)

@@ -1,0 +1,24 @@
+[submodule "reference-code/SCUNet"]
+	path = reference-code/SCUNet
+	url = https://github.com/cszn/SCUNet.git
+[submodule "reference-code/NAFNet"]
+	path = reference-code/NAFNet
+	url = https://github.com/megvii-research/NAFNet.git
+[submodule "reference-code/RAFT"]
+	path = reference-code/RAFT
+	url = https://github.com/princeton-vl/RAFT.git
+[submodule "reference-code/Video-Depth-Anything"]
+	path = reference-code/Video-Depth-Anything
+	url = https://github.com/DepthAnything/Video-Depth-Anything.git
+[submodule "reference-code/FlashVSR"]
+	path = reference-code/FlashVSR
+	url = https://github.com/OpenImagingLab/FlashVSR.git
+[submodule "reference-code/FlashVSR-Pro"]
+	path = reference-code/FlashVSR-Pro
+	url = https://github.com/LujiaJin/FlashVSR-Pro.git
+[submodule "reference-code/BasicVSR_PlusPlus"]
+	path = reference-code/BasicVSR_PlusPlus
+	url = https://github.com/ckkelvinchan/BasicVSR_PlusPlus.git
+[submodule "reference-code/KAIR"]
+	path = reference-code/KAIR
+	url = https://github.com/cszn/KAIR.git

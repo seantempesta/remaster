@@ -4,7 +4,11 @@ Streams frames: read -> denoise -> write to video. No intermediate PNGs.
 Safe: monitors VRAM, handles errors gracefully, won't fill disk.
 """
 import sys
-sys.path.append(r'C:\Users\sean\src\upscale-experiment\SCUNet')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib.paths import add_scunet_to_path, resolve_scunet_dir
+add_scunet_to_path()
+from lib.ffmpeg_utils import get_video_info
 
 import os, time, argparse
 import numpy as np
@@ -49,36 +53,6 @@ def _sdpa_forward(self, x):
 WMSA.forward = _sdpa_forward
 
 
-def get_video_info(video_path):
-    """Get fps and frame count from video."""
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    r = subprocess.run([ffmpeg, '-i', video_path], capture_output=True, text=True)
-    info = r.stderr
-    # Parse fps
-    fps = 23.976
-    for line in info.split('\n'):
-        if 'Video:' in line and 'fps' in line:
-            parts = line.split(',')
-            for p in parts:
-                if 'fps' in p:
-                    try:
-                        fps = float(p.strip().split()[0])
-                    except:
-                        pass
-    # Get frame count via duration
-    duration = 0
-    for line in info.split('\n'):
-        if 'Duration:' in line:
-            try:
-                t = line.split('Duration:')[1].split(',')[0].strip()
-                h, m, s = t.split(':')
-                duration = int(h)*3600 + int(m)*60 + float(s)
-            except:
-                pass
-    total_frames = int(duration * fps)
-    return fps, total_frames, duration
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', type=str, required=True, help='Input video path')
@@ -93,7 +67,7 @@ def main():
         args.output = f"{base}_denoised{ext}"
 
     # Video info
-    fps, total_frames, duration = get_video_info(args.input)
+    _, _, fps, total_frames, duration = get_video_info(args.input)
     if args.max_frames > 0:
         total_frames = min(total_frames, args.max_frames)
     print(f"Input: {args.input}")
@@ -101,7 +75,7 @@ def main():
     print(f"Output: {args.output}")
 
     # Load model
-    model_path = os.path.join(r'C:\Users\sean\src\upscale-experiment\SCUNet\model_zoo', f'{args.model}.pth')
+    model_path = str(resolve_scunet_dir() / "model_zoo" / f'{args.model}.pth')
     print(f"\nLoading SCUNet ({args.model})...")
     model = net(in_nc=3, config=[4,4,4,4,4,4,4], dim=64)
     model.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True), strict=True)
@@ -114,7 +88,6 @@ def main():
     # Set up ffmpeg reader and writer
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
-    # Reader: decode input video to raw frames via pipe
     read_cmd = [
         ffmpeg, '-i', args.input,
         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
@@ -124,21 +97,19 @@ def main():
         read_cmd += ['-vframes', str(args.max_frames)]
     read_cmd += ['pipe:1']
 
-    # Writer: encode output video from raw frames via pipe
     write_cmd = [
         ffmpeg, '-y',
         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-        '-s', '1920x1080',  # will be updated after first frame
+        '-s', '1920x1080',
         '-r', str(fps),
         '-i', 'pipe:0',
-        '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',  # NVENC H.265, hardware encoder
+        '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
         '-pix_fmt', 'yuv420p',
-        '-movflags', 'frag_keyframe+empty_moov',  # playable while being written
+        '-movflags', 'frag_keyframe+empty_moov',
         '-v', 'quiet',
         args.output
     ]
 
-    # Read first frame to get dimensions
     reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=10**8)
     raw = reader.stdout.read(1920 * 1080 * 3)
     if len(raw) == 0:
@@ -149,9 +120,8 @@ def main():
     reader.stdout.close()
     reader.wait()
 
-    # Restart reader and start writer with correct dimensions
     reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=10**8)
-    write_cmd[7] = f'{w}x{h}'  # update -s flag
+    write_cmd[7] = f'{w}x{h}'
     writer = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=10**8)
 
     print(f"\nProcessing {w}x{h} @ {fps}fps (fp16 direct inference)...")
@@ -181,7 +151,6 @@ def main():
                 del img_t, out_t
 
             except RuntimeError as e:
-                # On error, pass through original frame
                 out = frame
                 errors += 1
                 if errors <= 3:

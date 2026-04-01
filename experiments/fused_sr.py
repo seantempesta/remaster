@@ -1,10 +1,16 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Test A: Upscale the flow-fused frames with Real-ESRGAN."""
+from lib.paths import DATA_DIR
+
 import os, glob, time
 import cv2
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+data_dir = str(DATA_DIR)
 input_dir = os.path.join(data_dir, 'frames_fused_480p')
 output_dir = os.path.join(data_dir, 'frames_warp_fuse_sr')
 os.makedirs(output_dir, exist_ok=True)

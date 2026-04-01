@@ -37,9 +37,10 @@ build/
 Thumbs.db
 .DS_Store
 
-# Cloned repos (submodules or vendored)
-RAFT/
-Video-Depth-Anything/
-mmagic/
-BasicVSR_PlusPlus/
-SCUNet/
+# Allow reference-code submodules (but ignore their large files)
+!reference-code/
+reference-code/*/testsets/
+reference-code/*/results/
+reference-code/*/data/
+reference-code/*/model_zoo/*.pth
+reference-code/*/experiments/

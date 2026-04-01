@@ -1,10 +1,17 @@
 """Compare upscaling results: PSNR and SSIM against 1080p ground truth.
 Also generates side-by-side comparison frames."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import os, glob
 import numpy as np
 import cv2
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+from lib.paths import DATA_DIR
+from lib.metrics import compute_psnr, compute_ssim
+
+data_dir = str(DATA_DIR)
 gt_dir = os.path.join(data_dir, 'frames_1080p_gt')
 MAX_FRAMES = 150
 
@@ -13,37 +20,6 @@ methods = {
     'Flow-Fused + Real-ESRGAN': os.path.join(data_dir, 'frames_warp_fuse_sr'),
     'Bicubic (sanity check)': None,  # we'll generate on the fly
 }
-
-
-def compute_psnr(img1, img2):
-    mse = np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2)
-    if mse == 0:
-        return float('inf')
-    return 10 * np.log10(255.0 ** 2 / mse)
-
-
-def compute_ssim(img1, img2):
-    """Simple SSIM (per-channel, averaged)."""
-    C1 = (0.01 * 255) ** 2
-    C2 = (0.03 * 255) ** 2
-
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-
-    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
-    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
-
-    mu1_sq = mu1 ** 2
-    mu2_sq = mu2 ** 2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = cv2.GaussianBlur(img1 ** 2, (11, 11), 1.5) - mu1_sq
-    sigma2_sq = cv2.GaussianBlur(img2 ** 2, (11, 11), 1.5) - mu2_sq
-    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    return float(np.mean(ssim_map))
 
 
 def main():
@@ -93,7 +69,7 @@ def main():
     print("=" * 70)
 
     # Generate a few side-by-side comparison frames
-    compare_dir = os.path.join(data_dir, 'comparisons')
+    compare_dir = str(DATA_DIR / 'comparisons')
     os.makedirs(compare_dir, exist_ok=True)
     sample_indices = [0, 30, 60, 90, 120]
 

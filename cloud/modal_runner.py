@@ -2,9 +2,9 @@
 Generic GPU runner for upscale-experiment.
 Run any project script on a cloud GPU:
 
-    modal run modal_runner.py --script denoise_scunet.py
-    modal run modal_runner.py --script denoise_scunet.py --args "--some-flag value"
-    modal run modal_runner.py --script bench_sdpa.py --gpu A100-40GB
+    modal run cloud/modal_runner.py --script denoise_scunet.py
+    modal run cloud/modal_runner.py --script denoise_scunet.py --args "--some-flag value"
+    modal run cloud/modal_runner.py --script bench_sdpa.py --gpu A100-40GB
 
 Upload/download data:
     modal volume put upscale-data ./data/frames/ /frames/
@@ -12,7 +12,7 @@ Upload/download data:
     modal volume ls upscale-data /
 
 Interactive debugging:
-    modal shell modal_runner.py
+    modal shell cloud/modal_runner.py
 """
 import modal
 import subprocess
@@ -53,8 +53,7 @@ image = (
             ".git/**",
             "__pycache__/**",
             "*.pyc",
-            "mmagic/**",
-            "BasicVSR_PlusPlus/**",
+            "reference-code/**",
         ],
     )
 )
@@ -93,8 +92,8 @@ def run_script(script_name: str, extra_args: str = ""):
 def main(script: str, args: str = "", gpu: str = "A10G"):
     """
     Usage:
-        modal run modal_runner.py --script bench_sdpa.py
-        modal run modal_runner.py --script denoise_scunet.py --args "--input /mnt/data/frames"
+        modal run cloud/modal_runner.py --script bench_sdpa.py
+        modal run cloud/modal_runner.py --script denoise_scunet.py --args "--input /mnt/data/frames"
     """
     print(f"Dispatching '{script}' to cloud GPU ({gpu})...")
     run_script.remote(script, args)

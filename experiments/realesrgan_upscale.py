@@ -1,11 +1,17 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Baseline: Real-ESRGAN frame-by-frame upscale from 480p to 1080p."""
+from lib.paths import DATA_DIR
+
 import os, glob, time
 import cv2
 import torch
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
-data_dir = r'C:\Users\sean\src\upscale-experiment\data'
+data_dir = str(DATA_DIR)
 input_dir = os.path.join(data_dir, 'frames_480p')
 output_dir = os.path.join(data_dir, 'frames_realesrgan')
 os.makedirs(output_dir, exist_ok=True)
