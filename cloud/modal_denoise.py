@@ -40,6 +40,7 @@ image = (
         "numpy",
         "einops",
         "timm",
+        "av",
     )
     .add_local_dir(
         "reference-code/SCUNet",

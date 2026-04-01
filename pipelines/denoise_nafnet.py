@@ -119,24 +119,15 @@ def denoise_video(
     print(f"  {w}x{h} @ {fps:.3f}fps, {total_frames} frames, {duration:.1f}s")
     print(f"Output: {output_path}")
 
-    # FFmpeg setup
-    ffmpeg = get_ffmpeg()
-    frame_bytes = w * h * 3
+    # FFmpeg setup for encoder (subprocess — runs in own process, no GIL contention)
+    ffmpeg_bin = get_ffmpeg()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    read_cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "error",
-        "-i", input_path,
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-    ]
-    if max_frames > 0:
-        read_cmd += ["-vframes", str(max_frames)]
-    read_cmd += ["pipe:1"]
-
+    frame_bytes = w * h * 3
     fps_str = f"{fps:.6f}"
+
     if encoder == "hevc_nvenc":
         write_cmd = [
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-r", fps_str, "-i", "pipe:0",
             "-c:v", "hevc_nvenc", "-preset", "p4", "-tune", "hq",
@@ -145,7 +136,7 @@ def denoise_video(
         ]
     elif encoder == "libx264":
         write_cmd = [
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-r", fps_str, "-threads", "0", "-i", "pipe:0",
             "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
@@ -154,7 +145,7 @@ def denoise_video(
         ]
     else:
         write_cmd = [
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-r", fps_str, "-threads", "0", "-i", "pipe:0",
             "-c:v", "libx265", "-crf", str(crf), "-preset", "fast",
@@ -163,12 +154,10 @@ def denoise_video(
             "-movflags", "+faststart", output_path,
         ]
 
-    # --- Optimized I/O pipeline ---
-    # Key optimizations vs naive pipe approach:
-    # 1. Increase OS pipe buffer from 64KB to 8MB (eliminates context switch bottleneck)
-    # 2. Pre-allocated pinned memory for zero-copy async CPU→GPU transfer
-    # 3. CUDA stream for overlapping transfer with inference
-    # 4. Batch writes to encoder (one .tobytes() per batch, not per frame)
+    # --- Hybrid I/O: PyAV decode (in-process, no pipe) + ffmpeg encode (subprocess) ---
+    # PyAV eliminates the 64KB pipe bottleneck for decoding (biggest win).
+    # Encoding stays as subprocess so ffmpeg gets its own process/CPU cores.
+    import av
 
     frame_queue = Queue(maxsize=batch_size * 8)
     result_queue = Queue(maxsize=batch_size * 8)
@@ -176,26 +165,25 @@ def denoise_video(
     WRITER_DONE = object()
 
     def _try_increase_pipe_buf(fd, target=8 * 1024 * 1024):
-        """Increase pipe buffer on Linux (default 64KB is a major bottleneck)."""
         try:
             import fcntl
-            F_SETPIPE_SZ = 1031
-            fcntl.fcntl(fd, F_SETPIPE_SZ, target)
+            fcntl.fcntl(fd, 1031, target)  # F_SETPIPE_SZ
         except Exception:
             pass
 
     def reader_thread():
-        proc = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=frame_bytes * 8)
-        _try_increase_pipe_buf(proc.stdout.fileno())
-        while True:
-            raw = proc.stdout.read(frame_bytes)
-            if len(raw) < frame_bytes:
+        container = av.open(input_path)
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        stream.codec_context.thread_count = 0
+        count = 0
+        for frame in container.decode(stream):
+            frame_queue.put(frame.to_ndarray(format='rgb24'))
+            count += 1
+            if max_frames > 0 and count >= max_frames:
                 break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
-            frame_queue.put(frame)
         frame_queue.put(SENTINEL)
-        proc.stdout.close()
-        proc.wait()
+        container.close()
 
     writer_proc = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=frame_bytes * 8)
     _try_increase_pipe_buf(writer_proc.stdin.fileno())
@@ -205,7 +193,6 @@ def denoise_video(
             item = result_queue.get()
             if item is WRITER_DONE:
                 break
-            # item is the whole batch as contiguous numpy (N,H,W,3)
             writer_proc.stdin.write(item.tobytes())
         writer_proc.stdin.close()
         writer_proc.wait()
@@ -250,6 +237,14 @@ def denoise_video(
         gpu_tensor = buf[:len(frames)].to(DEVICE, memory_format=torch.channels_last, non_blocking=True)
         return gpu_tensor
 
+    # Per-stage timing accumulators
+    t_collect = 0.0
+    t_prepare = 0.0
+    t_infer = 0.0
+    t_postproc = 0.0
+    t_write = 0.0
+    n_batches = 0
+
     # Pre-collect first batch
     buf_idx = 0
     cur_frames, done = collect_batch()
@@ -258,11 +253,14 @@ def denoise_video(
         torch.cuda.synchronize()  # wait for first transfer
 
     while cur_frames:
+        t0 = time.perf_counter()
+
         # GPU inference on current batch
         with torch.no_grad():
             out_t = model(cur_tensor)
 
         # While GPU computes, prepare next batch on CPU
+        t1 = time.perf_counter()
         if not done:
             next_frames, done = collect_batch()
             next_buf_idx = 1 - buf_idx
@@ -270,13 +268,24 @@ def denoise_video(
                 next_tensor = prepare_tensor(next_frames, next_buf_idx)
         else:
             next_frames = []
+        t2 = time.perf_counter()
 
         # Sync GPU, get results
         torch.cuda.synchronize()
+        t3 = time.perf_counter()
         out_np = (out_t.clamp(0, 1) * 255).byte().cpu().numpy().transpose(0, 2, 3, 1)
+        t4 = time.perf_counter()
 
-        # Write entire batch to encoder at once (one .tobytes() call)
+        # Write entire batch to encoder at once
         result_queue.put(out_np[:len(cur_frames)])
+        t5 = time.perf_counter()
+
+        # Accumulate timings
+        t_infer += t1 - t0
+        t_collect += t2 - t1  # collect + prepare overlap with GPU
+        t_postproc += t4 - t3  # sync + cpu transfer
+        t_write += t5 - t4
+        n_batches += 1
 
         del cur_tensor, out_t
         processed += len(cur_frames)
@@ -294,6 +303,16 @@ def denoise_video(
         buf_idx = 1 - buf_idx
         if cur_frames:
             cur_tensor = next_tensor
+
+    # Print timing breakdown
+    if n_batches > 0:
+        print(f"\n  Timing per batch ({n_batches} batches, {batch_size} frames/batch):")
+        print(f"    Infer (launch):   {t_infer/n_batches*1000:.1f}ms")
+        print(f"    Collect+Prepare:  {t_collect/n_batches*1000:.1f}ms (overlaps with GPU)")
+        print(f"    GPU sync+postproc:{t_postproc/n_batches*1000:.1f}ms")
+        print(f"    Queue write:      {t_write/n_batches*1000:.1f}ms")
+        print(f"    Total per batch:  {(t_infer+t_collect+t_postproc+t_write)/n_batches*1000:.1f}ms"
+              f" = {n_batches*batch_size/(t_infer+t_collect+t_postproc+t_write):.1f} fps")
 
     result_queue.put(WRITER_DONE)
     writer_t.join()
