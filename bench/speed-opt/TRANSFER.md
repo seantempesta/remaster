@@ -26,9 +26,13 @@ The current model was trained with:
 
 ## What to Do Next
 
-1. **Add perceptual loss** — LPIPS or VGG feature loss preserves texture/sharpness. Weight it alongside Charbonnier (e.g., 1.0 * charbonnier + 0.1 * lpips).
+**CRITICAL: Resume from existing checkpoint, do not train from scratch.** The current best weights at `checkpoints/nafnet_distill/nafnet_best.pth` already match SCUNet pixel-level quality. We want to fine-tune it to add sharpness and fix shadow denoising, not retrain from zero.
 
-2. **Train longer** — run the full 50K iters. Loss was still improving at 5K.
+Use `--resume checkpoints/nafnet_distill/nafnet_best.pth` when launching training.
+
+1. **Add perceptual loss** — LPIPS or VGG feature loss preserves texture/sharpness. Weight it alongside Charbonnier (e.g., 1.0 * charbonnier + 0.1 * lpips). Add as a new `--loss` option or `--perceptual-weight` flag in `training/train_nafnet.py`.
+
+2. **Resume training with new loss** — start from the existing checkpoint, train 10-20K more iters with the combined loss. Use a lower LR (e.g., 1e-4 or 5e-5) since we're fine-tuning, not training fresh.
 
 3. **Larger crops** — try 384px or 512px crops to capture more context (especially dark regions that span large areas). Needs more VRAM — use A100 or reduce batch size.
 
