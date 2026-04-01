@@ -344,10 +344,12 @@ def _run_profile(
             model = torch.compile(
                 model,
                 backend="torch_tensorrt",
+                dynamic=False,
                 options={
-                    "enabled_precisions": {torch.float16},
-                    "truncate_long_and_double": True,
-                    "workspace_size": 1 << 30,
+                    "enabled_precisions": {torch.float, torch.half},
+                    "use_python_runtime": True,
+                    "min_block_size": 1,
+                    "immutable_weights": False,  # Required for engine caching
                     "cache_built_engines": True,
                     "reuse_cached_engines": True,
                 },
