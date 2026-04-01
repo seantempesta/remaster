@@ -2,26 +2,21 @@
 Modal Denoiser — cloud GPU pipeline for full episodes (SCUNet or NAFNet).
 
 Upload a video, denoise all frames with batched SCUNet or distilled NAFNet
-on a cloud GPU, encode to high-quality 10-bit H.265, download the result.
+on a cloud GPU, encode to high-quality 10-bit H.264, download the result.
 
 Usage:
-    # SCUNet (default)
+    # NAFNet (distilled — fast, recommended)
+    modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
+
+    # SCUNet (default, slower)
     modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv"
     modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --batch-size 8
 
-    # NAFNet (distilled — faster)
-    modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth
-    modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
-
 GPU recommendations (1080p fp16):
-    T4  (16GB, ~$0.59/hr) — budget option, batch_size=3-4
-    L4  (24GB, ~$0.80/hr) — best value, batch_size=6-8  [DEFAULT]
-    A10G(24GB, ~$1.10/hr) — faster, batch_size=6-8
-    A100(40GB, ~$2.10/hr) — overkill for this model, batch_size=12+
-
-Local test (same pipeline, your GPU):
-    python pipelines/denoise_batch.py --input episode.mkv --batch-size 1 --encoder hevc_nvenc --max-frames 100
-    python pipelines/denoise_nafnet.py --input episode.mkv --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
+    H100(80GB, ~$3.95/hr) — best for NAFNet+compile (30 fps model, no NVENC)
+    A100(40GB, ~$2.10/hr) — good alternative (15 fps model, no NVENC)
+    L4  (24GB, ~$0.80/hr) — budget, has NVENC for fast encoding
+    Note: H100/A100 have no NVENC — uses libx264 CPU encoding (fast enough)
 """
 import modal
 import os
@@ -30,34 +25,11 @@ import time
 vol = modal.Volume.from_name("upscale-data", create_if_missing=True)
 VOL_MOUNT = "/mnt/data"
 
+# Simple image: apt ffmpeg (has libx264/libx265), no source builds needed.
+# H100/A100 have no NVENC, so we use libx264 which is fast enough on CPU.
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install(
-        "git", "libgl1", "libglib2.0-0",
-        # ffmpeg build deps
-        "build-essential", "yasm", "nasm", "pkg-config",
-        "libx265-dev", "libnuma-dev",
-    )
-    # Build ffmpeg with NVENC + libx265 (NVENC only needs nv-codec-headers + driver)
-    .run_commands(
-        # nv-codec-headers: maps ffmpeg to NVIDIA driver's NVENC/NVDEC
-        "git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvcodec"
-        " && cd /tmp/nvcodec && make install && rm -rf /tmp/nvcodec",
-    )
-    .run_commands(
-        # Build ffmpeg from GitHub mirror (git.ffmpeg.org is unreliable)
-        "git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg-src"
-        " && cd /tmp/ffmpeg-src"
-        " && ./configure"
-        "   --enable-nonfree --enable-gpl"
-        "   --enable-nvenc --enable-libx265"
-        "   --disable-doc --disable-debug --disable-static --enable-shared"
-        " && make -j$(nproc)"
-        " && make install"
-        " && ldconfig"
-        " && cd / && rm -rf /tmp/ffmpeg-src",
-        "ffmpeg -encoders 2>/dev/null | grep nvenc | head -5",
-    )
+    .apt_install("git", "libgl1", "libglib2.0-0", "ffmpeg")
     .pip_install(
         "torch==2.7.1",
         "torchvision==0.22.1",
@@ -84,6 +56,7 @@ app = modal.App("denoise-video", image=image)
 
 @app.function(
     gpu="H100",
+    cpu=8,          # x264 encoding needs CPU cores to keep up with model
     volumes={VOL_MOUNT: vol},
     timeout=14400,  # 4 hours max
     memory=16384,   # 16GB RAM for ffmpeg encode buffer
@@ -132,7 +105,7 @@ def denoise_remote(
             checkpoint_path=checkpoint_path,
             batch_size=batch_size,
             crf=crf,
-            encoder="libx265",
+            encoder="libx264",
             max_frames=max_frames,
             fp16=True,
             use_compile=use_compile,
@@ -145,7 +118,7 @@ def denoise_remote(
             model_name=model_name,
             batch_size=batch_size,
             crf=crf,
-            encoder="hevc_nvenc",
+            encoder="libx264",
             max_frames=max_frames,
             use_compile=False,
             use_sdpa=False,
@@ -196,13 +169,12 @@ def main(
     Denoise a local video file on a Modal cloud GPU.
 
     Examples:
+        # NAFNet (distilled — recommended)
+        modal run cloud/modal_denoise.py --input episode.mkv --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
+
         # SCUNet (default)
         modal run cloud/modal_denoise.py --input episode.mkv
         modal run cloud/modal_denoise.py --input episode.mkv --batch-size 8
-
-        # NAFNet (distilled)
-        modal run cloud/modal_denoise.py --input episode.mkv --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth
-        modal run cloud/modal_denoise.py --input episode.mkv --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
     """
     import pathlib
 
@@ -257,7 +229,7 @@ def main(
     print(f"  Upload done in {time.time() - t0:.0f}s")
 
     # Denoise on cloud GPU
-    print(f"\nStarting denoise on L4 ({model})...")
+    print(f"\nStarting denoise on H100 ({model})...")
     result = denoise_remote.remote(
         input_path=ctr_input,
         output_path=ctr_output_video,

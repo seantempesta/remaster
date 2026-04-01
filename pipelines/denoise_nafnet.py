@@ -143,14 +143,23 @@ def denoise_video(
             "-rc", "vbr", "-cq", str(crf), "-pix_fmt", "p010le",
             "-movflags", "+faststart", output_path,
         ]
+    elif encoder == "libx264":
+        write_cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", fps_str, "-threads", "0", "-i", "pipe:0",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+            "-pix_fmt", "yuv420p10le",
+            "-movflags", "+faststart", output_path,
+        ]
     else:
         write_cmd = [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{w}x{h}", "-r", fps_str, "-i", "pipe:0",
-            "-c:v", "libx265", "-crf", str(crf), "-preset", "medium",
+            "-s", f"{w}x{h}", "-r", fps_str, "-threads", "0", "-i", "pipe:0",
+            "-c:v", "libx265", "-crf", str(crf), "-preset", "fast",
             "-pix_fmt", "yuv420p10le",
-            "-x265-params", "aq-mode=3:aq-strength=0.8:deblock=-1,-1:no-sao=1:rc-lookahead=40:pools=4",
+            "-x265-params", "aq-mode=3:aq-strength=0.8:deblock=-1,-1:no-sao=1:rc-lookahead=20:pools=4",
             "-movflags", "+faststart", output_path,
         ]
 
