@@ -326,26 +326,33 @@ def _run_profile(
             print("Swapping LayerNorm2d -> LayerNorm2dExport for TRT compatibility...")
             model = swap_layernorm_for_export(model)
 
+            # Use torch.compile with TRT backend — enables engine caching
+            print(f"Building TensorRT engine via torch.compile backend (batch_size={batch_size}, fp16, 1920x1088)...")
+            print(f"  Engine cache dir: {cache_dir}")
+            t0 = time.time()
+            model = torch.compile(
+                model,
+                backend="torch_tensorrt",
+                options={
+                    "enabled_precisions": {torch.float16},
+                    "truncate_long_and_double": True,
+                    "workspace_size": 1 << 30,
+                    "cache_built_engines": True,
+                    "reuse_cached_engines": True,
+                },
+            )
+
+            # Warmup — triggers engine build on first run, loads from cache on subsequent runs
             example_input = torch.randn(batch_size, 3, 1088, 1920, device="cuda", dtype=torch.float16)
             if use_channels_last:
                 example_input = example_input.to(memory_format=torch.channels_last)
-
-            print(f"Building TensorRT engine (batch_size={batch_size}, fp16, 1920x1088)...")
-            t0 = time.time()
-            model = torch_tensorrt.compile(
-                model,
-                inputs=[example_input],
-                enabled_precisions={torch.float16},
-                truncate_long_and_double=True,
-                workspace_size=1 << 30,  # 1 GB workspace for kernel selection
-            )
-            print(f"  TensorRT build done in {time.time() - t0:.1f}s")
-
-            # Warmup TRT engine (first inference may be slow)
-            print("  TRT warmup...")
+            print("  TRT warmup (first run builds engine, cached for future runs)...")
             with torch.no_grad():
                 _ = model(example_input)
             torch.cuda.synchronize()
+            build_time = time.time() - t0
+            print(f"  TRT ready in {build_time:.1f}s")
+            # Second warmup pass
             with torch.no_grad():
                 _ = model(example_input)
             torch.cuda.synchronize()
