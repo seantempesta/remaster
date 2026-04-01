@@ -57,7 +57,15 @@
 - **Simpler than:** Training a full temporal model
 - **Could be:** A fast warp-blend between consecutive SCUNet outputs, or a learned temporal filter
 
-### 10. NVENC Hardware-Accelerated Pipeline
+### 10. FlashVSR — One-Step Diffusion (Potentially Real-Time)
+- **Status:** Not yet tried
+- **Repo:** https://github.com/OpenImagingLab/FlashVSR (also FlashVSR-Pro: https://github.com/LujiaJin/FlashVSR-Pro with low-VRAM tiling)
+- **Concept:** One-step diffusion model for video super-resolution. Single forward pass, no iterative denoising. Could potentially run at or near real-time on RTX 3060
+- **Why exciting:** Combines the quality of diffusion models with the speed of single-pass inference. Claimed to work on 6GB VRAM
+- **Use case:** Could replace SCUNet as the denoiser if quality is comparable, at 10-50x the speed
+- **Open questions:** Does it work as a denoiser at native resolution (not just upscaling)? VRAM with 1080p input?
+
+### 11. NVENC Hardware-Accelerated Pipeline
 - **Status:** Partially implemented (H.265 NVENC encoding added to episode script)
 - **Concept:** Use the RTX 3060's dedicated video encoder for output, freeing CUDA cores entirely for inference
 - **Also possible:** NVDEC for hardware-accelerated input decoding
