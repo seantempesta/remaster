@@ -49,3 +49,46 @@ Results from completed experiments on the Firefly S01E01 test clips.
 - **Concept:** RAFT flow at half-res, upscale to full-res, occlusion-aware warp-fuse at 1080p
 - **Result:** Same blur problem as #2, just at native resolution
 - **Output:** `data/frames_1080p_denoised/`
+
+## 7. NAFNet Distilled Denoiser — Speed Optimization (2026-04-01)
+
+- **Scripts:** `cloud/modal_profile.py` (profiling), `cloud/modal_denoise.py` (production), `pipelines/denoise_nafnet.py` (pipeline)
+- **Model:** NAFNet-width64 distilled from SCUNet (56.82 dB val PSNR vs teacher)
+- **Starting point:** 0.7 fps on Modal L4, same speed as SCUNet despite being a pure CNN
+
+### Speed optimization journey
+
+| Change | FPS | Cost/ep | GPU |
+|--------|-----|---------|-----|
+| Baseline (eager, L4) | 0.78 | $17.38 | L4 |
+| + torch.compile + channels_last | 2.56 | $5.29 | L4 |
+| + A100 (more bandwidth) | 12.43 | $3.79 | A100 |
+| + PyTorch 2.7.1 + Inductor opts | 15.0 | $2.37 | A100-80GB |
+| + H100 (profiler) | 30.82 | $2.17 | H100 |
+| + CUDA graph shape fix (pipeline) | **27.9** | **~$2.40** | H100 |
+
+Key optimizations:
+- **PyTorch 2.5.1 → 2.7.1** + cu124 (better Inductor codegen)
+- **TORCHINDUCTOR_FREEZING=1** (inlines weights as constants, 15-30% gain)
+- **conv_1x1_as_mm=True** (1x1 conv → GEMM, better Tensor Cores)
+- **LayerNorm2dCompile** (F.layer_norm wrapper — Inductor can fuse it, unlike custom autograd.Function)
+- **CUDA graph shape fix** — pipeline warmed up at 1920x1088 but fed 1920x1080 tensors, causing re-recording every batch. Fixed with pre-allocated padded buffers.
+- **PyAV decode** — in-process decode eliminates subprocess pipe bottleneck
+- **Pre-allocated pinned memory** — avoids CUDA graph invalidation from alloc/free
+- **apt ffmpeg + libx264** — H100/A100 have no NVENC; libx264 encodes at 440 fps on CPU
+
+### What didn't work
+- **TensorRT 2.7.0** — DataDependentOutputException bug in weight mapping, falls back to eager (3 fps)
+- **INT8 quantization** — blocked by TRT; realistic gain only 1.2-1.4x due to depthwise conv limitations
+- **Batch size > 8** — CUDA graphs don't scale; bs=16 is 2.75x slower, bs=32 OOMs on 80GB
+- **GroupNorm(1) swap** — NOT equivalent to LayerNorm2d (different normalization dimensions), produced garbage
+
+### Full episode result
+- **Firefly S01E02**: 61,463 frames in 36.7 min at 27.9 fps, 0 errors, ~$2.40 on H100
+- Output: H.264 High10 + 5.1 audio + commentary + 3 subtitle tracks + chapter markers
+- **Quality issues:** Slightly soft, dark shadow areas still noisy — needs training improvements
+
+### Research & docs
+- Full research log: `bench/speed-opt/research.md`
+- All experiment results: `bench/speed-opt/results.tsv`
+- Transfer doc: `bench/speed-opt/TRANSFER.md`

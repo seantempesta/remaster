@@ -8,18 +8,28 @@ SCUNet produces great quality (39.6 dB PSNR) but is slow (0.6 fps locally, 0.7 f
 
 ## Current State (2026-04-01)
 
-### What's Done
-- **Training pairs**: 1032 pairs in `data/train_pairs/` (720 from mid clip + 100 from E01 + 106 from E04 + 106 from E08). Pairs are {input=compressed frame, target=SCUNet denoised frame} at full 1080p.
+### Speed: SOLVED
+Pipeline runs at **27.9 fps on H100** — Firefly S01E02 processed in 37 min for ~$2.40. See `docs/experiments-log.md` experiment #7 and `bench/speed-opt/` for full details.
+
+### Quality: NEEDS IMPROVEMENT
+First full episode result (Firefly S01E02) shows:
+- **Slightly soft** — model over-smooths fine detail (hair, fabric texture, film grain)
+- **Dark shadows still noisy** — denoising insufficient in low-light areas
+- **Otherwise good** — skin tones, colors, and mid-range detail are well preserved
+
+Root causes to investigate:
+1. **Training stopped too early** — only 5,350 iters of planned 50,000. Loss was still slowly improving.
+2. **Charbonnier loss only** — tends to produce smooth/soft results. Adding a perceptual loss (LPIPS, VGG feature loss) or adversarial loss would preserve sharpness.
+3. **256px crop size** — model never sees full-frame context during training. Dark regions (which tend to be large) may be underrepresented in random crops.
+4. **Limited training data** — 1,032 pairs from a few episodes. More diverse content (dark scenes, high-detail scenes) would help.
+5. **Teacher quality in shadows** — if SCUNet itself doesn't fully denoise dark areas, the student can't either. Could use stronger denoising targets for shadow regions.
+
+### Training History
+- **Training pairs**: 1,032 pairs in `data/train_pairs/` (720 from mid clip + 100 from E01 + 106 from E04 + 106 from E08). Pairs are {input=compressed frame, target=SCUNet denoised frame} at full 1080p.
 - **Local training test**: 200 iters, batch_size=2, loss 0.258→0.0025, PSNR 45.62→48.21 dB
-- **Modal training**: Ran to ~5350/50000 iters on A10G before stopping. Best validation PSNR 56.82 dB at iter 1000. Loss plateaued at ~0.0015 by iter 3000. Training was 1.8 it/s (IO-bound from Modal Volume), would have taken ~8 hours for 50K iters.
-- **Best checkpoint**: `checkpoints/nafnet_distill/nafnet_best.pth` — downloaded from Modal volume, from iter 1000
-- **End-to-end test**: Processed `data/clip_mid_1080p.mp4` (720 frames) on Modal L4. Output is `data/clip_mid_1080p_nafnet.mkv`. Video + mux pipeline works correctly. 0 errors.
-- **modal_denoise.py**: Updated to support both `--model scunet` (default) and `--model nafnet --checkpoint path`. Uploads checkpoint to volume, runs NAFNet pipeline, muxes audio/subs, downloads result.
-
-### What's NOT Done — Speed Problem
-NAFNet on Modal L4 at 1080p runs at **0.7 fps** — the same speed as SCUNet. The distillation produced a model with matching quality but **no speed gain** in the current configuration. A full 42-min episode (61K frames) would take ~24 hours and cost ~$19 on L4.
-
-The speed problem needs investigation before processing full episodes. See `docs/nafnet-speed-investigation.md` for details and next steps.
+- **Modal training**: Ran to ~5,350/50,000 iters on A10G before stopping. Best validation PSNR 56.82 dB at iter 1000. Loss plateaued at ~0.0015 by iter 3000.
+- **Best checkpoint**: `checkpoints/nafnet_distill/nafnet_best.pth` — from iter 1000
+- **Full episode test**: Firefly S01E02 — 61,463 frames, 27.9 fps, 0 errors, ~$2.40 on H100
 
 ### Training Observations
 - **NaN loss**: Occurred at iter 50 and iter 500 (both right at LR milestones — start and end of warmup). Model recovered both times. Gradient clipping (`--grad-clip`) was disabled. Future runs should enable it.

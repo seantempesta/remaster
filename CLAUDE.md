@@ -52,11 +52,13 @@ An experimentation platform for improving video quality using ML models. The pri
 
 ## Current Status (2026-04-01)
 
-**Working pipeline:** SCUNet streaming denoise (pipelines/denoise_batch.py) works locally and on Modal L4. Produces good quality (39.6 dB) but slow (0.7 fps on L4, memory-bandwidth-bound).
+**Working pipeline:** NAFNet distilled denoiser runs at **27.9 fps on H100** via `cloud/modal_denoise.py`. Full episodes process in ~37 min for ~$2.40. Uses PyTorch 2.7.1 + torch.compile(reduce-overhead) + CUDA graphs + Inductor optimizations.
 
-**In progress:** NAFNet distillation — trained NAFNet to match SCUNet quality. Pipeline works end-to-end on Modal. But NAFNet runs at the same 0.7 fps as SCUNet — no speed gain yet. Need to investigate torch.compile, batch sizing, and other optimizations. See `docs/nafnet-speed-investigation.md`.
+**First episode done:** Firefly S01E02 processed end-to-end (61K frames, 27.9 fps, 0 errors). Output has H.264 10-bit video + all audio/subtitle tracks.
 
-**Key TODO:** Optimize NAFNet inference speed on Modal so full episodes cost ≤$3 (need ~5 fps). Then process Firefly S01E02.
+**Quality issue:** Output is slightly soft and dark shadows are still noisy. Needs training improvements — current model was only trained for 5K of planned 50K iters, uses Charbonnier loss only (no perceptual loss), 256px crops, limited data.
+
+**Key TODO:** Improve training quality (perceptual loss, more data, longer training, larger crops). See `docs/distillation-guide.md`.
 
 ## Critical Gotchas
 
