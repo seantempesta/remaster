@@ -22,3 +22,6 @@
 [submodule "reference-code/KAIR"]
 	path = reference-code/KAIR
 	url = https://github.com/cszn/KAIR.git
+[submodule "reference-code/autoresearch"]
+	path = reference-code/autoresearch
+	url = https://github.com/karpathy/autoresearch.git

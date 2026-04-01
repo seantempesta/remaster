@@ -50,6 +50,32 @@ An experimentation platform for improving video quality using ML models. The pri
 ## Data Directory
 `data/` contains video clips, extracted frames, model outputs. Git-ignored due to size.
 
+## Current Status (2026-04-01)
+
+**Working pipeline:** SCUNet streaming denoise (pipelines/denoise_batch.py) works locally and on Modal L4. Produces good quality (39.6 dB) but slow (0.7 fps on L4, memory-bandwidth-bound).
+
+**In progress:** NAFNet distillation — trained NAFNet to match SCUNet quality. Pipeline works end-to-end on Modal. But NAFNet runs at the same 0.7 fps as SCUNet — no speed gain yet. Need to investigate torch.compile, batch sizing, and other optimizations. See `docs/nafnet-speed-investigation.md`.
+
+**Key TODO:** Optimize NAFNet inference speed on Modal so full episodes cost ≤$3 (need ~5 fps). Then process Firefly S01E02.
+
+## Critical Gotchas
+
+**DO NOT run heavy GPU models from agents locally** — the RTX 3060 has only 6GB VRAM. Running SCUNet or NAFNet at 1080p will spill into shared system RAM and freeze the machine. Do code writing + syntax checks locally, run inference on Modal.
+
+**Windows + Modal:** Never use `conda run -n upscale modal run ...` — breaks with UnicodeEncodeError. Use: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/script.py`
+
+**Modal Volume paths:** `batch_upload.put_file(local, remote)` — remote is volume-relative (e.g., `/input/file.mp4`). Container access uses mount prefix (`/mnt/data/input/file.mp4`). Must call `vol.reload()` inside container functions before reading uploaded files.
+
+**NAFNet fp16:** Fixed in `lib/nafnet_arch.py`. LayerNorm2d casts to fp32 for normalization, returns fp16. Don't revert this.
+
+**torch.compile:** Works on NAFNet (pure CNN). Does NOT work on SCUNet (dynamic W/SW window branches cause infinite recompilation).
+
+**FFmpeg on Modal:** Debian apt ffmpeg has no NVENC. `cloud/modal_denoise.py` builds ffmpeg from source with nv-codec-headers for NVENC support. Don't replace with apt ffmpeg.
+
+**x265 on Modal:** Prints "Failed to generate CPU mask" and falls back to single-threaded unless you add `pools=4` to x265-params.
+
+**Local ffmpeg:** imageio_ffmpeg ships v4.2.2 — doesn't support modern NVENC presets. Use `libx265` encoder locally or old NVENC syntax (`-rc vbr_hq -cq N`).
+
 ## Modal Development Guidelines
 
 Full docs: modal.com/docs — markdown for LLMs: modal.com/llms-full.txt — examples: modal.com/docs/examples (github.com/modal-labs/modal-examples)

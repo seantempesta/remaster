@@ -1,15 +1,19 @@
 """
-Modal SCUNet Denoiser — cloud GPU pipeline for full episodes.
+Modal Denoiser — cloud GPU pipeline for full episodes (SCUNet or NAFNet).
 
-Upload a video, denoise all frames with batched SCUNet on a cloud GPU,
-encode to high-quality 10-bit H.265, download the result.
+Upload a video, denoise all frames with batched SCUNet or distilled NAFNet
+on a cloud GPU, encode to high-quality 10-bit H.265, download the result.
 
 Usage:
+    # SCUNet (default)
     modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv"
     modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --batch-size 8
-    modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --crf 20 --model scunet_color_real_gan
 
-GPU recommendations (for 1080p SCUNet fp16):
+    # NAFNet (distilled — faster)
+    modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth
+    modal run cloud/modal_denoise.py --input "C:/path/to/episode.mkv" --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
+
+GPU recommendations (1080p fp16):
     T4  (16GB, ~$0.59/hr) — budget option, batch_size=3-4
     L4  (24GB, ~$0.80/hr) — best value, batch_size=6-8  [DEFAULT]
     A10G(24GB, ~$1.10/hr) — faster, batch_size=6-8
@@ -17,6 +21,7 @@ GPU recommendations (for 1080p SCUNet fp16):
 
 Local test (same pipeline, your GPU):
     python pipelines/denoise_batch.py --input episode.mkv --batch-size 1 --encoder hevc_nvenc --max-frames 100
+    python pipelines/denoise_nafnet.py --input episode.mkv --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
 """
 import modal
 import os
@@ -70,10 +75,11 @@ image = (
         ignore=["__pycache__/**", "*.pyc", "testsets/**", "results/**"],
     )
     .add_local_file("pipelines/denoise_batch.py", remote_path="/root/project/denoise_batch.py")
+    .add_local_file("pipelines/denoise_nafnet.py", remote_path="/root/project/denoise_nafnet.py")
     .add_local_dir("lib", remote_path="/root/project/lib", ignore=["__pycache__/**", "*.pyc"])
 )
 
-app = modal.App("denoise-scunet", image=image)
+app = modal.App("denoise-video", image=image)
 
 
 @app.function(
@@ -85,15 +91,17 @@ app = modal.App("denoise-scunet", image=image)
 def denoise_remote(
     input_path: str,
     output_path: str,
+    model_type: str = "scunet",
     model_name: str = "scunet_color_real_psnr",
+    checkpoint_path: str = "",
     batch_size: int = 6,
     crf: int = 18,
     max_frames: int = -1,
+    use_compile: bool = False,
 ):
-    """Run denoise_batch pipeline on a cloud GPU."""
+    """Run denoise pipeline on a cloud GPU (SCUNet or NAFNet)."""
     import sys
     sys.path.insert(0, "/root/project")
-    from denoise_batch import denoise_video
 
     # Ensure volume is synced with latest uploads
     vol.reload()
@@ -105,17 +113,36 @@ def denoise_remote(
         raise FileNotFoundError(f"Input not found on volume: {input_path}")
     print(f"Input file size: {os.path.getsize(input_path) / 1024**2:.1f} MB")
 
-    result = denoise_video(
-        input_path=input_path,
-        output_path=output_path,
-        model_name=model_name,
-        batch_size=batch_size,
-        crf=crf,
-        encoder="hevc_nvenc",  # L4 NVENC hardware encoder
-        max_frames=max_frames,
-        use_compile=False,
-        use_sdpa=False,
-    )
+    if model_type == "nafnet":
+        from denoise_nafnet import denoise_video
+        if not checkpoint_path:
+            raise ValueError("--checkpoint is required for nafnet model")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"NAFNet checkpoint not found: {checkpoint_path}")
+        result = denoise_video(
+            input_path=input_path,
+            output_path=output_path,
+            checkpoint_path=checkpoint_path,
+            batch_size=batch_size,
+            crf=crf,
+            encoder="hevc_nvenc",
+            max_frames=max_frames,
+            fp16=True,
+            use_compile=use_compile,
+        )
+    else:
+        from denoise_batch import denoise_video
+        result = denoise_video(
+            input_path=input_path,
+            output_path=output_path,
+            model_name=model_name,
+            batch_size=batch_size,
+            crf=crf,
+            encoder="hevc_nvenc",
+            max_frames=max_frames,
+            use_compile=False,
+            use_sdpa=False,
+        )
 
     vol.commit()
     return result
@@ -150,18 +177,25 @@ def mux_streams(denoised_path: str, original_path: str, final_path: str):
 def main(
     input: str,
     output: str = "",
-    model: str = "scunet_color_real_psnr",
+    model: str = "scunet",
+    model_name: str = "scunet_color_real_psnr",
+    checkpoint: str = "",
     batch_size: int = 6,
     crf: int = 18,
     max_frames: int = -1,
+    compile: bool = False,
 ):
     """
-    Denoise a local video file using SCUNet on a Modal cloud GPU.
+    Denoise a local video file on a Modal cloud GPU.
 
     Examples:
+        # SCUNet (default)
         modal run cloud/modal_denoise.py --input episode.mkv
         modal run cloud/modal_denoise.py --input episode.mkv --batch-size 8
-        modal run cloud/modal_denoise.py --input episode.mkv --crf 20
+
+        # NAFNet (distilled)
+        modal run cloud/modal_denoise.py --input episode.mkv --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth
+        modal run cloud/modal_denoise.py --input episode.mkv --model nafnet --checkpoint checkpoints/nafnet_distill/nafnet_best.pth --compile
     """
     import pathlib
 
@@ -169,14 +203,27 @@ def main(
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input not found: {input_path}")
 
+    if model == "nafnet" and not checkpoint:
+        raise ValueError("--checkpoint is required when --model nafnet")
+    if checkpoint:
+        checkpoint = str(pathlib.Path(checkpoint).resolve())
+        if not os.path.exists(checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+    # NAFNet uses more intermediate memory per frame (full-res convolutions)
+    # than SCUNet (windowed attention), so default to smaller batches
+    if batch_size == 6 and model == "nafnet":
+        batch_size = 2
+
     if not output:
         p = pathlib.Path(input_path)
-        output = str(p.with_stem(p.stem + "_denoised").with_suffix(".mkv"))
+        suffix = "_nafnet" if model == "nafnet" else "_denoised"
+        output = str(p.with_stem(p.stem + suffix).with_suffix(".mkv"))
 
     input_size = os.path.getsize(input_path) / 1024**2
     print(f"Input:  {input_path} ({input_size:.0f} MB)")
     print(f"Output: {output}")
-    print(f"batch_size: {batch_size}, CRF: {crf}, model: {model}")
+    print(f"Model: {model}, batch_size: {batch_size}, CRF: {crf}, compile: {compile}")
 
     # Volume paths (relative to volume root for upload/download API)
     basename = os.path.basename(input_path)
@@ -189,22 +236,32 @@ def main(
     ctr_output_video = f"{VOL_MOUNT}{vol_rel_output_video}"
     ctr_output_final = f"{VOL_MOUNT}{vol_rel_output_final}"
 
-    # Upload
+    # Upload video (and checkpoint if NAFNet)
     print(f"\nUploading {input_size:.0f} MB to Modal volume...")
     t0 = time.time()
+    ctr_checkpoint = ""
     with vol.batch_upload(force=True) as batch:
         batch.put_file(input_path, vol_rel_input)
+        if model == "nafnet" and checkpoint:
+            ckpt_basename = os.path.basename(checkpoint)
+            vol_rel_ckpt = f"/checkpoints/{ckpt_basename}"
+            batch.put_file(checkpoint, vol_rel_ckpt)
+            ctr_checkpoint = f"{VOL_MOUNT}{vol_rel_ckpt}"
+            print(f"  Uploading checkpoint: {ckpt_basename}")
     print(f"  Upload done in {time.time() - t0:.0f}s")
 
     # Denoise on cloud GPU
-    print(f"\nStarting denoise on L4...")
+    print(f"\nStarting denoise on L4 ({model})...")
     result = denoise_remote.remote(
         input_path=ctr_input,
         output_path=ctr_output_video,
-        model_name=model,
+        model_type=model,
+        model_name=model_name,
+        checkpoint_path=ctr_checkpoint,
         batch_size=batch_size,
         crf=crf,
         max_frames=max_frames,
+        use_compile=compile,
     )
     print(f"\nDenoise complete: {result['frames']} frames, "
           f"{result['elapsed_min']:.1f} min, {result['fps']:.1f} fps")
