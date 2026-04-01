@@ -254,8 +254,7 @@ def main(
     t0 = time.time()
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with open(output, "wb") as f:
-        for chunk in vol.read_file(vol_rel_output_final):
-            f.write(chunk)
+        vol.read_file_into_fileobj(vol_rel_output_final, f)
     dl_time = time.time() - t0
     out_size = os.path.getsize(output) / 1024**2
     print(f"  Downloaded {out_size:.0f} MB in {dl_time:.0f}s")
