@@ -211,10 +211,20 @@ def denoise_video(
     processed = 0
     errors = 0
 
-    # Pre-allocate pinned CPU buffers for async H2D transfer (double-buffered)
+    # Pad dimensions to match warmup shape (CUDA graphs are shape-specific!)
+    h_pad = h + (16 - h % 16) % 16
+    w_pad = w + (16 - w % 16) % 16
+
+    # Pre-allocate pinned CPU buffers at PADDED dims (must match compile warmup shape)
     dtype = torch.float16 if fp16 else torch.float32
-    pinned = [torch.empty(batch_size, 3, h, w, dtype=dtype, pin_memory=True) for _ in range(2)]
-    transfer_stream = torch.cuda.Stream()
+    pinned = [torch.zeros(batch_size, 3, h_pad, w_pad, dtype=dtype, pin_memory=True) for _ in range(2)]
+
+    # Pre-allocate GPU input buffers (reuse to avoid CUDA graph invalidation from alloc/free)
+    gpu_inputs = [
+        torch.zeros(batch_size, 3, h_pad, w_pad, dtype=dtype, device=DEVICE).to(
+            memory_format=torch.channels_last)
+        for _ in range(2)
+    ]
 
     def collect_batch():
         """Collect up to batch_size frames from reader queue."""
@@ -227,15 +237,14 @@ def denoise_video(
         return frames, False
 
     def prepare_tensor(frames, buf_idx):
-        """Convert frames directly into pinned buffer, async transfer to GPU."""
+        """Convert frames into pre-allocated pinned buffer at padded dims, copy to GPU."""
         buf = pinned[buf_idx]
         for i, frame in enumerate(frames):
-            # Write into pinned buffer: HWC uint8 → CHW fp16, single copy
-            t = torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1)  # (3,H,W) uint8
+            t = torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1)
             buf[i, :, :h, :w] = t.to(dtype=dtype) / 255.0
-        # Async transfer on separate stream
-        gpu_tensor = buf[:len(frames)].to(DEVICE, memory_format=torch.channels_last, non_blocking=True)
-        return gpu_tensor
+        # Copy into pre-allocated GPU buffer (no new CUDA allocation)
+        gpu_inputs[buf_idx][:len(frames)].copy_(buf[:len(frames)], non_blocking=True)
+        return gpu_inputs[buf_idx][:len(frames)]
 
     # Per-stage timing accumulators
     t_collect = 0.0
@@ -270,10 +279,11 @@ def denoise_video(
             next_frames = []
         t2 = time.perf_counter()
 
-        # Sync GPU, get results
+        # Sync GPU, get results — crop to original dims (undo padding)
         torch.cuda.synchronize()
         t3 = time.perf_counter()
-        out_np = (out_t.clamp(0, 1) * 255).byte().cpu().numpy().transpose(0, 2, 3, 1)
+        out_cropped = out_t[:, :, :h, :w]
+        out_np = (out_cropped.clamp(0, 1) * 255).byte().cpu().numpy().transpose(0, 2, 3, 1)
         t4 = time.perf_counter()
 
         # Write entire batch to encoder at once
@@ -287,7 +297,7 @@ def denoise_video(
         t_write += t5 - t4
         n_batches += 1
 
-        del cur_tensor, out_t
+        # Don't del cur_tensor — it's a view into pre-allocated gpu_inputs (avoid CUDA graph invalidation)
         processed += len(cur_frames)
 
         if processed % max(batch_size * 10, 50) == 0 or processed == len(cur_frames):
