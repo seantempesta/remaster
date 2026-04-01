@@ -1,0 +1,4 @@
+commit	fps	peak_gb	psnr_db	cost_ep	gpu	batch_size	status	description
+baseline	0.78	3.2	39.61	$17.38	L4	1	keep	eager + bs=1 + L4
+-	0.67	5.5	39.61	$20.16	L4	1	discard	eager + bs=1 + L4 + channels_last + cudnn.bench
+-	2.56	2.0	39.61	$5.29	L4	1	data	compile(reduce-overhead) + bs=1 + L4 + channels_last + cudnn.bench

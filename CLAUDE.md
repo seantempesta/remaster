@@ -48,7 +48,7 @@ An experimentation platform for improving video quality using ML models. The pri
 - `KAIR/` — image restoration toolkit reference
 
 ## Data Directory
-`data/` contains video clips, extracted frames, model outputs. Git-ignored due to size.
+`data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Contains video clips, extracted frames, model outputs. Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.
 
 ## Current Status (2026-04-01)
 
