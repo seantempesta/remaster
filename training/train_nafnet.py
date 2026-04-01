@@ -226,7 +226,7 @@ class PairedFrameDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, data_dir, device, num_frames=5, crop_size=512):
+def validate(model, data_dir, device, num_frames=10, crop_size=512):
     """
     Validate on a few full-resolution crops (larger than training crops).
     Returns average PSNR in dB.
@@ -481,9 +481,9 @@ def train(args):
 
         # ---- Validation ----
         if (iteration + 1) % args.val_freq == 0:
-            psnr = validate(model, args.data_dir, device,
-                          num_frames=min(10, len(dataset.pairs)),
-                          crop_size=512)
+            val_dir = args.val_dir if args.val_dir else args.data_dir
+            psnr = validate(model, val_dir, device,
+                          num_frames=10, crop_size=512)
             is_best = psnr > best_psnr
             if is_best:
                 best_psnr = psnr
@@ -540,6 +540,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int,
                         default=int(os.environ.get("BATCH_SIZE", "4")),
                         help="Batch size (4 fits in 6GB with 256 crops)")
+    parser.add_argument("--val-dir", type=str, default=None,
+                        help="Validation pairs directory (separate from training data)")
     parser.add_argument("--num-workers", type=int, default=2,
                         help="DataLoader workers")
 

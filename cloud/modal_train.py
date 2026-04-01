@@ -63,6 +63,7 @@ def train_remote(
     crop_size: int = 384,
     grad_clip: float = 1.0,
     perceptual_weight: float = 0.0,
+    val_dir: str = "",
 ):
     """Run training on a cloud GPU."""
     import sys
@@ -80,6 +81,10 @@ def train_remote(
     if n_input == 0 or n_target == 0:
         raise FileNotFoundError(f"No training pairs found in {data_dir}")
 
+    if val_dir:
+        n_val = len(glob.glob(os.path.join(val_dir, "input", "*.png")))
+        print(f"Validation data: {n_val} frames from {val_dir}")
+
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Build args
@@ -90,6 +95,7 @@ def train_remote(
         pass
     args = Args()
     args.data_dir = data_dir
+    args.val_dir = val_dir or None
     args.crop_size = crop_size
     args.batch_size = batch_size
     args.num_workers = 4
@@ -135,9 +141,10 @@ def main(
     crop_size: int = 384,
     grad_clip: float = 1.0,
     perceptual_weight: float = 0.0,
+    val_dir: str = "data/val_pairs",
 ):
     """
-    Upload training data and run NAFNet distillation training on Modal A10G.
+    Upload training data and run NAFNet distillation training on Modal A100.
 
     Examples:
         modal run cloud/modal_train.py --data-dir data/train_pairs
@@ -156,17 +163,26 @@ def main(
     target_files = sorted(glob.glob(os.path.join(target_dir, "*.png")))
     print(f"Training data: {len(input_files)} inputs, {len(target_files)} targets")
 
+    # Validation data (separate from training)
+    val_dir = os.path.abspath(val_dir)
+    val_input_files = sorted(glob.glob(os.path.join(val_dir, "input", "*.png"))) if os.path.isdir(val_dir) else []
+    val_target_files = sorted(glob.glob(os.path.join(val_dir, "target", "*.png"))) if os.path.isdir(val_dir) else []
+    has_val = len(val_input_files) > 0 and len(val_target_files) > 0
+    if has_val:
+        print(f"Validation data: {len(val_input_files)} pairs from {val_dir}")
+    else:
+        print(f"WARNING: No validation data found at {val_dir}, validating on training data")
+
     # Volume paths
     vol_data_dir = f"{VOL_MOUNT}/train_pairs"
+    vol_val_dir = f"{VOL_MOUNT}/val_pairs"
     vol_ckpt_dir = f"{VOL_MOUNT}/checkpoints/nafnet_distill"
     vol_pretrained = f"{VOL_MOUNT}/pretrained/NAFNet-SIDD-width64.pth"
 
-    # Upload training data + pretrained weights
-    print(f"\nUploading training data to Modal volume...")
+    # Upload training data + validation data + pretrained weights
+    print(f"\nUploading data to Modal volume...")
     t0 = time.time()
 
-    # Check what's already uploaded by counting (we can't easily check individual files)
-    # Upload everything (Modal handles dedup/overwrites efficiently)
     pretrained_local = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..",
         "reference-code", "NAFNet", "experiments", "pretrained_models", "NAFNet-SIDD-width64.pth"
@@ -185,6 +201,15 @@ def main(
         for f in target_files:
             fname = os.path.basename(f)
             batch.put_file(f, f"/train_pairs/target/{fname}")
+
+        # Upload validation pairs
+        if has_val:
+            for f in val_input_files:
+                fname = os.path.basename(f)
+                batch.put_file(f, f"/val_pairs/input/{fname}")
+            for f in val_target_files:
+                fname = os.path.basename(f)
+                batch.put_file(f, f"/val_pairs/target/{fname}")
 
     upload_time = time.time() - t0
     print(f"  Upload done in {upload_time:.0f}s")
@@ -205,6 +230,7 @@ def main(
         crop_size=crop_size,
         grad_clip=grad_clip,
         perceptual_weight=perceptual_weight,
+        val_dir=vol_val_dir if has_val else "",
     )
     print(f"\nTraining complete. Best model at: {result_path}")
 
