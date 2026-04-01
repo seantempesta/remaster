@@ -2,23 +2,33 @@
 
 ## Goal
 
-Get NAFNet-width64 inference to **>=5 fps at 1080p** so a 42-min Firefly episode (61K frames) costs **<=$3** on Modal.
+Maximize NAFNet-width64 inference fps at 1080p on Modal while maintaining quality (PSNR within 1 dB of baseline). Lower cost per episode is better — but the primary objective is **maximum throughput**. Don't settle for "good enough."
 
-Current: 0.7 fps on L4 = ~$19/episode. Target: 5+ fps = ~$2.70/episode.
+## How to Run an Experiment
 
-## Method (Karpathy Loop)
+1. Read `bench/speed-opt/results.tsv` — understand what's been tried and what the current best is
+2. **Think hard** about the best next experiment. Consider:
+   - What is the current bottleneck? (memory bandwidth? compute? batch utilization? GPU choice?)
+   - What does the data suggest? (e.g. if peak VRAM is 2 GB on a 40 GB GPU, increase batch size!)
+   - Don't just increment one variable — make the smartest move given ALL available information
+3. Run: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_profile.py [flags]`
+4. Verify results from Modal logs: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal app list` then `... -m modal app logs <app-id>`
+5. Record results in `bench/speed-opt/results.tsv`
+6. If fps improved and quality held: **keep** — commit and build on it
+7. If not: **discard** — record it and try something different
 
-Each experiment tests ONE optimization. The profiling script (`cloud/modal_profile.py`) runs on Modal, processes ~50 frames at 1080p, and reports fps / peak_memory / PSNR. Cost: ~$0.10-0.20 per run.
+## Profiling Script Flags
 
 ```
-LOOP:
-  1. Pick ONE optimization
-  2. Edit cloud/modal_profile.py or lib/nafnet_arch.py
-  3. git commit -m "speed-opt: <description>"
-  4. Run: PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_profile.py
-  5. Record results in bench/speed-opt/results.tsv
-  6. If fps improved AND psnr held (within 1 dB of baseline): KEEP
-  7. If not: DISCARD (git reset --hard to last keep commit)
+cloud/modal_profile.py [options]:
+  --batch-size N        Frames per batch (default: 1)
+  --compile             Enable torch.compile
+  --compile-mode MODE   reduce-overhead (default) or max-autotune
+  --channels-last       Use channels_last memory format
+  --cudnn-benchmark     Enable cudnn.benchmark
+  --tensorrt            Use TensorRT (requires trt_image)
+  --gpu GPU             L4 (default), A10G, or A100
+  --num-frames N        Frames to process (default: 50)
 ```
 
 ## Results File
@@ -29,65 +39,38 @@ LOOP:
 commit	fps	peak_gb	psnr_db	cost_ep	gpu	batch_size	status	description
 ```
 
-- **fps**: frames per second (primary metric, higher is better)
-- **peak_gb**: peak GPU memory in GB (constraint — must fit in GPU VRAM)
-- **psnr_db**: PSNR of output vs SCUNet reference frame (quality gate — must stay within 1 dB of baseline)
-- **cost_ep**: estimated cost for 61K frames = `61000 / fps / 3600 * gpu_hourly_rate` (L4=$0.80, A10G=$1.10, A100=$2.78, H100=$3.95)
-- **gpu**: GPU type used (L4, A10G, A100, H100)
-- **batch_size**: batch size tested
-- **status**: `keep` / `discard` / `crash`
-- **description**: what this experiment tried
+Cost formula: `61000 / fps / 3600 * gpu_hourly_rate` (L4=$0.80, A10G=$1.10, A100=$2.78, H100=$3.95)
 
-## Experiment Queue (ranked by expected impact)
+## Key Context
 
-| # | Optimization | Expected Gain | Notes |
-|---|---|---|---|
-| 1 | **Baseline** | — | Establish current fps/memory/psnr |
-| 2 | **channels_last + cudnn.benchmark** | 1.3-1.6x | 2 lines of code, free perf for CNNs |
-| 3 | **torch.compile reduce-overhead** | 1.5-3x | Proper 1080p warmup, not 256x256 |
-| 4 | **torch.compile max-autotune** | possibly better than reduce-overhead | Slower warmup, better kernels |
-| 5 | **TensorRT fp16** | 3-5x over eager | Nuclear option for static CNNs |
-| 6 | **Optimal batch_size** | 1.2-1.5x | Test bs=1,2,3,4,6 at best config |
-| 7 | **A100 GPU** | ~3x bandwidth | 2TB/s vs L4's 300 GB/s |
-| 8 | **INT8 quantization** | 2x over fp16 | Via TensorRT, check quality |
+- **NAFNet-width64**: 116M params, pure CNN, no attention, no dynamic control flow. torch.compile and TensorRT friendly.
+- **Memory-bandwidth bound**: steady per-frame latency with zero variance confirms this. Optimizations that reduce memory traffic (kernel fusion, bigger batches to amortize weight reads) help most.
+- **Available GPUs on Modal**: L4 (24GB, 300 GB/s, $0.80/hr), A10G (24GB, 600 GB/s, $1.10/hr), A100 (40GB, 2 TB/s, $2.78/hr), H100 (80GB, 3.35 TB/s, $3.95/hr)
+- **VRAM headroom**: compiled model uses ~2 GB peak at bs=1. Most GPUs have massive headroom for larger batches.
 
-## Profiling Script
+## Optimization Levers
 
-`cloud/modal_profile.py` — self-contained Modal script that:
-1. Loads NAFNet-width64 from checkpoint on Modal volume
-2. Decodes ~50 frames from clip_mid_1080p.mp4 (uploaded to volume)
-3. Runs inference with the specified configuration
-4. Measures: fps (excluding warmup), peak VRAM, PSNR vs first input frame
-5. Prints a TSV-formatted results line for easy copy-paste
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `cloud/modal_profile.py` | Modal profiling script (edit per experiment) |
-| `bench/speed-opt/results.tsv` | Experiment results log |
-| `bench/speed-opt/EXPERIMENT.md` | This file — experiment guide |
-| `lib/nafnet_arch.py` | NAFNet architecture (may be edited for optimizations) |
-| `checkpoints/nafnet_distill/nafnet_best.pth` | Trained checkpoint (443MB) |
-| `data/clip_mid_1080p.mp4` | Reference clip for profiling (81MB, 720 frames) |
+| Lever | What it does | When to use |
+|-------|-------------|-------------|
+| **batch_size** | Process N frames at once. Amortizes weight reads, improves GPU utilization. | When peak VRAM << available VRAM |
+| **torch.compile** | Fuses ops, reduces kernel launches, enables CUDA graphs. | Always — 2-3x speedup confirmed |
+| **compile mode** | `reduce-overhead` uses CUDA graphs. `max-autotune` adds Triton kernel search. | Try max-autotune if reduce-overhead plateaus |
+| **channels_last** | NHWC memory layout, better for cuDNN conv kernels. | Helps ~15% with compile, hurts without |
+| **cudnn.benchmark** | Autoselects fastest conv algorithm. | Free, always enable with compile |
+| **TensorRT** | Maximum kernel fusion for static CNNs. Eliminates intermediate memory writes. | If compile isn't enough — biggest potential gain |
+| **GPU tier** | More bandwidth = more fps for bandwidth-bound models. | When software optimizations plateau |
+| **INT8 quantization** | Halves memory bandwidth needs. | Last resort — may affect quality |
 
 ## Environment
 
-- **Local**: Windows 11, conda env `upscale`, RTX 3060 6GB — DO NOT run inference locally
-- **Modal**: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_profile.py`
-- **Volume**: `upscale-data` mounted at `/mnt/data` in containers
-- Checkpoint uploaded to `/mnt/data/checkpoints/nafnet_best.pth`
-- Clip uploaded to `/mnt/data/input/clip_mid_1080p.mp4`
-
-## Quality Gate
-
-Baseline PSNR (NAFNet output vs compressed input) should be ~56.8 dB (from distillation training). Any optimization that drops PSNR by more than 1 dB is rejected. INT8 gets a 2 dB tolerance since the quality tradeoff is intentional.
+- **Local**: Windows 11, conda env `upscale`, RTX 3060 6GB — **DO NOT run inference locally**
+- **Modal command**: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_profile.py`
+- **Verify results**: Always check Modal logs directly. Agent-reported results must be verified.
+- **Volume**: `upscale-data` mounted at `/mnt/data`. Checkpoint at `/mnt/data/checkpoints/nafnet_best.pth`, clip at `/mnt/data/input/clip_mid_1080p.mp4`.
 
 ## Critical Gotchas
 
-- **torch.compile warmup**: Must warm up at actual 1080p resolution (1920x1088 padded), NOT 256x256. Different shapes trigger separate compilations.
-- **NAFNet fp16 LayerNorm**: `lib/nafnet_arch.py` casts to fp32 for normalization. Don't revert this.
-- **Modal volume**: Must call `vol.reload()` before reading uploaded files in container.
-- **PYTHONUTF8=1**: Required on Windows to avoid UnicodeEncodeError with Modal CLI.
-- **channels_last**: Apply with `model.to(memory_format=torch.channels_last)` AND convert input tensors too.
-- **TensorRT**: May need to rewrite LayerNorm2d custom autograd for ONNX export compatibility.
+- **torch.compile warmup**: Must warm up at 1920x1088 (actual resolution), not 256x256.
+- **NAFNet fp16 LayerNorm**: `lib/nafnet_arch.py` casts to fp32 for normalization. Don't revert.
+- **Modal volume**: Must call `vol.reload()` before reading uploaded files.
+- **PYTHONUTF8=1**: Required on Windows for Modal CLI.
