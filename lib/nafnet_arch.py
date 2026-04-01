@@ -59,6 +59,51 @@ class LayerNorm2d(nn.Module):
         return x.to(dtype)
 
 
+class LayerNorm2dExport(nn.Module):
+    """TRT/ONNX-export-safe version of LayerNorm2d.
+
+    Uses only standard ops (no custom autograd.Function, no dtype branching).
+    Always casts to fp32 for the normalization arithmetic and back.
+    Numerically identical to LayerNorm2d's fp16 path.
+    """
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.eps = eps
+
+    def forward(self, x):
+        x_f = x.float()
+        mu = x_f.mean(1, keepdim=True)
+        var = (x_f - mu).pow(2).mean(1, keepdim=True)
+        x_f = (x_f - mu) / (var + self.eps).sqrt()
+        x_f = self.weight.float().view(1, -1, 1, 1) * x_f + self.bias.float().view(1, -1, 1, 1)
+        return x_f.half()
+
+
+def swap_layernorm_for_export(model):
+    """Replace all LayerNorm2d modules with LayerNorm2dExport (TRT-safe).
+
+    Copies weights/bias from the original modules. Modifies the model in-place
+    and returns it for convenience.
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, LayerNorm2d):
+            export_ln = LayerNorm2dExport(module.weight.shape[0], module.eps)
+            export_ln.weight = module.weight
+            export_ln.bias = module.bias
+            # Navigate to parent and replace the attribute
+            parts = name.split('.')
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p) if not p.isdigit() else parent[int(p)]
+            if parts[-1].isdigit():
+                parent[int(parts[-1])] = export_ln
+            else:
+                setattr(parent, parts[-1], export_ln)
+    return model
+
+
 class SimpleGate(nn.Module):
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)

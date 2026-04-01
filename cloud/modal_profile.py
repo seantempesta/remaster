@@ -21,8 +21,8 @@ import time
 vol = modal.Volume.from_name("upscale-data", create_if_missing=True)
 VOL_MOUNT = "/mnt/data"
 
-# Base image with PyTorch + OpenCV (no ffmpeg build needed for profiling)
-base_image = (
+# Packages shared by both base and TRT images (add_local_dir must come LAST)
+_packages_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg")
     .pip_install(
@@ -31,13 +31,19 @@ base_image = (
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install("opencv-python-headless", "numpy")
+)
+
+# Base image with PyTorch + OpenCV (no ffmpeg build needed for profiling)
+base_image = (
+    _packages_image
     .add_local_dir("lib", remote_path="/root/project/lib", ignore=["__pycache__/**", "*.pyc"])
 )
 
 # TensorRT image (heavier, only used when --tensorrt flag is set)
 trt_image = (
-    base_image
+    _packages_image
     .pip_install("torch-tensorrt==2.5.0", extra_index_url="https://download.pytorch.org/whl/cu121")
+    .add_local_dir("lib", remote_path="/root/project/lib", ignore=["__pycache__/**", "*.pyc"])
 )
 
 app = modal.App("nafnet-profile", image=base_image)
@@ -139,6 +145,107 @@ def profile_a100(
     )
 
 
+# --- TensorRT variants (use trt_image with torch-tensorrt installed) ---
+
+@app.function(
+    image=trt_image,
+    gpu="L4",
+    volumes={VOL_MOUNT: vol},
+    timeout=1800,
+    memory=8192,
+)
+def profile_l4_trt(
+    checkpoint_path: str,
+    clip_path: str,
+    num_frames: int = 200,
+    batch_size: int = 1,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_channels_last: bool = False,
+    use_cudnn_benchmark: bool = False,
+    use_tensorrt: bool = False,
+):
+    return _run_profile(
+        checkpoint_path=checkpoint_path,
+        clip_path=clip_path,
+        num_frames=num_frames,
+        batch_size=batch_size,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_channels_last=use_channels_last,
+        use_cudnn_benchmark=use_cudnn_benchmark,
+        use_tensorrt=use_tensorrt,
+        gpu_name="L4",
+        gpu_hourly_rate=0.80,
+    )
+
+
+@app.function(
+    image=trt_image,
+    gpu="A10G",
+    volumes={VOL_MOUNT: vol},
+    timeout=1800,
+    memory=8192,
+)
+def profile_a10g_trt(
+    checkpoint_path: str,
+    clip_path: str,
+    num_frames: int = 200,
+    batch_size: int = 1,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_channels_last: bool = False,
+    use_cudnn_benchmark: bool = False,
+    use_tensorrt: bool = False,
+):
+    return _run_profile(
+        checkpoint_path=checkpoint_path,
+        clip_path=clip_path,
+        num_frames=num_frames,
+        batch_size=batch_size,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_channels_last=use_channels_last,
+        use_cudnn_benchmark=use_cudnn_benchmark,
+        use_tensorrt=use_tensorrt,
+        gpu_name="A10G",
+        gpu_hourly_rate=1.10,
+    )
+
+
+@app.function(
+    image=trt_image,
+    gpu="A100",
+    volumes={VOL_MOUNT: vol},
+    timeout=1800,
+    memory=8192,
+)
+def profile_a100_trt(
+    checkpoint_path: str,
+    clip_path: str,
+    num_frames: int = 200,
+    batch_size: int = 1,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_channels_last: bool = False,
+    use_cudnn_benchmark: bool = False,
+    use_tensorrt: bool = False,
+):
+    return _run_profile(
+        checkpoint_path=checkpoint_path,
+        clip_path=clip_path,
+        num_frames=num_frames,
+        batch_size=batch_size,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_channels_last=use_channels_last,
+        use_cudnn_benchmark=use_cudnn_benchmark,
+        use_tensorrt=use_tensorrt,
+        gpu_name="A100",
+        gpu_hourly_rate=2.78,
+    )
+
+
 def _run_profile(
     checkpoint_path: str,
     clip_path: str,
@@ -213,10 +320,16 @@ def _run_profile(
     if use_tensorrt:
         try:
             import torch_tensorrt
-            # Use torch_tensorrt.compile for simplicity
+            from lib.nafnet_arch import swap_layernorm_for_export
+
+            # Replace LayerNorm2d with export-safe version (no custom autograd.Function)
+            print("Swapping LayerNorm2d -> LayerNorm2dExport for TRT compatibility...")
+            model = swap_layernorm_for_export(model)
+
             example_input = torch.randn(batch_size, 3, 1088, 1920, device="cuda", dtype=torch.float16)
             if use_channels_last:
                 example_input = example_input.to(memory_format=torch.channels_last)
+
             print(f"Building TensorRT engine (batch_size={batch_size}, fp16, 1920x1088)...")
             t0 = time.time()
             model = torch_tensorrt.compile(
@@ -224,8 +337,22 @@ def _run_profile(
                 inputs=[example_input],
                 enabled_precisions={torch.float16},
                 truncate_long_and_double=True,
+                workspace_size=1 << 30,  # 1 GB workspace for kernel selection
             )
             print(f"  TensorRT build done in {time.time() - t0:.1f}s")
+
+            # Warmup TRT engine (first inference may be slow)
+            print("  TRT warmup...")
+            with torch.no_grad():
+                _ = model(example_input)
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                _ = model(example_input)
+            torch.cuda.synchronize()
+            del example_input
+            torch.cuda.empty_cache()
+            print("  TRT warmup done")
+
         except Exception as e:
             import traceback
             print(f"  TensorRT FAILED: {e}")
@@ -511,7 +638,10 @@ def main(
     print(f"  batch_size={batch_size}, compile={compile}, compile_mode={compile_mode}")
     print(f"  channels_last={channels_last}, cudnn_benchmark={cudnn_benchmark}, tensorrt={tensorrt}")
 
-    gpu_funcs = {"L4": profile_l4, "A10G": profile_a10g, "A100": profile_a100}
+    if tensorrt:
+        gpu_funcs = {"L4": profile_l4_trt, "A10G": profile_a10g_trt, "A100": profile_a100_trt}
+    else:
+        gpu_funcs = {"L4": profile_l4, "A10G": profile_a10g, "A100": profile_a100}
     fn = gpu_funcs.get(gpu.upper())
     if fn is None:
         raise ValueError(f"Unsupported GPU: {gpu}. Choose from: {list(gpu_funcs.keys())}")
