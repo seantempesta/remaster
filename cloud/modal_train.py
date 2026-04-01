@@ -26,9 +26,9 @@ image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("libgl1", "libglib2.0-0")
     .pip_install(
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
+        "torch==2.7.1",
+        "torchvision==0.22.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
     )
     .pip_install(
         "opencv-python-headless",
@@ -44,22 +44,25 @@ app = modal.App("train-nafnet-distill", image=image)
 
 
 @app.function(
-    gpu="A10G",
+    gpu="H100",
     volumes={VOL_MOUNT: vol},
     timeout=28800,  # 8 hours max
-    memory=32768,   # 32GB RAM
+    memory=65536,   # 64GB RAM
 )
 def train_remote(
     data_dir: str,
     checkpoint_dir: str,
     pretrained_path: str,
     max_iters: int = 50000,
-    batch_size: int = 8,
+    batch_size: int = 16,
     lr: float = 2e-4,
     loss: str = "charbonnier",
     resume: bool = False,
     val_freq: int = 1000,
     save_freq: int = 5000,
+    crop_size: int = 384,
+    grad_clip: float = 1.0,
+    perceptual_weight: float = 0.0,
 ):
     """Run training on a cloud GPU."""
     import sys
@@ -87,7 +90,7 @@ def train_remote(
         pass
     args = Args()
     args.data_dir = data_dir
-    args.crop_size = 256
+    args.crop_size = crop_size
     args.batch_size = batch_size
     args.num_workers = 4
     args.pretrained = pretrained_path
@@ -97,8 +100,9 @@ def train_remote(
     args.eta_min = 1e-7
     args.weight_decay = 0.0
     args.warmup_iters = min(500, max_iters // 10)
-    args.grad_clip = 0.0
+    args.grad_clip = grad_clip
     args.loss = loss
+    args.perceptual_weight = perceptual_weight
     args.amp = True
     args.checkpoint_dir = checkpoint_dir
     args.print_freq = 50
@@ -122,12 +126,15 @@ def train_remote(
 def main(
     data_dir: str = "data/train_pairs",
     max_iters: int = 50000,
-    batch_size: int = 8,
+    batch_size: int = 16,
     lr: float = 2e-4,
     loss: str = "charbonnier",
     resume: bool = False,
     val_freq: int = 1000,
     save_freq: int = 5000,
+    crop_size: int = 384,
+    grad_clip: float = 1.0,
+    perceptual_weight: float = 0.0,
 ):
     """
     Upload training data and run NAFNet distillation training on Modal A10G.
@@ -183,7 +190,7 @@ def main(
     print(f"  Upload done in {upload_time:.0f}s")
 
     # Run training
-    print(f"\nStarting training on A10G ({max_iters} iterations)...")
+    print(f"\nStarting training on H100 ({max_iters} iters, crop={crop_size}, bs={batch_size}, perceptual={perceptual_weight})...")
     result_path = train_remote.remote(
         data_dir=vol_data_dir,
         checkpoint_dir=vol_ckpt_dir,
@@ -195,6 +202,9 @@ def main(
         resume=resume,
         val_freq=val_freq,
         save_freq=save_freq,
+        crop_size=crop_size,
+        grad_clip=grad_clip,
+        perceptual_weight=perceptual_weight,
     )
     print(f"\nTraining complete. Best model at: {result_path}")
 

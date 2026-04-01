@@ -340,6 +340,14 @@ def train(args):
         raise ValueError(f"Unknown loss: {args.loss}")
     print(f"Loss: {args.loss}")
 
+    # ---- Perceptual loss (optional) ----
+    perceptual_criterion = None
+    if args.perceptual_weight > 0:
+        perceptual_criterion = VGGPerceptualLoss().to(device)
+        print(f"Perceptual loss: VGG19, weight={args.perceptual_weight}")
+        if device.type == "cuda":
+            print(f"  VGG VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
+
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -391,6 +399,8 @@ def train(args):
     print(f"  max_iters:   {args.max_iters}")
     print(f"  warmup:      {warmup_iters}")
     print(f"  loss:        {args.loss}")
+    print(f"  perceptual:  {args.perceptual_weight}")
+    print(f"  grad_clip:   {args.grad_clip}")
     print(f"  amp:         {use_amp}")
     print(f"  checkpoints: {ckpt_dir}")
     print()
@@ -399,6 +409,8 @@ def train(args):
 
     data_iter = iter(dataloader)
     loss_sum = 0.0
+    pixel_loss_sum = 0.0
+    percep_loss_sum = 0.0
     loss_count = 0
     start_time = time.time()
 
@@ -416,7 +428,15 @@ def train(args):
         # Forward with AMP
         with torch.amp.autocast("cuda", enabled=use_amp):
             pred = model(inp_batch)
-            loss = criterion(pred, tgt_batch)
+            pixel_loss = criterion(pred, tgt_batch)
+
+        # Perceptual loss runs in fp32 (VGG is numerically unstable in fp16)
+        if perceptual_criterion is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                p_loss = perceptual_criterion(pred.float(), tgt_batch.float())
+            loss = pixel_loss + args.perceptual_weight * p_loss
+        else:
+            loss = pixel_loss
 
         # Backward with scaler
         optimizer.zero_grad(set_to_none=True)
@@ -432,6 +452,9 @@ def train(args):
         scheduler.step()
 
         loss_sum += loss.item()
+        pixel_loss_sum += pixel_loss.item()
+        if perceptual_criterion is not None:
+            percep_loss_sum += p_loss.item()
         loss_count += 1
 
         # ---- Logging ----
@@ -442,11 +465,18 @@ def train(args):
             eta = (args.max_iters - iteration - 1) / max(iters_per_sec, 0.01)
             lr_now = optimizer.param_groups[0]["lr"]
             vram = torch.cuda.memory_allocated() / 1024**2 if device.type == "cuda" else 0
+            loss_detail = f"loss={avg_loss:.6f}"
+            if perceptual_criterion is not None:
+                avg_px = pixel_loss_sum / loss_count
+                avg_pc = percep_loss_sum / loss_count
+                loss_detail = f"loss={avg_loss:.6f} (px={avg_px:.6f} perc={avg_pc:.4f})"
             print(f"  iter {iteration + 1:6d}/{args.max_iters} | "
-                  f"loss={avg_loss:.6f} | lr={lr_now:.2e} | "
+                  f"{loss_detail} | lr={lr_now:.2e} | "
                   f"{iters_per_sec:.1f} it/s | ETA: {eta / 60:.1f}min | "
                   f"VRAM: {vram:.0f}MB")
             loss_sum = 0.0
+            pixel_loss_sum = 0.0
+            percep_loss_sum = 0.0
             loss_count = 0
 
         # ---- Validation ----
@@ -534,8 +564,8 @@ def parse_args():
                         help="AdamW weight decay")
     parser.add_argument("--warmup-iters", type=int, default=500,
                         help="Linear warmup iterations")
-    parser.add_argument("--grad-clip", type=float, default=0.0,
-                        help="Gradient clipping max norm (0 = disabled)")
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Gradient clipping max norm (0 = disabled, default: 1.0)")
     parser.add_argument("--loss", type=str, default="charbonnier",
                         choices=["charbonnier", "psnr", "l1"],
                         help="Loss function")
@@ -543,6 +573,8 @@ def parse_args():
                         help="Use AMP mixed precision (default: on, essential for 6GB VRAM)")
     parser.add_argument("--no-amp", action="store_false", dest="amp",
                         help="Disable AMP mixed precision")
+    parser.add_argument("--perceptual-weight", type=float, default=0.0,
+                        help="VGG perceptual loss weight (0 = disabled, try 0.05)")
 
     # Logging / checkpoints
     parser.add_argument("--checkpoint-dir", type=str,
