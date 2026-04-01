@@ -103,6 +103,12 @@ def denoise_remote(
     import sys
     sys.path.insert(0, "/root/project")
 
+    # Persist torch.compile / Triton caches to volume (avoids 5+ min warmup)
+    cache_dir = f"{VOL_MOUNT}/torch_compile_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
+
     # Ensure volume is synced with latest uploads
     vol.reload()
 

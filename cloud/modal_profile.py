@@ -52,7 +52,7 @@ app = modal.App("nafnet-profile", image=base_image)
 def profile_l4(
     checkpoint_path: str,
     clip_path: str,
-    num_frames: int = 50,
+    num_frames: int = 200,
     batch_size: int = 1,
     use_compile: bool = False,
     compile_mode: str = "reduce-overhead",
@@ -84,7 +84,7 @@ def profile_l4(
 def profile_a10g(
     checkpoint_path: str,
     clip_path: str,
-    num_frames: int = 50,
+    num_frames: int = 200,
     batch_size: int = 1,
     use_compile: bool = False,
     compile_mode: str = "reduce-overhead",
@@ -116,7 +116,7 @@ def profile_a10g(
 def profile_a100(
     checkpoint_path: str,
     clip_path: str,
-    num_frames: int = 50,
+    num_frames: int = 200,
     batch_size: int = 1,
     use_compile: bool = False,
     compile_mode: str = "reduce-overhead",
@@ -155,6 +155,12 @@ def _run_profile(
     """Core profiling logic — runs inside the Modal container."""
     import sys
     sys.path.insert(0, "/root/project")
+
+    # Persist torch.compile and Triton caches to Modal volume
+    cache_dir = f"{VOL_MOUNT}/torch_compile_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
 
     import subprocess
     import numpy as np
@@ -416,13 +422,17 @@ def _run_profile(
     print(f"\nTSV line (copy to bench/speed-opt/results.tsv):")
     print(f"COMMIT\t{fps:.2f}\t{peak_gb:.1f}\t{psnr_db:.2f}\t${cost_ep:.2f}\t{gpu_name}\t{batch_size}\t{result['status']}\t{description}")
 
+    # Persist compile/autotune cache to volume for future runs
+    vol.commit()
+    print("Compile cache saved to volume.")
+
     return result
 
 
 @app.local_entrypoint()
 def main(
     batch_size: int = 1,
-    num_frames: int = 50,
+    num_frames: int = 200,
     compile: bool = False,
     compile_mode: str = "reduce-overhead",
     channels_last: bool = False,
