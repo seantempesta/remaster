@@ -44,7 +44,7 @@ app = modal.App("train-nafnet-distill", image=image)
 
 
 @app.function(
-    gpu="H100",
+    gpu="A100",
     volumes={VOL_MOUNT: vol},
     timeout=28800,  # 8 hours max
     memory=65536,   # 64GB RAM
@@ -190,7 +190,7 @@ def main(
     print(f"  Upload done in {upload_time:.0f}s")
 
     # Run training
-    print(f"\nStarting training on H100 ({max_iters} iters, crop={crop_size}, bs={batch_size}, perceptual={perceptual_weight})...")
+    print(f"\nStarting training on A100 ({max_iters} iters, crop={crop_size}, bs={batch_size}, perceptual={perceptual_weight})...")
     result_path = train_remote.remote(
         data_dir=vol_data_dir,
         checkpoint_dir=vol_ckpt_dir,
