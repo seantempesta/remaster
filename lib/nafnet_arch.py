@@ -81,27 +81,74 @@ class LayerNorm2dExport(nn.Module):
         return x_f.half()
 
 
+def _replace_modules(model, predicate, factory):
+    """Replace modules matching predicate with factory(module). In-place."""
+    for name, module in model.named_modules():
+        if predicate(module):
+            replacement = factory(module)
+            parts = name.split('.')
+            parent = model
+            for p in parts[:-1]:
+                parent = getattr(parent, p) if not p.isdigit() else parent[int(p)]
+            if parts[-1].isdigit():
+                parent[int(parts[-1])] = replacement
+            else:
+                setattr(parent, parts[-1], replacement)
+    return model
+
+
 def swap_layernorm_for_export(model):
     """Replace all LayerNorm2d modules with LayerNorm2dExport (TRT-safe).
 
     Copies weights/bias from the original modules. Modifies the model in-place
     and returns it for convenience.
     """
-    for name, module in model.named_modules():
-        if isinstance(module, LayerNorm2d):
-            export_ln = LayerNorm2dExport(module.weight.shape[0], module.eps)
-            export_ln.weight = module.weight
-            export_ln.bias = module.bias
-            # Navigate to parent and replace the attribute
-            parts = name.split('.')
-            parent = model
-            for p in parts[:-1]:
-                parent = getattr(parent, p) if not p.isdigit() else parent[int(p)]
-            if parts[-1].isdigit():
-                parent[int(parts[-1])] = export_ln
-            else:
-                setattr(parent, parts[-1], export_ln)
-    return model
+    def make_export(m):
+        ln = LayerNorm2dExport(m.weight.shape[0], m.eps)
+        ln.weight = m.weight
+        ln.bias = m.bias
+        return ln
+    return _replace_modules(model, lambda m: isinstance(m, LayerNorm2d), make_export)
+
+
+class LayerNorm2dCompile(nn.Module):
+    """torch.compile-friendly version of LayerNorm2d.
+
+    Uses F.layer_norm (a standard op Inductor can fuse) instead of the custom
+    autograd.Function. Normalizes over the channel dimension at each spatial
+    position — identical to LayerNorm2d. Handles fp16 by casting to fp32
+    internally (same as PyTorch's native layer_norm).
+    """
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.channels = channels
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.eps = eps
+
+    def forward(self, x):
+        # Cast to fp32 for numerical stability (same as original LayerNorm2d fp16 path)
+        dtype = x.dtype
+        # NCHW -> NHWC, apply layer_norm over C, NHWC -> NCHW
+        return F.layer_norm(
+            x.float().permute(0, 2, 3, 1), [self.channels],
+            self.weight.float(), self.bias.float(), self.eps
+        ).permute(0, 3, 1, 2).to(dtype)
+
+
+def swap_layernorm_for_compile(model):
+    """Replace all LayerNorm2d with LayerNorm2dCompile for better torch.compile fusion.
+
+    Numerically identical to LayerNorm2d (both normalize over C at each H,W position).
+    Same weights, no retraining needed. Uses F.layer_norm which is a standard op
+    that Inductor can fuse, unlike the custom autograd.Function in LayerNorm2d.
+    """
+    def make_compile(m):
+        ln = LayerNorm2dCompile(m.weight.shape[0], m.eps)
+        ln.weight = m.weight
+        ln.bias = m.bias
+        return ln
+    return _replace_modules(model, lambda m: isinstance(m, LayerNorm2d), make_compile)
 
 
 class SimpleGate(nn.Module):

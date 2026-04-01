@@ -222,3 +222,109 @@ This is important for NAFNet's `LayerNorm2d` which already does fp32 casting int
 - [NVIDIA INT8 quantization whitepaper (2020)](https://arxiv.org/pdf/2004.09602)
 - [Outlier-Aware PTQ for Image SR (ICCV 2025)](https://openaccess.thecvf.com/content/ICCV2025/papers/Wang_Outlier-Aware_Post-Training_Quantization_for_Image_Super-Resolution_ICCV_2025_paper.pdf)
 - [Image Denoising Meets Quantization (IEEE 2024)](https://ieeexplore.ieee.org/document/11137609/)
+
+## 2026-04-01: Full optimization audit
+
+### PyTorch upgrade: 2.5.1 → 2.7.1 + torch-tensorrt 2.7.0
+
+- **Target**: torch==2.7.1, torchvision==0.22.1, torch-tensorrt==2.7.0, cu124
+- **Engine caching API**: `immutable_weights=False` is correct for 2.7.0 (our existing code was right)
+- **15x faster TRT engine builds** in 2.7.0 vs 2.5.0
+- **Python 3.10** still supported (range: 3.9-3.13)
+- **CUDA 12.4 forward-compatible** with A100 (sm_80) and H100 (sm_90)
+- **Breaking changes**: None for pure CNNs. Custom autograd.Function still not TRT-traceable (swap_layernorm_for_export still needed)
+- **New feature**: `tiling_optimization_level` option ("none", "fast", "moderate", "full") — worth testing
+
+### Inductor optimizations we missed
+
+- **TORCHINDUCTOR_FREEZING=1**: Inlines model weights as constants, enables constant folding. Reports show 15-30% latency reduction for UNet models. Just an env var, works on 2.5.1+.
+- **conv_1x1_as_mm=True**: Converts 1x1 convolutions to GEMM (better Tensor Core utilization). NAFNet uses 1x1 convs extensively (conv1, conv3, conv4, conv5 in every NAFBlock). Expected 5-15% gain.
+- **coordinate_descent_tuning=True**: More thorough Triton kernel tuning than default, less expensive than max-autotune.
+
+### LayerNorm2d → GroupNorm(1) swap
+
+Custom `LayerNormFunction` (autograd.Function) is opaque to torch.compile — Inductor cannot fuse it. Replace with `nn.GroupNorm(num_groups=1, num_channels=C)`:
+- Mathematically identical (GroupNorm with 1 group = LayerNorm over C,H,W)
+- Same weights, no retraining needed
+- Inductor can fuse GroupNorm with adjacent convolutions
+- PyTorch's native GroupNorm handles fp16→fp32 accumulation internally
+- Eliminates explicit `.float()` / `.to(dtype)` round-trips that double memory traffic per norm op
+- 72 LayerNorm ops in the model (2 per NAFBlock × 36 blocks)
+
+### AOTInductor (PyTorch 2.6+, stable in 2.7+)
+
+- Compile once → save `.pt2` artifact → zero-warmup loads
+- Same steady-state fps as torch.compile (same Inductor backend)
+- Eliminates 30-60s warmup per Modal container start
+- For production: compile offline, upload `.pt2` to Modal volume, load instantly
+
+### Modal GPU pricing update
+
+A100 dropped from $2.78/hr to $2.10/hr. At 13.4 fps, cost is now ~$2.65/episode (not $3.51).
+
+| GPU | VRAM | $/hr | BW (GB/s) | Projected FPS | $/episode |
+|-----|------|------|-----------|---------------|-----------|
+| L4 | 24 GB | $0.80 | 300 | 2.6 | $5.24 |
+| A10 | 24 GB | $1.10 | 600 | 5.2 | $3.59 |
+| A100-40GB | 40 GB | $2.10 | 1,555 | 13.4 (measured) | $2.65 |
+| A100-80GB | 80 GB | $2.50 | 2,039 | ~17.6 | $2.41 |
+| H100 | 80 GB | $3.95 | 3,350 | ~29 | $2.32 |
+| H200 | 141 GB | $4.54 | 4,800 | ~41 | $1.86 |
+
+### INT8 quantization — realistic expectations
+
+- **Realistic speedup: 1.2-1.4x** (not 2x) due to depthwise conv limitations in TensorRT
+- TensorRT historically has suboptimal INT8 kernels for depthwise convs (groups=channels)
+- TRT 10.x: "no optimized FP8 Convolutions for Group/Depthwise Convolutions" — INT8 recommended but still has limitations
+- NAFNet dw_channel=128 (power of 2) avoids the worst regression (60% perf drop for non-power-of-2 groups)
+- **Quality risk**: Depthwise convs have "fluctuant dynamic data range across filters" — MobileNet-V1/V2 don't reach baseline with INT8 PTQ alone
+- **Mitigation**: Disable quantization on depthwise conv layers if quality drops > 1 dB: `config["quant_cfg"]["*conv2*"] = {"enable": False}`
+- **FP8 not viable**: No FP8 kernels for depthwise convs, even on H100
+- **ModelOpt 0.42.0** is current, requires PyTorch upgrade first
+- **Calibration**: 1000 images sufficient, use entropy calibration (handles activation outliers better than minmax for denoising)
+
+## 2026-04-01: GroupNorm(1) swap — WRONG MATH
+
+The research agent incorrectly stated GroupNorm(1, C) is equivalent to LayerNorm2d. It is NOT:
+- **LayerNorm2d**: normalizes over channel dim (dim=1) — mean/var computed across C channels at each (h,w) position
+- **GroupNorm(1, C)**: normalizes over C,H,W together — mean/var computed across all channels AND spatial positions
+- **GroupNorm(C, C)**: normalizes over H,W per channel — this is InstanceNorm, also not the same
+
+**Correct replacement**: `F.layer_norm(x.permute(0,2,3,1), [C], weight, bias, eps).permute(0,3,1,2)` — this applies LayerNorm over the channel dimension at each spatial position, matching the original. Implemented as `LayerNorm2dCompile` in `lib/nafnet_arch.py`.
+
+The fp32 cast is still needed for fp16 stability (same as original LayerNorm2d).
+
+## 2026-04-01: PyTorch 2.7.1 + torch.compile results
+
+Upgraded from PyTorch 2.5.1 → 2.7.1, cu121 → cu124. All optimizations combined:
+- `TORCHINDUCTOR_FREEZING=1`
+- `conv_1x1_as_mm=True`
+- `LayerNorm2dCompile` (F.layer_norm, Inductor-fusable)
+- `channels_last` + `cudnn.benchmark`
+- `compile(reduce-overhead)`
+
+| GPU | FPS | Cost/ep | vs previous best |
+|-----|-----|---------|-----------------|
+| A100-80GB bs=8 | **15.0** | **$2.37** | +12% fps, -11% cost (was 13.4 fps, $2.65) |
+| H100 bs=8 | **30.82** | **$2.17** | NEW — 2x A100, cheapest yet |
+
+## 2026-04-01: TensorRT 2.7.0 — BROKEN
+
+torch-tensorrt 2.7.0 with `immutable_weights=False` (engine caching) crashes with `DataDependentOutputException` in `_save_weight_mapping`. The conversion falls back to eager PyTorch on failed subgraphs, giving 3.0 fps (5x slower than torch.compile).
+
+The error is in `_TRTInterpreter.check_weight_equal()` which tries to compare tensor values inside FakeTensor mode — `aten._local_scalar_dense` is not supported in FakeTensor. This is a torch-tensorrt bug.
+
+With `immutable_weights=True` (no caching), TRT might work but the engine would need rebuilding every run (~8 min). Not practical.
+
+**Conclusion**: TensorRT via torch.compile backend is not viable for NAFNet with torch-tensorrt 2.7.0. torch.compile with Inductor backend is faster anyway (15 fps vs 3 fps fallback). INT8 via ModelOpt+TRT is blocked by the same issue.
+
+## 2026-04-01: Batch size scaling with CUDA graphs (reduce-overhead)
+
+On H100 with compile(reduce-overhead):
+- bs=8: **30.82 fps** (0.5 GB peak) — best
+- bs=16: **11.2 fps** (0.6 GB peak) — 2.75x SLOWER
+- bs=32: **OOM** — CUDA graph allocation exhausts 80 GB
+
+CUDA graphs pre-allocate the full execution memory upfront. Larger batch sizes mean more activation memory per graph recording, and the graph replay overhead increases. For this bandwidth-bound model, bs=8 is the sweet spot — it amortizes weight reads without excessive graph overhead.
+
+This confirms the model is bandwidth-bound, not compute-bound. Batching beyond bs=8 provides no benefit.

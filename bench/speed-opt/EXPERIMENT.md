@@ -2,7 +2,7 @@
 
 ## Goal
 
-Maximize NAFNet-width64 inference fps at 1080p on Modal while maintaining quality (PSNR within 1 dB of baseline). Lower cost per episode is better — but the primary objective is **maximum throughput**. Don't settle for "good enough."
+Minimize cost per episode AND maximize fps. Both matter — a more expensive GPU that finishes faster and costs less per episode is a win. Maintain quality (PSNR within 1 dB of baseline). Don't settle for "good enough."
 
 ## How to Run an Experiment
 

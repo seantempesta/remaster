@@ -59,9 +59,9 @@ image = (
         "ffmpeg -encoders 2>/dev/null | grep nvenc | head -5",
     )
     .pip_install(
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
+        "torch==2.7.1",
+        "torchvision==0.22.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
     )
     .pip_install(
         "opencv-python-headless",

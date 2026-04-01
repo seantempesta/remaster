@@ -26,9 +26,9 @@ _packages_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg")
     .pip_install(
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
+        "torch==2.7.1",
+        "torchvision==0.22.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
     )
     .pip_install("opencv-python-headless", "numpy")
 )
@@ -42,7 +42,7 @@ base_image = (
 # TensorRT image (heavier, only used when --tensorrt flag is set)
 trt_image = (
     _packages_image
-    .pip_install("torch-tensorrt==2.5.0", extra_index_url="https://download.pytorch.org/whl/cu121")
+    .pip_install("torch-tensorrt==2.7.0", extra_index_url="https://download.pytorch.org/whl/cu124")
     .add_local_dir("lib", remote_path="/root/project/lib", ignore=["__pycache__/**", "*.pyc"])
 )
 
@@ -141,7 +141,7 @@ def profile_a100(
         use_cudnn_benchmark=use_cudnn_benchmark,
         use_tensorrt=use_tensorrt,
         gpu_name="A100",
-        gpu_hourly_rate=2.78,
+        gpu_hourly_rate=2.10,
     )
 
 
@@ -242,7 +242,74 @@ def profile_a100_trt(
         use_cudnn_benchmark=use_cudnn_benchmark,
         use_tensorrt=use_tensorrt,
         gpu_name="A100",
-        gpu_hourly_rate=2.78,
+        gpu_hourly_rate=2.10,
+    )
+
+
+# --- H100 variants ---
+
+@app.function(
+    gpu="H100",
+    volumes={VOL_MOUNT: vol},
+    timeout=1800,
+    memory=8192,
+)
+def profile_h100(
+    checkpoint_path: str,
+    clip_path: str,
+    num_frames: int = 200,
+    batch_size: int = 1,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_channels_last: bool = False,
+    use_cudnn_benchmark: bool = False,
+    use_tensorrt: bool = False,
+):
+    return _run_profile(
+        checkpoint_path=checkpoint_path,
+        clip_path=clip_path,
+        num_frames=num_frames,
+        batch_size=batch_size,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_channels_last=use_channels_last,
+        use_cudnn_benchmark=use_cudnn_benchmark,
+        use_tensorrt=use_tensorrt,
+        gpu_name="H100",
+        gpu_hourly_rate=3.95,
+    )
+
+
+@app.function(
+    image=trt_image,
+    gpu="H100",
+    volumes={VOL_MOUNT: vol},
+    timeout=1800,
+    memory=8192,
+)
+def profile_h100_trt(
+    checkpoint_path: str,
+    clip_path: str,
+    num_frames: int = 200,
+    batch_size: int = 1,
+    use_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
+    use_channels_last: bool = False,
+    use_cudnn_benchmark: bool = False,
+    use_tensorrt: bool = False,
+):
+    return _run_profile(
+        checkpoint_path=checkpoint_path,
+        clip_path=clip_path,
+        num_frames=num_frames,
+        batch_size=batch_size,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        use_channels_last=use_channels_last,
+        use_cudnn_benchmark=use_cudnn_benchmark,
+        use_tensorrt=use_tensorrt,
+        gpu_name="H100",
+        gpu_hourly_rate=3.95,
     )
 
 
@@ -265,13 +332,18 @@ def _run_profile(
 
     # Persist torch.compile and Triton caches to Modal volume
     cache_dir = f"{VOL_MOUNT}/torch_compile_cache"
+    trt_cache_dir = f"{VOL_MOUNT}/trt_engine_cache"
     os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(trt_cache_dir, exist_ok=True)
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
     os.environ["TRITON_CACHE_DIR"] = f"{cache_dir}/triton"
+    os.environ["TORCHINDUCTOR_FREEZING"] = "1"
 
     import subprocess
     import numpy as np
     import torch
+    import torch._inductor.config
+    torch._inductor.config.conv_1x1_as_mm = True
     from lib.nafnet_arch import NAFNet
 
     vol.reload()
@@ -307,6 +379,14 @@ def _run_profile(
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
+
+    # Replace LayerNorm2d with compile-friendly F.layer_norm wrapper
+    # (numerically identical, but uses standard ops Inductor can fuse)
+    if not use_tensorrt:
+        from lib.nafnet_arch import swap_layernorm_for_compile
+        model = swap_layernorm_for_compile(model)
+        print("Swapped LayerNorm2d -> LayerNorm2dCompile for Inductor fusion")
+
     model = model.cuda().half()
 
     if use_channels_last:
@@ -352,6 +432,7 @@ def _run_profile(
                     "immutable_weights": False,  # Required for engine caching
                     "cache_built_engines": True,
                     "reuse_cached_engines": True,
+                    "engine_cache_dir": trt_cache_dir,
                 },
             )
 
@@ -664,9 +745,9 @@ def main(
     print(f"  channels_last={channels_last}, cudnn_benchmark={cudnn_benchmark}, tensorrt={tensorrt}")
 
     if tensorrt:
-        gpu_funcs = {"L4": profile_l4_trt, "A10G": profile_a10g_trt, "A100": profile_a100_trt}
+        gpu_funcs = {"L4": profile_l4_trt, "A10G": profile_a10g_trt, "A100": profile_a100_trt, "H100": profile_h100_trt}
     else:
-        gpu_funcs = {"L4": profile_l4, "A10G": profile_a10g, "A100": profile_a100}
+        gpu_funcs = {"L4": profile_l4, "A10G": profile_a10g, "A100": profile_a100, "H100": profile_h100}
     fn = gpu_funcs.get(gpu.upper())
     if fn is None:
         raise ValueError(f"Unsupported GPU: {gpu}. Choose from: {list(gpu_funcs.keys())}")

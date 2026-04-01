@@ -6,3 +6,9 @@ baseline	0.78	3.2	39.61	$17.38	L4	1	keep	eager + bs=1 + L4
 -	12.43	2.0	39.61	$3.79	A100	1	keep	compile(reduce-overhead) + bs=1 + A100 + channels_last + cudnn.bench
 -	13.4	14.3	39.61	$3.51	A100	8	keep	compile(reduce-overhead) + bs=8 + A100 + channels_last + cudnn.bench (steady-state fps; avg=10.91 due to too few frames after warmup)
 -	12.78	2.7	39.61	$3.69	A100	1	discard	compile(max-autotune) + bs=1 + A100 + channels_last + cudnn.bench (5 min warmup for 3% gain - not worth it)
+-	4.08	0.3	15.68	$8.71	A100	1	discard	PyTorch 2.7.1 + BROKEN GroupNorm(1) swap (wrong math — GroupNorm(1)≠LayerNorm2d)
+-	15.00	0.5	39.61	$2.37	A100-80GB	8	keep	PyTorch 2.7.1 + compile(reduce-overhead) + LayerNorm2dCompile + FREEZING + conv_1x1_as_mm + channels_last + cudnn.bench
+-	30.82	0.5	39.61	$2.17	H100	8	keep	PyTorch 2.7.1 + compile(reduce-overhead) + LayerNorm2dCompile + FREEZING + conv_1x1_as_mm + channels_last + cudnn.bench
+-	3.0	14.4	39.61	$11.85	A100-80GB	8	discard	TRT 2.7.0 fell back to eager (DataDependentOutputException in weight mapping)
+-	10.89	0.6	39.61	$6.15	H100	16	discard	compile(reduce-overhead) + bs=16 slower than bs=8 — CUDA graphs + larger batch = worse
+-	OOM	-	-	-	H100	32	crash	compile(reduce-overhead) + bs=32 — CUDA graph alloc exhausts 80GB
