@@ -115,7 +115,7 @@ def train_remote(
     args.grad_clip = grad_clip
     args.loss = loss
     args.perceptual_weight = perceptual_weight
-    args.perceptual_freq = 5  # aligned with print_freq=10
+    args.perceptual_freq = 1  # every iteration
     args.cache_in_ram = True
     args.amp = True
     args.checkpoint_dir = checkpoint_dir

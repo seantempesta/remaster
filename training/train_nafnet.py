@@ -468,6 +468,7 @@ def train(args):
     # ---- Resume ----
     start_iter = 0
     best_psnr = 0.0
+    best_val_loss = None
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -536,7 +537,7 @@ def train(args):
 
     stop_check = getattr(args, 'stop_check', None)
     stop_check_freq = getattr(args, 'stop_check_freq', 50)
-    percep_freq = getattr(args, 'perceptual_freq', 5)
+    percep_freq = getattr(args, 'perceptual_freq', 10)
 
     # CUDA event profiling — measures GPU time per phase, logged every print_freq
     profile_on = device.type == "cuda"
@@ -701,9 +702,18 @@ def train(args):
                           perceptual_weight=args.perceptual_weight,
                           crop_size=512)
             psnr = val["psnr"]
-            is_best = psnr > best_psnr
-            if is_best:
-                best_psnr = psnr
+            # Use total loss (pixel + perceptual) to decide best when
+            # perceptual loss is active, otherwise fall back to PSNR
+            val_loss = val.get("combined_loss", None)
+            if val_loss is not None:
+                is_best = best_val_loss is None or val_loss < best_val_loss
+                if is_best:
+                    best_val_loss = val_loss
+                    best_psnr = psnr
+            else:
+                is_best = psnr > best_psnr
+                if is_best:
+                    best_psnr = psnr
             val_detail = f"PSNR={psnr:.2f} dB"
             if "pixel_loss" in val:
                 val_detail += f" | px={val['pixel_loss']:.6f}"
@@ -711,8 +721,12 @@ def train(args):
                 val_detail += f" perc={val['percep_loss']:.4f}"
             if "combined_loss" in val:
                 val_detail += f" total={val['combined_loss']:.6f}"
-            print(f"  VALIDATION iter {iteration + 1} ({val['n_frames']} frames): "
-                  f"{val_detail} {'(BEST)' if is_best else ''} [best={best_psnr:.2f}]")
+            best_str = (f"best_loss={best_val_loss:.6f}"
+                        if best_val_loss is not None
+                        else f"best_psnr={best_psnr:.2f}")
+            print(f"  VAL {iteration + 1} ({val['n_frames']}f): "
+                  f"{val_detail} {'(BEST)' if is_best else ''} "
+                  f"[{best_str}]")
             model.train()
 
             # Save best model
@@ -804,8 +818,8 @@ def parse_args():
                         help="Disable AMP mixed precision")
     parser.add_argument("--perceptual-weight", type=float, default=0.0,
                         help="VGG perceptual loss weight (0 = disabled, try 0.05)")
-    parser.add_argument("--perceptual-freq", type=int, default=5,
-                        help="Compute perceptual loss every N iters (default: 5, saves ~60%% GPU time)")
+    parser.add_argument("--perceptual-freq", type=int, default=10,
+                        help="Compute perceptual loss every N iters (default: 10, aligned with print_freq)")
 
     # Logging / checkpoints
     parser.add_argument("--checkpoint-dir", type=str,
