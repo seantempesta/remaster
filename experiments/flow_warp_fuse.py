@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from PIL import Image
 from raft import RAFT
 from utils.utils import InputPadder
-import imageio_ffmpeg
+from lib.ffmpeg_utils import get_ffmpeg
 
 DEVICE = 'cuda'
 MAX_FRAMES = 150
@@ -32,7 +32,7 @@ MAX_FRAMES = 150
 
 def extract_frames(video_path, output_dir, max_frames=-1):
     os.makedirs(output_dir, exist_ok=True)
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg = get_ffmpeg()
     import subprocess
     cmd = [ffmpeg, '-y', '-i', video_path]
     if max_frames > 0:
@@ -179,7 +179,7 @@ def fuse_frames(frames, flow_dir, output_dir):
 
 
 def frames_to_video(frames_dir, output_path, fps=23.976):
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg = get_ffmpeg()
     import subprocess
     subprocess.run([
         ffmpeg, '-y', '-framerate', str(fps),

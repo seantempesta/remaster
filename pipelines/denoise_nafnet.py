@@ -38,13 +38,16 @@ from lib.ffmpeg_utils import get_ffmpeg, get_video_info
 DEVICE = "cuda"
 
 
-def load_nafnet(checkpoint_path, device="cuda", fp16=True, use_compile=False):
-    """Load NAFNet-width64 from checkpoint."""
+def load_nafnet(checkpoint_path, device="cuda", fp16=True, use_compile=False,
+                width=64, middle_blk_num=12, enc_blk_nums=None, dec_blk_nums=None):
+    """Load NAFNet from checkpoint with configurable architecture."""
+    enc_blk_nums = enc_blk_nums or [2, 2, 4, 8]
+    dec_blk_nums = dec_blk_nums or [2, 2, 2, 2]
     model = NAFNet(
-        img_channel=3, width=64,
-        middle_blk_num=12,
-        enc_blk_nums=[2, 2, 4, 8],
-        dec_blk_nums=[2, 2, 2, 2],
+        img_channel=3, width=width,
+        middle_blk_num=middle_blk_num,
+        enc_blk_nums=enc_blk_nums,
+        dec_blk_nums=dec_blk_nums,
     )
 
     print(f"Loading checkpoint: {checkpoint_path}")
@@ -69,7 +72,7 @@ def load_nafnet(checkpoint_path, device="cuda", fp16=True, use_compile=False):
     torch.backends.cudnn.benchmark = True
 
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"  NAFNet-width64: {params_m:.1f}M params, VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
+    print(f"  NAFNet w={width} mid={middle_blk_num}: {params_m:.1f}M params, VRAM: {torch.cuda.max_memory_reserved() / 1024**3:.1f}GB")
 
     if use_compile:
         try:
@@ -85,11 +88,14 @@ def denoise_video(
     input_path, output_path, checkpoint_path,
     batch_size=1, crf=18, encoder="libx265",
     max_frames=-1, fp16=True, use_compile=False,
+    width=64, middle_blk_num=12,
 ):
     """Stream video through NAFNet with threaded IO."""
 
     # Load model
-    model = load_nafnet(checkpoint_path, device=DEVICE, fp16=fp16, use_compile=use_compile)
+    model = load_nafnet(checkpoint_path, device=DEVICE, fp16=fp16,
+                        use_compile=use_compile, width=width,
+                        middle_blk_num=middle_blk_num)
 
     # Video info (need dimensions before warmup)
     input_path = os.path.abspath(input_path)
@@ -304,9 +310,9 @@ def denoise_video(
             elapsed = time.time() - start
             fps_actual = processed / elapsed
             eta_min = (total_frames - processed) / max(fps_actual, 0.01) / 60
-            vram = torch.cuda.memory_allocated() / 1024**2
+            vram = torch.cuda.max_memory_reserved() / 1024**3
             print(f"  [{processed}/{total_frames}] {fps_actual:.1f} fps, "
-                  f"VRAM: {vram:.0f}MB, ETA: {eta_min:.1f}min, errors: {errors}")
+                  f"VRAM: {vram:.1f}GB, ETA: {eta_min:.1f}min, errors: {errors}")
 
         # Swap buffers
         cur_frames = next_frames
@@ -354,11 +360,15 @@ def main():
                         help="Frames per batch (NAFNet uses less VRAM than SCUNet)")
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--encoder", default="libx265",
-                        choices=["hevc_nvenc", "libx265"])
+                        choices=["hevc_nvenc", "libx265", "libx264"])
     parser.add_argument("--max-frames", type=int, default=-1)
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile (NAFNet is compile-friendly)")
     parser.add_argument("--fp32", action="store_true", help="Use fp32 instead of fp16")
+    parser.add_argument("--width", type=int, default=64,
+                        help="NAFNet channel width (default: 64)")
+    parser.add_argument("--middle-blk-num", type=int, default=12,
+                        help="Number of middle blocks (default: 12)")
     args = parser.parse_args()
 
     if args.output is None:
@@ -375,6 +385,8 @@ def main():
         max_frames=args.max_frames,
         fp16=not args.fp32,
         use_compile=args.compile,
+        width=args.width,
+        middle_blk_num=args.middle_blk_num,
     )
 
 

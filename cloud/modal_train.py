@@ -35,11 +35,19 @@ image = (
         "opencv-python-headless",
         "numpy",
         "psutil",
+        "matplotlib",
     )
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
     .add_local_file("lib/paths.py", remote_path="/root/project/lib/paths.py")
     .add_local_file("lib/__init__.py", remote_path="/root/project/lib/__init__.py")
-    .add_local_file("training/train_nafnet.py", remote_path="/root/project/train_nafnet.py")
+    .add_local_file("training/train_nafnet.py", remote_path="/root/project/training/train_nafnet.py")
+    .add_local_file("training/losses.py", remote_path="/root/project/training/losses.py")
+    .add_local_file("training/dataset.py", remote_path="/root/project/training/dataset.py")
+    .add_local_file("training/viz.py", remote_path="/root/project/training/viz.py")
+    .add_local_file("training/__init__.py", remote_path="/root/project/training/__init__.py")
+    .add_local_file("reference-code/DISTS/DISTS_pytorch/DISTS_pt.py", remote_path="/root/project/reference-code/DISTS/DISTS_pytorch/DISTS_pt.py")
+    .add_local_file("reference-code/DISTS/DISTS_pytorch/__init__.py", remote_path="/root/project/reference-code/DISTS/DISTS_pytorch/__init__.py")
+    .add_local_file("reference-code/DISTS/DISTS_pytorch/weights.pt", remote_path="/root/project/reference-code/DISTS/DISTS_pytorch/weights.pt")
 )
 
 app = modal.App("train-nafnet-distill", image=image)
@@ -65,6 +73,8 @@ def train_remote(
     crop_size: int = 384,
     grad_clip: float = 1.0,
     perceptual_weight: float = 0.0,
+    fft_weight: float = 0.0,
+    fft_alpha: float = 1.0,
     val_dir: str = "",
     width: int = 64,
     middle_blk_num: int = 12,
@@ -94,7 +104,7 @@ def train_remote(
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Build args
-    from train_nafnet import parse_args, train
+    from training.train_nafnet import parse_args, train
     import argparse
 
     class Args:
@@ -116,6 +126,8 @@ def train_remote(
     args.loss = loss
     args.perceptual_weight = perceptual_weight
     args.perceptual_freq = 1  # every iteration
+    args.fft_weight = fft_weight
+    args.fft_alpha = fft_alpha
     args.cache_in_ram = True
     args.amp = True
     args.checkpoint_dir = checkpoint_dir
@@ -163,19 +175,23 @@ def main(
     crop_size: int = 384,
     grad_clip: float = 1.0,
     perceptual_weight: float = 0.0,
+    fft_weight: float = 0.0,
+    fft_alpha: float = 1.0,
     val_dir: str = "data/val_pairs",
     width: int = 64,
     middle_blk_num: int = 12,
     enc_blk_nums: str = "2,2,4,8",
     dec_blk_nums: str = "2,2,2,2",
     checkpoint_dir: str = "",
+    pretrained: str = "",
 ):
     """
-    Upload training data and run NAFNet distillation training on Modal A100.
+    Upload training data and run NAFNet distillation training on Modal H100.
 
     Examples:
         modal run cloud/modal_train.py --data-dir data/train_pairs
-        modal run cloud/modal_train.py --data-dir data/train_pairs --max-iters 100000
+        modal run cloud/modal_train.py --perceptual-weight 0.1 --fft-weight 500
+        modal run cloud/modal_train.py --pretrained checkpoints/nafnet_w32_mid4_dists/pretrained_from_vgg.pth
     """
     import pathlib
 
@@ -211,23 +227,29 @@ def main(
     else:
         vol_ckpt_dir = f"{VOL_MOUNT}/checkpoints/nafnet_distill"
 
-    pretrained_filename = f"NAFNet-SIDD-width{width}.pth"
-    vol_pretrained = f"{VOL_MOUNT}/pretrained/{pretrained_filename}"
+    # Determine pretrained weights path
+    if pretrained:
+        pretrained_local = os.path.abspath(pretrained)
+        pretrained_vol_name = os.path.basename(pretrained_local)
+        vol_pretrained = f"{VOL_MOUNT}/pretrained/{pretrained_vol_name}"
+    else:
+        pretrained_filename = f"NAFNet-SIDD-width{width}.pth"
+        pretrained_local = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..",
+            "reference-code", "NAFNet", "experiments", "pretrained_models", pretrained_filename
+        )
+        vol_pretrained = f"{VOL_MOUNT}/pretrained/{pretrained_filename}"
 
     # Upload training data + validation data + pretrained weights
     print(f"\nUploading data to Modal volume...")
     t0 = time.time()
 
-    pretrained_local = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..",
-        "reference-code", "NAFNet", "experiments", "pretrained_models", pretrained_filename
-    )
-
     with vol.batch_upload(force=True) as batch:
         # Upload pretrained weights
         if os.path.exists(pretrained_local):
-            batch.put_file(pretrained_local, f"/pretrained/{pretrained_filename}")
-            print(f"  Uploading pretrained weights ({pretrained_filename})...")
+            vol_pretrained_remote = vol_pretrained.replace(VOL_MOUNT, "")
+            batch.put_file(pretrained_local, vol_pretrained_remote)
+            print(f"  Uploading pretrained weights ({os.path.basename(pretrained_local)})...")
 
         # Upload training pairs
         for f in input_files:
@@ -250,8 +272,8 @@ def main(
     print(f"  Upload done in {upload_time:.0f}s")
 
     # Run training
-    print(f"\nStarting training on A100 ({max_iters} iters, crop={crop_size}, bs={batch_size}, "
-          f"w={width}, mid={middle_blk_num}, perceptual={perceptual_weight})...")
+    print(f"\nStarting training on H100 ({max_iters} iters, crop={crop_size}, bs={batch_size}, "
+          f"w={width}, mid={middle_blk_num}, perc={perceptual_weight}, fft={fft_weight})...")
     result_path = train_remote.remote(
         data_dir=vol_data_dir,
         checkpoint_dir=vol_ckpt_dir,
@@ -266,6 +288,8 @@ def main(
         crop_size=crop_size,
         grad_clip=grad_clip,
         perceptual_weight=perceptual_weight,
+        fft_weight=fft_weight,
+        fft_alpha=fft_alpha,
         val_dir=vol_val_dir if has_val else "",
         width=width,
         middle_blk_num=middle_blk_num,

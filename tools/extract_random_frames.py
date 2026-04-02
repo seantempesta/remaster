@@ -16,9 +16,9 @@ import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import imageio_ffmpeg
+from lib.ffmpeg_utils import get_ffmpeg, get_ffprobe
 
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG = get_ffmpeg()
 PLEX_DIR = r"E:\plex\tv\Firefly (2002) Season 1 S01 (1080p BluRay x265 HEVC 10bit AAC Silence)"
 
 # Map episode numbers to filenames
@@ -42,26 +42,27 @@ EPISODES = {
 
 def get_duration(path):
     """Get video duration in seconds using ffprobe."""
-    ffprobe = FFMPEG.replace("ffmpeg", "ffprobe")
-    if not os.path.exists(ffprobe):
-        # Fallback: use ffmpeg to probe
-        r = subprocess.run(
-            [FFMPEG, "-hide_banner", "-i", path],
-            capture_output=True, text=True,
-        )
-        # Parse duration from stderr: "Duration: HH:MM:SS.xx"
-        for line in r.stderr.split("\n"):
-            if "Duration:" in line:
-                parts = line.split("Duration:")[1].split(",")[0].strip()
-                h, m, s = parts.split(":")
-                return float(h) * 3600 + float(m) * 60 + float(s)
-    else:
+    ffprobe = get_ffprobe()
+    if ffprobe:
         r = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", path],
             capture_output=True, text=True,
         )
-        return float(r.stdout.strip())
+        try:
+            return float(r.stdout.strip())
+        except ValueError:
+            pass
+    # Fallback: use ffmpeg to probe
+    r = subprocess.run(
+        [FFMPEG, "-hide_banner", "-i", path],
+        capture_output=True, text=True,
+    )
+    for line in r.stderr.split("\n"):
+        if "Duration:" in line:
+            parts = line.split("Duration:")[1].split(",")[0].strip()
+            h, m, s = parts.split(":")
+            return float(h) * 3600 + float(m) * 60 + float(s)
     return 2400  # fallback: 40 min
 
 

@@ -10,7 +10,7 @@ import os, glob, time
 import cv2
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
-import imageio_ffmpeg
+from lib.ffmpeg_utils import get_ffmpeg
 
 data_dir = str(DATA_DIR)
 input_dir = os.path.join(data_dir, 'frames_1080p_src')
@@ -51,7 +51,7 @@ elapsed = time.time() - start
 print(f"\nDone! {len(frames)} frames in {elapsed:.1f}s ({len(frames)/elapsed:.2f} fps)")
 
 print("Encoding video...")
-ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+ffmpeg = get_ffmpeg()
 import subprocess
 subprocess.run([
     ffmpeg, '-y', '-framerate', '23.976',

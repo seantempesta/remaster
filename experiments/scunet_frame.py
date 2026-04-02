@@ -15,7 +15,7 @@ import cv2
 import torch
 from models.network_scunet import SCUNet as net
 from utils import utils_model
-import imageio_ffmpeg
+from lib.ffmpeg_utils import get_ffmpeg
 
 DEVICE = 'cuda'
 MAX_FRAMES = 150
@@ -158,7 +158,7 @@ def main():
 
     # Encode video
     print("\nEncoding video...")
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg = get_ffmpeg()
     import subprocess
     out_video = os.path.join(data_dir, 'clip_1080p_scunet.mp4')
     subprocess.run([

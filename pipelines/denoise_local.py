@@ -736,13 +736,22 @@ def denoise_video(
     print(f"  {w}x{h} @ {fps:.3f}fps, {total_frames} frames, {duration:.1f}s")
     print(f"Output: {output_path}")
 
-    # FFmpeg encoder setup — local only uses libx265 or libx264
+    # FFmpeg encoder setup
     ffmpeg_bin = get_ffmpeg()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     frame_bytes = w * h * 3
     fps_str = f"{fps:.6f}"
 
-    if encoder == "libx264":
+    if encoder == "hevc_nvenc":
+        write_cmd = [
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", fps_str, "-i", "pipe:0",
+            "-c:v", "hevc_nvenc", "-preset", "p4", "-tune", "hq",
+            "-rc", "vbr", "-cq", str(crf), "-pix_fmt", "p010le",
+            "-movflags", "+faststart", output_path,
+        ]
+    elif encoder == "libx264":
         write_cmd = [
             ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -895,8 +904,8 @@ def main():
                         help="Quantization mode: none=fp16, int8=TorchAO, tensorrt=TRT INT8")
     parser.add_argument("--batch-size", type=int, default=1, help="Frames per batch (default: 1)")
     parser.add_argument("--crf", type=int, default=18, help="CRF for encoding")
-    parser.add_argument("--encoder", default="libx265", choices=["libx265", "libx264"],
-                        help="Video encoder (local only, no NVENC)")
+    parser.add_argument("--encoder", default="libx265", choices=["libx265", "libx264", "hevc_nvenc"],
+                        help="Video encoder (hevc_nvenc for NVENC HW encoding)")
     parser.add_argument("--max-frames", type=int, default=-1, help="Max frames to process")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
     parser.add_argument("--calib-frames", type=int, default=200,

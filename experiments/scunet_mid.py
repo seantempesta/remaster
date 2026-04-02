@@ -11,7 +11,7 @@ import numpy as np
 import cv2
 import torch
 from models.network_scunet import SCUNet as net
-import imageio_ffmpeg
+from lib.ffmpeg_utils import get_ffmpeg
 
 DEVICE = 'cuda'
 MAX_FRAMES = 150
@@ -69,7 +69,7 @@ print(f"Peak VRAM: {torch.cuda.max_memory_allocated()/1024**2:.0f}MB")
 
 # Encode video
 print("\nEncoding video...")
-ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+ffmpeg = get_ffmpeg()
 import subprocess
 out_video = os.path.join(data_dir, 'clip_mid_scunet.mp4')
 subprocess.run([

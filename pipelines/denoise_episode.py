@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.paths import add_scunet_to_path, resolve_scunet_dir
 add_scunet_to_path()
-from lib.ffmpeg_utils import get_video_info
+from lib.ffmpeg_utils import get_ffmpeg, get_video_info
 
 import os, time, argparse
 import numpy as np
@@ -17,7 +17,6 @@ import torch
 import torch.nn.functional as TF
 from einops import rearrange
 from models.network_scunet import SCUNet as net, WMSA
-import imageio_ffmpeg
 import subprocess
 
 DEVICE = 'cuda'
@@ -86,42 +85,38 @@ def main():
     print(f"  Model VRAM: {torch.cuda.memory_allocated()/1024**2:.0f}MB")
 
     # Set up ffmpeg reader and writer
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg_bin = get_ffmpeg()
+    w, h = 1920, 1080  # will be overridden by probe below
+
+    # Probe actual resolution
+    w, h, fps, total_frames_probed, duration = get_video_info(args.input)
+    if args.max_frames < 0:
+        total_frames = total_frames_probed
 
     read_cmd = [
-        ffmpeg, '-i', args.input,
+        ffmpeg_bin, '-hide_banner', '-loglevel', 'error',
+        '-i', args.input,
         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-        '-v', 'quiet',
     ]
     if args.max_frames > 0:
         read_cmd += ['-vframes', str(args.max_frames)]
     read_cmd += ['pipe:1']
 
+    fps_str = f"{fps:.6f}"
     write_cmd = [
-        ffmpeg, '-y',
+        ffmpeg_bin, '-hide_banner', '-loglevel', 'error', '-y',
         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
-        '-s', '1920x1080',
-        '-r', str(fps),
+        '-s', f'{w}x{h}',
+        '-r', fps_str,
         '-i', 'pipe:0',
-        '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
-        '-pix_fmt', 'yuv420p',
-        '-movflags', 'frag_keyframe+empty_moov',
-        '-v', 'quiet',
+        '-c:v', 'hevc_nvenc', '-preset', 'p4', '-tune', 'hq',
+        '-rc', 'vbr', '-cq', '20',
+        '-pix_fmt', 'p010le',
+        '-movflags', '+faststart',
         args.output
     ]
 
     reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=10**8)
-    raw = reader.stdout.read(1920 * 1080 * 3)
-    if len(raw) == 0:
-        print("ERROR: Could not read first frame")
-        return
-    first_frame = np.frombuffer(raw, dtype=np.uint8).reshape(1080, 1920, 3)
-    h, w = first_frame.shape[:2]
-    reader.stdout.close()
-    reader.wait()
-
-    reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=10**8)
-    write_cmd[7] = f'{w}x{h}'
     writer = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=10**8)
 
     print(f"\nProcessing {w}x{h} @ {fps}fps (fp16 direct inference)...")

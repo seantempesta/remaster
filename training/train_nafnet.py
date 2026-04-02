@@ -7,10 +7,10 @@ at much higher speed (pure CNN, torch.compile friendly).
 Training recipe:
     - Start from SIDD-pretrained NAFNet-width64 checkpoint
     - Random 256x256 crops from full-frame 1080p pairs
-    - Charbonnier loss (smooth L1)
+    - Charbonnier pixel loss + DISTS perceptual loss + Focal Frequency loss
     - AdamW optimizer, cosine LR with warmup
     - Random flip/rotation augmentation
-    - Validation PSNR every N iterations
+    - Validation PSNR + sample images every N iterations
 
 Usage:
     # Quick local test (5 frames, 100 iters)
@@ -28,230 +28,26 @@ import gc
 import glob
 import time
 import math
-import random
 import argparse
-import json
 import signal
 import warnings
 from pathlib import Path
 
 import numpy as np
-import cv2
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.nafnet_arch import NAFNet
 from lib.paths import PROJECT_ROOT, REFERENCE_CODE, CHECKPOINTS_DIR
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Loss functions
-# ──────────────────────────────────────────────────────────────────────────────
-
-class CharbonnierLoss(nn.Module):
-    """Charbonnier loss (smooth L1): sqrt((pred - target)^2 + eps^2)"""
-    def __init__(self, eps=1e-6):
-        super().__init__()
-        self.eps2 = eps ** 2
-
-    def forward(self, pred, target):
-        return torch.mean(torch.sqrt((pred - target) ** 2 + self.eps2))
-
-
-class PSNRLoss(nn.Module):
-    """PSNR-based loss (as used in NAFNet original training)."""
-    def __init__(self):
-        super().__init__()
-        self.scale = 10 / math.log(10)
-
-    def forward(self, pred, target):
-        mse = ((pred - target) ** 2).mean(dim=(1, 2, 3))
-        return self.scale * torch.log(mse + 1e-8).mean()
-
-
-class VGGFeatureExtractor(nn.Module):
-    """Extract multi-layer features from VGG19 for perceptual loss.
-
-    Adapted from KAIR (github.com/cszn/KAIR). Extracts features at
-    conv layers [2, 7, 16, 25, 34] (one per VGG block), applies
-    ImageNet normalization, and freezes all weights.
-    """
-    def __init__(self, feature_layers=[2, 7, 16, 25, 34]):
-        super().__init__()
-        vgg = torchvision.models.vgg19(weights=torchvision.models.VGG19_Weights.IMAGENET1K_V1)
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        self.register_buffer('mean', mean)
-        self.register_buffer('std', std)
-
-        # Split VGG into sub-networks ending at each feature layer
-        self.features = nn.Sequential()
-        prev = -1
-        for i, layer in enumerate(feature_layers):
-            self.features.add_module(
-                f'block{i}',
-                nn.Sequential(*list(vgg.features.children())[(prev + 1):(layer + 1)])
-            )
-            prev = layer
-
-        for p in self.parameters():
-            p.requires_grad = False
-
-    def forward(self, x):
-        x = (x - self.mean) / self.std
-        feats = []
-        for block in self.features.children():
-            x = block(x)
-            feats.append(x.clone())
-        return feats
-
-
-class VGGPerceptualLoss(nn.Module):
-    """VGG-based perceptual loss for image restoration.
-
-    Computes weighted L1 distance between VGG19 feature maps of
-    prediction and target. Runs in eval mode with frozen weights.
-    Must be called in fp32 (not inside AMP autocast).
-    """
-    def __init__(self, weights=[0.1, 0.1, 1.0, 1.0, 1.0]):
-        super().__init__()
-        self.vgg = VGGFeatureExtractor()
-        self.weights = weights
-        self.criterion = nn.L1Loss()
-        self.eval()
-
-    def forward(self, pred, target):
-        pred_feats = self.vgg(pred)
-        with torch.no_grad():
-            target_feats = self.vgg(target)
-        loss = 0.0
-        for w, pf, tf in zip(self.weights, pred_feats, target_feats):
-            loss += w * self.criterion(pf, tf)
-        return loss
-
-    def train(self, mode=True):
-        # Always stay in eval mode (BN stats, dropout)
-        return super().train(False)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataset
-# ──────────────────────────────────────────────────────────────────────────────
-
-class PairedFrameDataset(Dataset):
-    """
-    Loads paired input/target frames, returns random crops with augmentation.
-
-    Directory structure:
-        data_dir/input/frame_XXXXX.png   (compressed input)
-        data_dir/target/frame_XXXXX.png  (SCUNet denoised)
-    """
-    def __init__(self, data_dir, crop_size=256, augment=True,
-                 max_frames=-1, cache_in_ram=False):
-        self.crop_size = crop_size
-        self.augment = augment
-        self.cache_in_ram = cache_in_ram
-        self.cached_images = None
-
-        input_dir = os.path.join(data_dir, "input")
-        target_dir = os.path.join(data_dir, "target")
-
-        input_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))
-        if not input_files:
-            raise FileNotFoundError(f"No PNG files in {input_dir}")
-
-        # Match input/target pairs by filename
-        self.pairs = []
-        for inp_path in input_files:
-            fname = os.path.basename(inp_path)
-            tgt_path = os.path.join(target_dir, fname)
-            if os.path.exists(tgt_path):
-                self.pairs.append((inp_path, tgt_path))
-
-        if max_frames > 0:
-            self.pairs = self.pairs[:max_frames]
-
-        if not self.pairs:
-            raise FileNotFoundError(
-                f"No matching pairs found in {data_dir}")
-
-        if cache_in_ram:
-            self._load_all_into_ram()
-
-        print(f"Dataset: {len(self.pairs)} pairs, crop={crop_size}, "
-              f"augment={augment}, cached={cache_in_ram}")
-
-    def _load_all_into_ram(self):
-        """Pre-load all images as float32 numpy arrays."""
-        import psutil
-        print(f"  Caching {len(self.pairs)} pairs into RAM...")
-        t0 = time.time()
-        self.cached_images = []
-        for i, (inp_path, tgt_path) in enumerate(self.pairs):
-            inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
-            tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
-            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
-            tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
-            # Store as uint8 to save RAM (convert to float in __getitem__)
-            self.cached_images.append((inp, tgt))
-            if (i + 1) % 200 == 0:
-                mb = psutil.Process().memory_info().rss / 1024**2
-                print(f"    {i+1}/{len(self.pairs)} loaded, "
-                      f"RAM: {mb:.0f}MB")
-        elapsed = time.time() - t0
-        mb = psutil.Process().memory_info().rss / 1024**2
-        print(f"  Cached {len(self.pairs)} pairs in {elapsed:.1f}s, "
-              f"RAM: {mb:.0f}MB")
-
-    def __len__(self):
-        return len(self.pairs) * 100
-
-    def __getitem__(self, idx):
-        pair_idx = idx % len(self.pairs)
-
-        if self.cached_images is not None:
-            inp, tgt = self.cached_images[pair_idx]
-            inp = inp.astype(np.float32) / 255.0
-            tgt = tgt.astype(np.float32) / 255.0
-        else:
-            inp_path, tgt_path = self.pairs[pair_idx]
-            inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
-            tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
-            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(
-                np.float32) / 255.0
-            tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(
-                np.float32) / 255.0
-
-        h, w, _ = inp.shape
-        cs = self.crop_size
-
-        # Random crop (same location for both)
-        top = random.randint(0, h - cs)
-        left = random.randint(0, w - cs)
-        inp = inp[top:top + cs, left:left + cs]
-        tgt = tgt[top:top + cs, left:left + cs]
-
-        # Augmentation: random flip and rotation
-        if self.augment:
-            if random.random() < 0.5:
-                inp = inp[:, ::-1, :].copy()
-                tgt = tgt[:, ::-1, :].copy()
-            if random.random() < 0.5:
-                inp = inp[::-1, :, :].copy()
-                tgt = tgt[::-1, :, :].copy()
-            k = random.randint(0, 3)
-            if k > 0:
-                inp = np.rot90(inp, k).copy()
-                tgt = np.rot90(tgt, k).copy()
-
-        inp = torch.from_numpy(inp.transpose(2, 0, 1))
-        tgt = torch.from_numpy(tgt.transpose(2, 0, 1))
-        return inp, tgt
+from training.losses import (
+    CharbonnierLoss, PSNRLoss, FocalFrequencyLoss, DISTSPerceptualLoss,
+    build_pixel_criterion,
+)
+from training.dataset import PairedFrameDataset
+from training.viz import TrainingLogger, save_val_samples
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -259,12 +55,15 @@ class PairedFrameDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, data_dir, device, pixel_criterion=None, perceptual_criterion=None,
-             perceptual_weight=0.0, crop_size=512):
+def validate(model, data_dir, device, pixel_criterion=None,
+             perceptual_criterion=None, fft_criterion=None,
+             perceptual_weight=0.0, fft_weight=0.0, crop_size=512):
     """
     Validate on held-out frames with larger crops than training.
-    Returns dict with PSNR, pixel loss, perceptual loss, and combined loss.
+    Returns dict with PSNR, pixel loss, perceptual loss, FFT loss, and combined loss.
     """
+    import cv2
+
     model.eval()
     input_dir = os.path.join(data_dir, "input")
     target_dir = os.path.join(data_dir, "target")
@@ -273,6 +72,7 @@ def validate(model, data_dir, device, pixel_criterion=None, perceptual_criterion
     psnrs = []
     pixel_losses = []
     percep_losses = []
+    fft_losses = []
 
     for inp_path in input_files:
         fname = os.path.basename(inp_path)
@@ -312,13 +112,28 @@ def validate(model, data_dir, device, pixel_criterion=None, perceptual_criterion
             p_loss = perceptual_criterion(out_t.float(), tgt_t.float())
             percep_losses.append(p_loss.item())
 
+        # FFT loss
+        if fft_criterion is not None:
+            f_loss = fft_criterion(out_t.float(), tgt_t.float())
+            fft_losses.append(f_loss.item())
+
     model.train()
     result = {"psnr": np.mean(psnrs) if psnrs else 0.0, "n_frames": len(psnrs)}
     if pixel_losses:
         result["pixel_loss"] = np.mean(pixel_losses)
     if percep_losses:
         result["percep_loss"] = np.mean(percep_losses)
-        result["combined_loss"] = result.get("pixel_loss", 0) + perceptual_weight * result["percep_loss"]
+    if fft_losses:
+        result["fft_loss"] = np.mean(fft_losses)
+
+    # Combined loss for best-model selection
+    total = result.get("pixel_loss", 0)
+    if percep_losses:
+        total += perceptual_weight * result["percep_loss"]
+    if fft_losses:
+        total += fft_weight * result["fft_loss"]
+    result["combined_loss"] = total
+
     return result
 
 
@@ -327,10 +142,7 @@ def validate(model, data_dir, device, pixel_criterion=None, perceptual_criterion
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _save_checkpoint(model, optimizer, scheduler, scaler, iteration, best_psnr, args, ckpt_dir):
-    """Save a full training checkpoint (model + optimizer + scheduler state).
-
-    Filters callable attributes from args to avoid serialization issues.
-    """
+    """Save a full training checkpoint (model + optimizer + scheduler state)."""
     ckpt_data = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -416,24 +228,21 @@ def train(args):
         persistent_workers=args.num_workers > 0,
     )
 
-    # ---- Loss ----
-    if args.loss == "charbonnier":
-        criterion = CharbonnierLoss(eps=1e-6)
-    elif args.loss == "psnr":
-        criterion = PSNRLoss()
-    elif args.loss == "l1":
-        criterion = nn.L1Loss()
-    else:
-        raise ValueError(f"Unknown loss: {args.loss}")
-    print(f"Loss: {args.loss}")
+    # ---- Losses ----
+    criterion = build_pixel_criterion(args.loss)
+    print(f"Pixel loss: {args.loss}")
 
-    # ---- Perceptual loss (optional) ----
     perceptual_criterion = None
     if args.perceptual_weight > 0:
-        perceptual_criterion = VGGPerceptualLoss().to(device)
-        print(f"Perceptual loss: VGG19, weight={args.perceptual_weight}")
+        perceptual_criterion = DISTSPerceptualLoss().to(device)
+        print(f"Perceptual loss: DISTS, weight={args.perceptual_weight}")
         if device.type == "cuda":
-            print(f"  VGG VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
+            print(f"  DISTS VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
+
+    fft_criterion = None
+    if args.fft_weight > 0:
+        fft_criterion = FocalFrequencyLoss(alpha=args.fft_alpha)
+        print(f"FFT loss: Focal Frequency (alpha={args.fft_alpha}), weight={args.fft_weight}")
 
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(
@@ -460,6 +269,9 @@ def train(args):
     ckpt_dir = os.path.abspath(args.checkpoint_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # ---- Training logger + viz ----
+    logger = TrainingLogger(os.path.join(ckpt_dir, "training_log.json"))
+
     # ---- AMP (mixed precision) ----
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -481,7 +293,7 @@ def train(args):
         best_psnr = ckpt.get("best_psnr", 0.0)
         print(f"  Resumed at iter {start_iter}, best_psnr={best_psnr:.2f}")
 
-    # ---- Training ----
+    # ---- Print config ----
     print(f"\nTraining config:")
     print(f"  data_dir:    {args.data_dir}")
     print(f"  batch_size:  {args.batch_size}")
@@ -489,8 +301,9 @@ def train(args):
     print(f"  lr:          {args.lr}")
     print(f"  max_iters:   {args.max_iters}")
     print(f"  warmup:      {warmup_iters}")
-    print(f"  loss:        {args.loss}")
+    print(f"  pixel loss:  {args.loss}")
     print(f"  perceptual:  {args.perceptual_weight}")
+    print(f"  fft:         {args.fft_weight} (alpha={args.fft_alpha})")
     print(f"  grad_clip:   {args.grad_clip}")
     print(f"  amp:         {use_amp}")
     print(f"  checkpoints: {ckpt_dir}")
@@ -499,7 +312,7 @@ def train(args):
     # ---- cuDNN benchmark warmup ----
     torch.backends.cudnn.benchmark = True
 
-    # Run one full training step (including perceptual loss) to trigger
+    # Run one full training step (including all losses) to trigger
     # cudnn.benchmark algorithm selection, then free scratch memory.
     print("  cuDNN benchmark warmup...")
     _wb = next(iter(dataloader))
@@ -511,11 +324,16 @@ def train(args):
         with torch.amp.autocast("cuda", enabled=False):
             _pl = perceptual_criterion(_wo.float(), _wt.float())
         _wl = _wl + args.perceptual_weight * _pl
+    if fft_criterion is not None:
+        _fl = fft_criterion(_wo.float(), _wt.float())
+        _wl = _wl + args.fft_weight * _fl
     _wl.backward()
     optimizer.zero_grad(set_to_none=True)
     del _wb, _wi, _wt, _wo, _wl
     if perceptual_criterion is not None:
         del _pl
+    if fft_criterion is not None:
+        del _fl
     torch.cuda.empty_cache()
     gc.collect()
     peak_gb = torch.cuda.max_memory_reserved() / 1024**3
@@ -528,8 +346,10 @@ def train(args):
     loss_sum = 0.0
     pixel_loss_sum = 0.0
     percep_loss_sum = 0.0
+    fft_loss_sum = 0.0
     loss_count = 0
     percep_count = 0
+    fft_count = 0
     data_time_sum = 0.0
     compute_time_sum = 0.0
     start_time = time.time()
@@ -537,14 +357,14 @@ def train(args):
 
     stop_check = getattr(args, 'stop_check', None)
     stop_check_freq = getattr(args, 'stop_check_freq', 50)
-    percep_freq = getattr(args, 'perceptual_freq', 10)
+    percep_freq = getattr(args, 'perceptual_freq', 1)
 
     # CUDA event profiling — measures GPU time per phase, logged every print_freq
     profile_on = device.type == "cuda"
     if profile_on:
         ev_fwd_start = torch.cuda.Event(enable_timing=True)
         ev_fwd_end = torch.cuda.Event(enable_timing=True)
-        ev_vgg_end = torch.cuda.Event(enable_timing=True)
+        ev_aux_end = torch.cuda.Event(enable_timing=True)
         ev_bwd_end = torch.cuda.Event(enable_timing=True)
         ev_opt_end = torch.cuda.Event(enable_timing=True)
 
@@ -557,6 +377,7 @@ def train(args):
         torch.save(ckpt_data, path)
         torch.save({"params": model.state_dict()},
                     os.path.join(ckpt_dir, "nafnet_final.pth"))
+        logger.flush()
         print(f"  Saved checkpoint at iter {it}: {path}")
 
     _current_iter = start_iter
@@ -609,18 +430,22 @@ def train(args):
         if do_profile:
             ev_fwd_end.record()
 
-        # Perceptual loss runs in fp32 (VGG is numerically unstable in fp16)
-        # Only compute every N iters to save GPU time (scale up to compensate)
+        # Auxiliary losses run in fp32 (numerically unstable in fp16)
+        loss = pixel_loss
+        p_loss = None
+        f_loss = None
+
         if perceptual_criterion is not None and (iteration % percep_freq == 0):
             with torch.amp.autocast("cuda", enabled=False):
                 p_loss = perceptual_criterion(pred.float(), tgt_batch.float())
-            loss = pixel_loss + args.perceptual_weight * percep_freq * p_loss
-        else:
-            p_loss = None
-            loss = pixel_loss
+            loss = loss + args.perceptual_weight * percep_freq * p_loss
+
+        if fft_criterion is not None:
+            f_loss = fft_criterion(pred.float(), tgt_batch.float())
+            loss = loss + args.fft_weight * f_loss
 
         if do_profile:
-            ev_vgg_end.record()
+            ev_aux_end.record()
 
         # Backward with scaler
         optimizer.zero_grad(set_to_none=True)
@@ -649,6 +474,9 @@ def train(args):
         if p_loss is not None:
             percep_loss_sum += p_loss.item()
             percep_count += 1
+        if f_loss is not None:
+            fft_loss_sum += f_loss.item()
+            fft_count += 1
         loss_count += 1
 
         # ---- Logging ----
@@ -661,21 +489,36 @@ def train(args):
             vram = torch.cuda.max_memory_reserved() / 1024**3 if device.type == "cuda" else 0
             total_t = data_time_sum + compute_time_sum
             data_pct = data_time_sum / total_t * 100 if total_t > 0 else 0
-            loss_detail = f"loss={avg_loss:.6f}"
-            if perceptual_criterion is not None and percep_count > 0:
-                avg_px = pixel_loss_sum / loss_count
-                avg_pc = percep_loss_sum / percep_count
-                loss_detail = f"loss={avg_loss:.6f} (px={avg_px:.6f} perc={avg_pc:.4f})"
+
+            # Build loss detail string
+            avg_px = pixel_loss_sum / loss_count
+            parts = [f"px={avg_px:.6f}"]
+            if percep_count > 0:
+                parts.append(f"perc={percep_loss_sum / percep_count:.4f}")
+            if fft_count > 0:
+                parts.append(f"fft={fft_loss_sum / fft_count:.4f}")
+            loss_detail = f"loss={avg_loss:.6f} ({' '.join(parts)})"
+
+            # Log to training logger
+            logger.log_train(
+                iteration + 1,
+                pixel_loss=avg_px,
+                perceptual_loss=percep_loss_sum / percep_count if percep_count > 0 else None,
+                fft_loss=fft_loss_sum / fft_count if fft_count > 0 else None,
+                total_loss=avg_loss,
+                lr=lr_now,
+            )
+
             profile_str = ""
             if do_profile:
                 torch.cuda.synchronize()
                 t_fwd = ev_fwd_start.elapsed_time(ev_fwd_end)
-                t_vgg = ev_fwd_end.elapsed_time(ev_vgg_end)
-                t_bwd = ev_vgg_end.elapsed_time(ev_bwd_end)
+                t_aux = ev_fwd_end.elapsed_time(ev_aux_end)
+                t_bwd = ev_aux_end.elapsed_time(ev_bwd_end)
                 t_opt = ev_bwd_end.elapsed_time(ev_opt_end)
-                t_total = t_fwd + t_vgg + t_bwd + t_opt
+                t_total = t_fwd + t_aux + t_bwd + t_opt
                 profile_str = (
-                    f"\n    fwd={t_fwd:.0f} vgg={t_vgg:.0f} "
+                    f"\n    fwd={t_fwd:.0f} aux={t_aux:.0f} "
                     f"bwd={t_bwd:.0f} opt={t_opt:.0f} "
                     f"total={t_total:.0f}ms")
             print(
@@ -688,8 +531,10 @@ def train(args):
             loss_sum = 0.0
             pixel_loss_sum = 0.0
             percep_loss_sum = 0.0
+            fft_loss_sum = 0.0
             loss_count = 0
             percep_count = 0
+            fft_count = 0
             data_time_sum = 0.0
             compute_time_sum = 0.0
 
@@ -699,13 +544,15 @@ def train(args):
             val = validate(model, val_dir, device,
                           pixel_criterion=criterion,
                           perceptual_criterion=perceptual_criterion,
+                          fft_criterion=fft_criterion,
                           perceptual_weight=args.perceptual_weight,
+                          fft_weight=args.fft_weight,
                           crop_size=512)
             psnr = val["psnr"]
-            # Use total loss (pixel + perceptual) to decide best when
-            # perceptual loss is active, otherwise fall back to PSNR
             val_loss = val.get("combined_loss", None)
-            if val_loss is not None:
+
+            # Best model by total loss when auxiliary losses are active
+            if val_loss is not None and (perceptual_criterion is not None or fft_criterion is not None):
                 is_best = best_val_loss is None or val_loss < best_val_loss
                 if is_best:
                     best_val_loss = val_loss
@@ -714,11 +561,26 @@ def train(args):
                 is_best = psnr > best_psnr
                 if is_best:
                     best_psnr = psnr
+
+            # Log validation
+            logger.log_val(
+                iteration + 1,
+                psnr=psnr,
+                pixel_loss=val.get("pixel_loss"),
+                perceptual_loss=val.get("percep_loss"),
+                fft_loss=val.get("fft_loss"),
+                total_loss=val_loss,
+            )
+            logger.flush()
+
+            # Print validation summary
             val_detail = f"PSNR={psnr:.2f} dB"
             if "pixel_loss" in val:
                 val_detail += f" | px={val['pixel_loss']:.6f}"
             if "percep_loss" in val:
                 val_detail += f" perc={val['percep_loss']:.4f}"
+            if "fft_loss" in val:
+                val_detail += f" fft={val['fft_loss']:.4f}"
             if "combined_loss" in val:
                 val_detail += f" total={val['combined_loss']:.6f}"
             best_str = (f"best_loss={best_val_loss:.6f}"
@@ -727,6 +589,17 @@ def train(args):
             print(f"  VAL {iteration + 1} ({val['n_frames']}f): "
                   f"{val_detail} {'(BEST)' if is_best else ''} "
                   f"[{best_str}]")
+
+            # Save sample comparison images
+            save_val_samples(model, val_dir, ckpt_dir, iteration + 1,
+                           device, num_samples=3, crop_size=512)
+
+            # Update loss curves chart
+            try:
+                logger.plot_curves(os.path.join(ckpt_dir, "training_curves.png"))
+            except Exception as e:
+                print(f"  (chart error: {e})")
+
             model.train()
 
             # Save best model
@@ -746,14 +619,22 @@ def train(args):
             # Also save latest (for easy resume)
             latest_path = os.path.join(ckpt_dir, "nafnet_latest.pth")
             torch.save(ckpt_data, latest_path)
+            logger.flush()
 
     # ---- Final save ----
     final_path = os.path.join(ckpt_dir, "nafnet_final.pth")
     torch.save({"params": model.state_dict()}, final_path)
+    logger.flush()
+
+    # Final loss curves
+    try:
+        logger.plot_curves(os.path.join(ckpt_dir, "training_curves.png"))
+    except Exception:
+        pass
+
     print(f"\nTraining complete. Final model: {final_path}")
     print(f"Best PSNR: {best_psnr:.2f} dB")
 
-    # Also save the best model in a standalone format (just params, like NAFNet expects)
     best_ckpt = os.path.join(ckpt_dir, "nafnet_best.pth")
     if os.path.exists(best_ckpt):
         print(f"Best model: {best_ckpt}")
@@ -811,15 +692,23 @@ def parse_args():
                         help="Gradient clipping max norm (0 = disabled, default: 1.0)")
     parser.add_argument("--loss", type=str, default="charbonnier",
                         choices=["charbonnier", "psnr", "l1"],
-                        help="Loss function")
+                        help="Pixel loss function")
     parser.add_argument("--amp", action="store_true", default=True,
-                        help="Use AMP mixed precision (default: on, essential for 6GB VRAM)")
+                        help="Use AMP mixed precision (default: on)")
     parser.add_argument("--no-amp", action="store_false", dest="amp",
                         help="Disable AMP mixed precision")
+
+    # Perceptual loss (DISTS)
     parser.add_argument("--perceptual-weight", type=float, default=0.0,
-                        help="VGG perceptual loss weight (0 = disabled, try 0.05)")
-    parser.add_argument("--perceptual-freq", type=int, default=10,
-                        help="Compute perceptual loss every N iters (default: 10, aligned with print_freq)")
+                        help="DISTS perceptual loss weight (0 = disabled, try 0.05)")
+    parser.add_argument("--perceptual-freq", type=int, default=1,
+                        help="Compute perceptual loss every N iters (default: 1)")
+
+    # FFT loss
+    parser.add_argument("--fft-weight", type=float, default=0.0,
+                        help="Focal frequency loss weight (0 = disabled, try 0.1)")
+    parser.add_argument("--fft-alpha", type=float, default=1.0,
+                        help="Focal frequency loss alpha (focal exponent, default: 1.0)")
 
     # Logging / checkpoints
     parser.add_argument("--checkpoint-dir", type=str,

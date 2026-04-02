@@ -3,10 +3,11 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import imageio_ffmpeg, subprocess, os, struct
+import subprocess, os, struct
 from lib.paths import DATA_DIR
+from lib.ffmpeg_utils import get_ffmpeg
 
-ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+ffmpeg = get_ffmpeg()
 
 inp = str(DATA_DIR / 'Firefly_S01E02_denoised - Copy.mp4')
 out = str(DATA_DIR / 'Firefly_S01E02_denoised_preview.mp4')

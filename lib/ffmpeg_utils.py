@@ -5,25 +5,34 @@ import re
 
 
 def get_ffmpeg():
-    """Get ffmpeg path — prefer imageio_ffmpeg (reliable), fall back to system."""
+    """Get ffmpeg path — prefer local bin/ (modern, NVENC), fall back to system/imageio."""
+    import shutil
+    # Prefer project-local ffmpeg (modern build with NVENC)
+    local = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "ffmpeg.exe")
+    if os.path.exists(local):
+        return local
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except ImportError:
         pass
-    import shutil
-    path = shutil.which("ffmpeg")
-    if path:
-        return path
     raise RuntimeError("ffmpeg not found. Install it or pip install imageio-ffmpeg")
 
 
 def get_ffprobe():
-    """Get ffprobe path, or None if unavailable."""
+    """Get ffprobe path — prefer local bin/ (modern), fall back to system/imageio."""
     import shutil
+    # Prefer project-local ffprobe (matches local ffmpeg build)
+    local = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "ffprobe.exe")
+    if os.path.exists(local):
+        return local
     path = shutil.which("ffprobe")
     if path:
         return path
+    # Try alongside whatever ffmpeg we found
     ffmpeg = get_ffmpeg()
     ffdir = os.path.dirname(ffmpeg)
     for name in ("ffprobe", "ffprobe.exe"):

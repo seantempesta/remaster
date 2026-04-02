@@ -24,6 +24,7 @@ import torch
 from lib.paths import PROJECT_ROOT, DATA_DIR, REFERENCE_CODE
 from lib.nafnet_arch import NAFNet
 from lib.metrics import compute_psnr, compute_ssim
+from lib.ffmpeg_utils import get_ffmpeg
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -96,7 +97,7 @@ def extract_frames_if_needed():
     os.makedirs(INPUT_DIR, exist_ok=True)
     print(f"Extracting frames from {clip} ...")
     subprocess.run([
-        'ffmpeg', '-i', clip,
+        get_ffmpeg(), '-hide_banner', '-i', clip,
         '-start_number', '1',
         os.path.join(INPUT_DIR, 'frame_%05d.png')
     ], check=True, capture_output=True)
