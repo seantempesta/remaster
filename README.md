@@ -6,29 +6,42 @@ This project uses ML to fix it — removing compression artifacts from video at 
 
 > **Status: Active development.** The student model now runs at **78 fps** (1080p, RTX 3060) — **78x faster** than the teacher — using only 2.3 GB VRAM. Currently building a zero-copy GPU pipeline and training with DISTS perceptual loss.
 
+![Comparison: Original vs NAFNet w64 vs NAFNet w32](assets/comparison_detail.png)
+*Firefly S01E02 — Compressed original vs restored. The w32 model runs at 78 fps and produces results visually close to the much larger w64.*
+
+![Full frame comparison](assets/comparison_full.png)
+
 ## The Problem
 
 Compressed video (H.264/H.265) destroys detail in ways that are obvious to the eye but hard to undo. Blocking, ringing, banding, mosquito noise — the usual suspects. Traditional denoising filters either nuke the detail along with the artifacts, or barely touch them. Neural networks can learn the difference, but the good ones are *way* too slow for a whole TV series.
 
-## The Approach
+## How It Works
 
-**Distillation**: Train a fast student model (NAFNet, pure CNN) to replicate the output of a slow but high-quality teacher (SCUNet, transformer-based). The student runs at real-time speeds while the teacher took 32+ hours per episode.
+### 1. Generate Training Targets
 
+The best neural denoiser we found is [SCUNet](https://github.com/cszn/SCUNet) — a transformer-based model that produces excellent results but crawls at 0.5 fps. Way too slow for a whole series, but perfect as a teacher.
+
+We run SCUNet's GAN variant over thousands of frames to generate clean targets, then blend back high-frequency detail from the originals:
+
+```python
+target = SCUNet_GAN(frame) + 0.15 * high_pass(frame)
 ```
-Compressed Frame ──> NAFNet (student) ──> Clean Frame
-                        ^
-                        │ trained to match
-                        │
-Compressed Frame ──> SCUNet (teacher) ──> Clean Frame (slow but excellent)
-```
 
-### Loss Functions
+This **detail transfer** is the secret sauce. The GAN cleans up compression artifacts beautifully but can lose fine texture in the process — hair, fabric weave, film grain. By extracting the high-frequency component of the original (a Gaussian high-pass filter) and blending just 15% of it back, we get targets that are both clean *and* detailed. Zero hallucination — every bit of recovered detail comes from the original source.
 
-The training uses three complementary loss signals:
+### 2. Distill Into a Fast Model
+
+[NAFNet](https://github.com/megvii-research/NAFNet) is a pure CNN — no attention, no transformers, just convolutions. That makes it `torch.compile` friendly and stupidly fast. We eviscerated the middle section (12 blocks down to 4) and halved the channel width (64 to 32), producing a model that's 4.7x smaller and runs at **78 fps on a laptop GPU**.
+
+The student learns to match the teacher's output using three complementary loss signals:
 
 - **Charbonnier** (pixel loss) — smooth L1 for overall fidelity
-- **DISTS** (perceptual loss) — [Deep Image Structure and Texture Similarity](https://github.com/dingkeyan93/DISTS), specifically designed for compression artifact assessment. Better calibrated to human perception than VGG feature matching
-- **Focal Frequency Loss** — operates in the frequency domain to preserve high-frequency detail (edges, texture) that pixel and perceptual losses tend to smooth away
+- **[DISTS](https://github.com/dingkeyan93/DISTS)** (perceptual loss) — Deep Image Structure and Texture Similarity, specifically designed for assessing compression artifacts. Better calibrated to human perception than VGG feature matching, and faster too (VGG16 vs VGG19 backbone)
+- **Focal Frequency Loss** — operates in the frequency domain to preserve the high-frequency detail that pixel and perceptual losses tend to smooth away
+
+### 3. Run It
+
+The compiled model processes 1080p video at 78 fps with `torch.compile` on a consumer RTX 3060. A 42-minute episode that took 32 hours with the teacher now takes about 14 minutes.
 
 ## Results
 

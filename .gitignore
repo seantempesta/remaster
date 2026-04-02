@@ -37,6 +37,9 @@ build/
 Thumbs.db
 .DS_Store
 
+# Allow assets for README
+!assets/*.png
+
 # Allow reference-code submodules (but ignore their large files)
 !reference-code/
 reference-code/*/testsets/
