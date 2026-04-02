@@ -326,8 +326,8 @@ def build_tensorrt_engine(onnx_path, num_calib_frames=200):
 
     # Configure builder for INT8 + FP16 mixed precision
     config = builder.create_builder_config()
-    # 4 GB workspace — RTX 3060 has 6GB, engine build uses system RAM too
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
+    # 1 GB workspace — RTX 3060 has 6GB, model+calibration uses ~4GB already
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
     config.set_flag(trt.BuilderFlag.FP16)
     config.set_flag(trt.BuilderFlag.INT8)
 
@@ -390,16 +390,19 @@ class TRTModel:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
 
-        # Pre-allocate I/O tensors on GPU
-        # Input: (1, 3, TRT_INPUT_H, TRT_INPUT_W) — fp16 since engine was built from fp16 ONNX
-        # Output: same shape
+        # Pre-allocate I/O tensors on GPU — match engine dtype
+        # Query actual dtypes from engine (may be fp32 even with INT8 engine)
+        in_dtype = trt.nptype(self.engine.get_tensor_dtype("input"))
+        out_dtype = trt.nptype(self.engine.get_tensor_dtype("output"))
+        torch_in_dtype = torch.float32 if in_dtype == np.float32 else torch.float16
+        torch_out_dtype = torch.float32 if out_dtype == np.float32 else torch.float16
         self.input_tensor = torch.zeros(
             1, 3, TRT_INPUT_H, TRT_INPUT_W,
-            dtype=torch.float16, device="cuda"
+            dtype=torch_in_dtype, device="cuda"
         )
         self.output_tensor = torch.zeros(
             1, 3, TRT_INPUT_H, TRT_INPUT_W,
-            dtype=torch.float16, device="cuda"
+            dtype=torch_out_dtype, device="cuda"
         )
 
         # CUDA stream for async execution
@@ -421,8 +424,8 @@ class TRTModel:
             f"Pre-pad to the fixed TRT input shape."
         )
 
-        # Copy input data (handles channels_last -> contiguous if needed)
-        self.input_tensor.copy_(x.contiguous())
+        # Copy input data, casting to engine's expected dtype
+        self.input_tensor.copy_(x.to(dtype=self.input_tensor.dtype).contiguous())
 
         with torch.cuda.stream(self.stream):
             # Set tensor addresses (TensorRT 10.x API)
