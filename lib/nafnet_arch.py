@@ -62,25 +62,23 @@ class LayerNorm2d(nn.Module):
 class LayerNorm2dExport(nn.Module):
     """TRT/ONNX-export-safe version of LayerNorm2d.
 
-    Uses only standard ops (no custom autograd.Function, no dtype branching).
-    Operates in the input dtype (no fp32 upcast) to minimize memory during
-    ONNX JIT tracing on VRAM-constrained GPUs. TensorRT controls per-layer
-    precision independently of what the ONNX graph specifies, so the fp32
-    upcast is not needed in the export graph.
+    Uses F.layer_norm which maps to ONNX LayerNormalization op (opset 17).
+    TensorRT handles this via INormalizationLayer with proper fp32 precision
+    for reduction ops, avoiding the fp16 overflow that manual reduce/pow causes.
     """
     def __init__(self, channels, eps=1e-6):
         super().__init__()
+        self.channels = channels
         self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
         self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
         self.eps = eps
 
     def forward(self, x):
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        x = (x - mu) / (var + self.eps).sqrt()
-        w = self.weight.to(x.dtype).view(1, -1, 1, 1)
-        b = self.bias.to(x.dtype).view(1, -1, 1, 1)
-        return w * x + b
+        # NCHW -> NHWC, layer_norm over C, NHWC -> NCHW
+        return F.layer_norm(
+            x.permute(0, 2, 3, 1), [self.channels],
+            self.weight, self.bias, self.eps
+        ).permute(0, 3, 1, 2)
 
 
 def _replace_modules(model, predicate, factory):
