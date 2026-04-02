@@ -7,9 +7,16 @@ This project uses ML to fix it — removing compression artifacts from video at 
 > **Status: Active development.** The student model now runs at **78 fps** (1080p, RTX 3060) — **78x faster** than the teacher — using only 2.3 GB VRAM. Currently building a zero-copy GPU pipeline and training with DISTS perceptual loss.
 
 ![Detail comparison](assets/comparison_detail.png)
+*Morena Baccarin deserves better than MPEG artifacts.*
+
+![Confrontation scene](assets/comparison_e08_00028.png)
+*Skin detail and lighting. The compressed original has visible banding and smearing — both models clean it up, the speed model at **78 fps**.*
+
+![Dark scene](assets/comparison_e08_00077.png)
+*Dark scenes are the hardest — compression loves to destroy shadow detail. Both models recover it without introducing noise.*
 
 ![Full frame comparison](assets/comparison_full.png)
-*Firefly S01E02 (2002, Fox). Left: the compressed source — look at the skin banding and smeared hair. Middle: our quality model cleans it up at 1.9 fps. Right: the speed model produces nearly identical results at **78 fps**. Morena Baccarin deserves better than MPEG artifacts.*
+*All comparisons from Firefly (2002, Fox). Left: compressed source. Middle: quality model (1.9 fps). Right: speed model (78 fps).*
 
 ## The Problem
 
