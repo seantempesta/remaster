@@ -63,8 +63,10 @@ class LayerNorm2dExport(nn.Module):
     """TRT/ONNX-export-safe version of LayerNorm2d.
 
     Uses only standard ops (no custom autograd.Function, no dtype branching).
-    Always casts to fp32 for the normalization arithmetic and back.
-    Numerically identical to LayerNorm2d's fp16 path.
+    Operates in the input dtype (no fp32 upcast) to minimize memory during
+    ONNX JIT tracing on VRAM-constrained GPUs. TensorRT controls per-layer
+    precision independently of what the ONNX graph specifies, so the fp32
+    upcast is not needed in the export graph.
     """
     def __init__(self, channels, eps=1e-6):
         super().__init__()
@@ -73,12 +75,12 @@ class LayerNorm2dExport(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        x_f = x.float()
-        mu = x_f.mean(1, keepdim=True)
-        var = (x_f - mu).pow(2).mean(1, keepdim=True)
-        x_f = (x_f - mu) / (var + self.eps).sqrt()
-        x_f = self.weight.float().view(1, -1, 1, 1) * x_f + self.bias.float().view(1, -1, 1, 1)
-        return x_f.half()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        x = (x - mu) / (var + self.eps).sqrt()
+        w = self.weight.to(x.dtype).view(1, -1, 1, 1)
+        b = self.bias.to(x.dtype).view(1, -1, 1, 1)
+        return w * x + b
 
 
 def _replace_modules(model, predicate, factory):
