@@ -50,15 +50,23 @@ An experimentation platform for improving video quality using ML models. The pri
 ## Data Directory
 `data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Contains video clips, extracted frames, model outputs. Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.
 
-## Current Status (2026-04-01)
+## Current Status (2026-04-02)
 
-**Working pipeline:** NAFNet distilled denoiser runs at **27.9 fps on H100** via `cloud/modal_denoise.py`. Full episodes process in ~37 min for ~$2.40. Uses PyTorch 2.7.1 + torch.compile(reduce-overhead) + CUDA graphs + Inductor optimizations.
+**Cloud inference:** NAFNet width64 at **27.9 fps on H100** via `cloud/modal_denoise.py`. ~$2.40/episode. Modal still on PyTorch 2.7.1+cu124 — needs upgrade to 2.11.0+cu126.
 
-**First episode done:** Firefly S01E02 processed end-to-end (61K frames, 27.9 fps, 0 errors). Output has H.264 10-bit video + all audio/subtitle tracks.
+**Local inference:** **1.94 fps** with torch.compile on RTX 3060 (PyTorch 2.11.0+cu126 + triton-windows). TensorRT FP16 also works at 1.92 fps, 96MB VRAM. Full episode = 8.6 hours overnight, free.
 
-**Quality issue:** Output is slightly soft and dark shadows are still noisy. Needs training improvements — current model was only trained for 5K of planned 50K iters, uses Charbonnier loss only (no perceptual loss), 256px crops, limited data.
+**Training:** Active run on Modal with GAN+detail targets (SCUNet GAN + α=0.15 high-pass detail transfer). VGG perceptual loss + Charbonnier. 25K checkpoint showed +2.39 dB over original on held-out val set.
 
-**Key TODO:** Improve training quality (perceptual loss, more data, longer training, larger crops). See `docs/distillation-guide.md`.
+**Quality:** GAN+detail targets produce sharper output than PSNR-only teacher. Detail transfer adds real texture from original frames (zero hallucination). Best alpha = 0.15.
+
+**Next:** Three parallel experiments to shrink the model for ~30 fps local:
+- A: width64, middle blocks 12→4 (~3-4 fps)
+- B: width32, full depth (~8 fps)
+- C: width32, middle blocks 12→4 (~15-25 fps, target 30 fps)
+See plan at `.claude/plans/groovy-hugging-rossum.md`.
+
+**Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`.
 
 ## Critical Gotchas
 
