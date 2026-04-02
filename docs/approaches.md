@@ -3,8 +3,8 @@
 | Approach | Quality | Speed | VRAM | Script | Status |
 |----------|---------|-------|------|--------|--------|
 | SCUNet | Best | 0.52 fps | 3.1GB | `pipelines/denoise_batch.py` | Production |
-| NAFNet (distilled) | TBD | 10-30+ fps target | ~1GB | `pipelines/denoise_nafnet.py` | Training |
-| FlashVSR | TBD | Near real-time? | ~6GB | `cloud/modal_flashvsr.py` | Testing (active run) |
+| NAFNet (distilled) | Good (+2.39 dB vs original) | 1.9 fps local, 28 fps H100 | ~1GB | `pipelines/denoise_nafnet.py` | Training (Exp C) |
+| FlashVSR | Untested | Near real-time? | ~6GB | `cloud/modal_flashvsr.py` | On hold |
 | Real-ESRGAN roundtrip | Mediocre | 0.19 fps | ~4GB | `experiments/realesrgan_roundtrip.py` | Done, not viable |
 | RAFT flow-fusion | Bad (blurry) | N/A | N/A | `experiments/flow_warp_fuse.py` | Failed |
 | Real-ESRGAN upscale | Good (perceptual) | 0.19 fps | ~4GB | `experiments/realesrgan_upscale.py` | Done |
