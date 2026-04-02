@@ -1,12 +1,14 @@
-# Video Enhancement Experiment Platform
+# remaster
 
-A research platform for improving video quality using ML models. The primary goal is removing compression artifacts from existing video libraries (e.g., BluRay rips) at native 1080p resolution, running on consumer hardware.
+You know that feeling when you want to rewatch an old favorite and the only copy you can find looks like it was compressed through a potato? Blocky gradients, smeared faces, fine detail replaced with MPEG sludge. Some people will tell you that's "charming" or "authentic." Those people are wrong. The director didn't spend months on lighting and color grading so you could watch a copy that looks like it was faxed. Don't settle for it.
 
-> **Status: Active development.** The distillation pipeline is producing real results — NAFNet student models that run 50x faster than the SCUNet teacher while approaching its quality.
+This project uses ML to fix it — removing compression artifacts from video at native resolution, fast enough to actually use on your library.
+
+> **Status: Active development.** Training a fast student model (NAFNet) that runs 50x faster than the best denoiser (SCUNet) while approaching its quality. Currently experimenting with loss functions to push quality further.
 
 ## The Problem
 
-Compressed video (H.264/H.265) introduces blocking artifacts, ringing, and loss of fine detail. Traditional denoising filters are either too aggressive (destroying detail) or too conservative (leaving artifacts). Neural networks can learn the difference — but the best models are too slow for practical use.
+Compressed video (H.264/H.265) destroys detail in ways that are obvious to the eye but hard to undo. Blocking, ringing, banding, mosquito noise — the usual suspects. Traditional denoising filters either nuke the detail along with the artifacts, or barely touch them. Neural networks can learn the difference, but the good ones are *way* too slow for a whole TV series.
 
 ## The Approach
 
