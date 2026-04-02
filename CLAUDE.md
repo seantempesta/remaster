@@ -43,12 +43,16 @@ An experimentation platform for improving video quality using ML models. The pri
 - `cloud/` — Modal remote GPU execution scripts
 - `bench/` — benchmarking and quality comparison
 - `tools/` — small utilities (clip extraction, probing, MP4 repair)
+- `playback/` — mpv + VapourSynth + vs-mlrt real-time playback (enhance.vpy, README)
 - `docs/` — documentation (setup, architecture, experiment log, approach comparison)
 
 ## Key Scripts
 - `pipelines/denoise_batch.py` — main pipeline: batched SCUNet with threaded IO
 - `pipelines/denoise_nafnet.py` — NAFNet pipeline (configurable arch, torch.compile, NVENC)
-- `pipelines/denoise_gpu.py` — zero-copy GPU pipeline (PyNvVideoCodec NVDEC/NVENC, WIP)
+- `pipelines/denoise_gpu.py` — zero-copy GPU pipeline (PyNvVideoCodec NVDEC/NVENC, original, 5.4 fps)
+- `pipelines/denoise_gpu_v2.py` — CUDA streams + ring buffers + stream-isolated NVDEC/NVENC (6.8 fps, GIL-limited)
+- `pipelines/denoise_gpu_v3.py` — NVDEC decode + ffmpeg pipe encode (5.0 fps, GPU→CPU sync bottleneck)
+- `pipelines/denoise_fast.py` — pipe-based pipeline (ffmpeg NVDEC/NVENC via stdin/stdout, 3.5 fps)
 - `pipelines/denoise_episode.py` — original episode denoiser (simpler, single-frame)
 - `training/train_nafnet.py` — NAFNet distillation training loop (configurable arch, profiling, graceful stop)
 - `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency
@@ -56,6 +60,8 @@ An experimentation platform for improving video quality using ML models. The pri
 - `training/viz.py` — Training visualization: sample images + loss curves
 - `tools/stop_training.py` — Send graceful stop signal to Modal training via Dict
 - `tools/verify_arch_configs.py` — Verify weight loading for different NAFNet architectures
+- `cloud/modal_export_onnx_w32.py` — Export NAFNet w32_mid4 to ONNX on Modal
+- `playback/enhance.vpy` — VapourSynth script for real-time mpv playback via vs-mlrt TensorRT
 - `bench/compare.py` — PSNR/SSIM metrics and side-by-side comparison
 - `bench/bench_nafnet.py` — NAFNet vs SCUNet benchmark
 
@@ -77,7 +83,9 @@ An experimentation platform for improving video quality using ML models. The pri
 
 **Local inference (w64):** **1.94 fps** with torch.compile on RTX 3060. TensorRT FP16: 1.92 fps, 96MB VRAM.
 
-**Local inference (w32_mid4):** **5.2 fps** with torch.compile, **2.3GB VRAM**. Raw model throughput: 78 fps (pipeline-bottlenecked by decode/encode). Zero-copy GPU pipeline via PyNvVideoCodec achieves same 5.4 fps — needs pipelining (decode/infer/encode concurrently) to approach 78 fps.
+**Local inference (w32_mid4):** Raw model: **78 fps** (13ms/frame). Best Python pipeline: **6.8 fps** (`denoise_gpu_v2.py` with CUDA stream isolation). **Python's GIL is the ceiling** — three pipeline threads serialize on the GIL regardless of CUDA stream separation. See `docs/realtime-playback-research.md` for full analysis. Reaching 40+ fps requires a C++ pipeline (TensorRT + Video Codec SDK, or vs-mlrt).
+
+**ONNX exports:** w64 at `checkpoints/nafnet_distill/nafnet_w64_1088x1920.onnx`. w32_mid4 at `checkpoints/nafnet_w32_mid4/nafnet_w32mid4_1088x1920.onnx` (57MB, opset 18, validated). Exported via `cloud/modal_export_onnx_w32.py`.
 
 **Completed training runs:**
 - **w64 GAN+detail (40K iters, A100):** Best PSNR 56.82 dB. Checkpoint at `checkpoints/nafnet_distill/nafnet_best.pth` (464MB). Final loss 0.055.
@@ -101,11 +109,17 @@ An experimentation platform for improving video quality using ML models. The pri
 - `clip_mid_1080p_nafnet_gan_final.mkv` — w64 GAN+detail, final 40K iter checkpoint
 - `clip_mid_1080p_nafnet_w32mid4.mkv` — w32_mid4 with torch.compile (5.2 fps)
 
+**Pipeline findings (2026-04-02):**
+- PyNvVideoCodec accepts `cuda_stream=` (decoder) and `cudastream=` (encoder) for stream isolation
+- torch.compile `reduce-overhead` CUDA graphs replay on **default stream** regardless of `torch.cuda.stream()` context — events must be recorded on `torch.cuda.default_stream()`
+- Python GIL caps all pipeline architectures at ~5-7 fps (GIL contention between decode/infer/encode threads)
+- VLC plugin: not viable (CPU-only filter API). See `docs/realtime-playback-research.md`
+
 **Next steps:**
-- Pipeline the GPU video path (NVDEC/infer/NVENC concurrent) to approach 78 fps
+- Install VapourSynth + vs-mlrt + mpv for real-time playback (see `playback/README.md`)
+- Test vs-mlrt batch encoding via `vspipe` + ffmpeg (C++ TensorRT, no GIL)
 - Evaluate DISTS+FFT training quality vs VGG
-- Consider TensorRT for w32_mid4 (~1.5GB VRAM, potentially faster)
-- Real-time playback via mpv + VapourSynth + vs-mlrt (see `docs/realtime-playback-research.md`)
+- If vs-mlrt insufficient: custom C++ pipeline (Video Codec SDK + TensorRT)
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`.
 
@@ -127,7 +141,9 @@ An experimentation platform for improving video quality using ML models. The pri
 
 **NAFNet fp16:** Fixed in `lib/nafnet_arch.py`. LayerNorm2d casts to fp32 for normalization, returns fp16. Don't revert this.
 
-**torch.compile:** Works on NAFNet (pure CNN). Does NOT work on SCUNet (dynamic W/SW window branches cause infinite recompilation).
+**torch.compile:** Works on NAFNet (pure CNN). Does NOT work on SCUNet (dynamic W/SW window branches cause infinite recompilation). `reduce-overhead` mode uses CUDA graphs that replay on the **default stream** regardless of `torch.cuda.stream()` context — record events on `torch.cuda.default_stream()` not the custom stream.
+
+**Python GIL limits pipeline to ~7 fps.** PyNvVideoCodec's C extensions hold the GIL during blocking NVDEC/NVENC calls. Threading doesn't help — all three pipeline stages (decode/infer/encode) serialize on the GIL. Reaching 40+ fps requires C++ (vs-mlrt, custom TensorRT pipeline).
 
 **FFmpeg on Modal:** Debian apt ffmpeg has no NVENC. `cloud/modal_denoise.py` builds ffmpeg from source with nv-codec-headers for NVENC support. Don't replace with apt ffmpeg.
 
@@ -135,7 +151,9 @@ An experimentation platform for improving video quality using ML models. The pri
 
 **Local ffmpeg:** Modern ffmpeg 7.1 with NVENC at `bin/ffmpeg.exe`. `lib/ffmpeg_utils.get_ffmpeg()` prefers this over the old imageio_ffmpeg v4.2.2. All pipeline scripts use `get_ffmpeg()`. NVENC presets: `-preset p4 -tune hq -rc vbr -cq N`.
 
-**PyNvVideoCodec:** Installed (v2.1.0). Zero-copy NVDEC decode to CUDA tensors via `torch.from_dlpack()`. NVENC encode from GPU. Needs `os.add_dll_directory()` for PyTorch CUDA DLLs on Windows. RTX 3060 NVDEC cannot decode H264 High 10 (10-bit) — use HEVC sources.
+**PyNvVideoCodec:** Installed (v2.1.0). Zero-copy NVDEC decode to CUDA tensors via `torch.from_dlpack()`. NVENC encode from GPU. Needs `os.add_dll_directory()` for PyTorch CUDA DLLs on Windows. RTX 3060 NVDEC cannot decode H264 High 10 (10-bit) — use HEVC sources. **Stream isolation:** pass `cuda_stream=stream.cuda_stream` to SimpleDecoder and `cudastream=stream.cuda_stream` to CreateEncoder to prevent their internal syncs from blocking other streams.
+
+**ONNX export (PyTorch 2.11):** The dynamo exporter saves weights as external `.data` files. Must merge them inline: load with `load_external_data=True`, clear `data_location` on initializers, re-save. See `cloud/modal_export_onnx_w32.py`. Also requires `onnxscript` pip package.
 
 ## Modal Development Guidelines
 
