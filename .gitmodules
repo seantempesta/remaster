@@ -25,3 +25,6 @@
 [submodule "reference-code/autoresearch"]
 	path = reference-code/autoresearch
 	url = https://github.com/karpathy/autoresearch.git
+[submodule "reference-code/DISTS"]
+	path = reference-code/DISTS
+	url = https://github.com/dingkeyan93/DISTS.git
