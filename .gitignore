@@ -44,3 +44,5 @@ reference-code/*/results/
 reference-code/*/data/
 reference-code/*/model_zoo/*.pth
 reference-code/*/experiments/
+tools/ffmpeg-release-full.7z
+bin/*.7z
