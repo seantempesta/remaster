@@ -6,10 +6,10 @@ This project uses ML to fix it — removing compression artifacts from video at 
 
 > **Status: Active development.** The student model now runs at **78 fps** (1080p, RTX 3060) — **78x faster** than the teacher — using only 2.3 GB VRAM. Currently building a zero-copy GPU pipeline and training with DISTS perceptual loss.
 
-![Comparison: Original vs NAFNet w64 vs NAFNet w32](assets/comparison_detail.png)
-*Firefly S01E02 — Compressed original vs restored. The w32 model runs at 78 fps and produces results visually close to the much larger w64.*
+![Detail comparison](assets/comparison_detail.png)
 
 ![Full frame comparison](assets/comparison_full.png)
+*Firefly S01E02 (2002, Fox). Left: the compressed source — look at the skin banding and smeared hair. Middle: our quality model cleans it up at 1.9 fps. Right: the speed model produces nearly identical results at **78 fps**. Morena Baccarin deserves better than MPEG artifacts.*
 
 ## The Problem
 
