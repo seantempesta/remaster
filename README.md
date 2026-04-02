@@ -4,7 +4,7 @@ You know that feeling when you want to rewatch an old favorite and the only copy
 
 This project uses ML to fix it — removing compression artifacts from video at native resolution, fast enough to actually use on your library.
 
-> **Status: Active development.** Training a fast student model (NAFNet) that runs 50x faster than the best denoiser (SCUNet) while approaching its quality. Currently experimenting with loss functions to push quality further.
+> **Status: Active development.** The student model now runs at **78 fps** (1080p, RTX 3060) — **78x faster** than the teacher — using only 2.3 GB VRAM. Currently building a zero-copy GPU pipeline and training with DISTS perceptual loss.
 
 ## The Problem
 
@@ -30,17 +30,23 @@ The training uses three complementary loss signals:
 - **DISTS** (perceptual loss) — [Deep Image Structure and Texture Similarity](https://github.com/dingkeyan93/DISTS), specifically designed for compression artifact assessment. Better calibrated to human perception than VGG feature matching
 - **Focal Frequency Loss** — operates in the frequency domain to preserve high-frequency detail (edges, texture) that pixel and perceptual losses tend to smooth away
 
-## Results So Far
+## Results
 
-| Metric | Value |
-|--------|-------|
-| Teacher (SCUNet) speed | 0.52 fps |
-| Student (NAFNet w64) on H100 | 27.9 fps |
-| Student (NAFNet w64) local RTX 3060 | 1.94 fps |
-| Quality improvement over original | +2.39 dB PSNR |
-| VRAM usage (local fp16) | 96 MB |
+| Metric | NAFNet w64 | NAFNet w32-mid4 | SCUNet (teacher) |
+|--------|-----------|----------------|-----------------|
+| Parameters | 67M | **14.3M** | 15.2M (transformer) |
+| Model inference | 1.94 fps | **78 fps** | 0.52 fps |
+| End-to-end pipeline | 1.94 fps | **5.2 fps** | 0.52 fps |
+| VRAM (fp16 + compile) | 3.3 GB | **2.3 GB** | 4.8 GB |
+| Checkpoint size | 464 MB | **55 MB** | 60 MB |
+| Quality (PSNR vs teacher) | 56.82 dB | 49.50 dB | reference |
+| Speedup vs teacher | 3.7x | **78x** (raw), **10x** (pipeline) | 1x |
+| Cloud speed (H100) | 27.9 fps | est. 200+ fps | ~5 fps |
+| Training cost | ~$15 | **~$13** | — |
 
-Current experiment: shrinking the model further (width32, fewer middle blocks) targeting 30 fps on a laptop GPU.
+The w32-mid4 model (width=32, 4 middle blocks instead of 12) is 4.7x smaller and 40x faster than the original student while maintaining strong visual quality. The raw model throughput of 78 fps is bottlenecked by video decode/encode in the current pipeline — a [zero-copy GPU pipeline](#zero-copy-gpu-pipeline) using NVDEC/NVENC is in progress to close this gap.
+
+> **Why is end-to-end slower than raw inference?** The model finishes a frame in 13ms, but HEVC decoding + encoding add ~170ms overhead per frame. Pipelining decode/infer/encode concurrently on separate hardware (NVDEC/CUDA/NVENC) should approach the raw 78 fps.
 
 ## Architecture
 
@@ -52,9 +58,9 @@ Local (Windows, RTX 3060 6GB)     Cloud (Modal, H100 80GB)
 └── Quality evaluation
 ```
 
-- **Local inference** — PyTorch with torch.compile, or TensorRT FP16
-- **Cloud training** — [Modal](https://modal.com) for on-demand H100 GPU time
-- **Streaming pipeline** — reads video, processes frames, writes video (no intermediate files)
+- **Local inference** — PyTorch with torch.compile, or TensorRT FP16. Zero-copy GPU pipeline via [PyNvVideoCodec](https://github.com/NVIDIA/VideoProcessingFramework) (NVDEC → inference → NVENC, WIP)
+- **Cloud training** — [Modal](https://modal.com) for on-demand H100 GPU time (~$4/hr). RAM-cached datasets, CUDA event profiling, graceful shutdown via Modal Dict signals
+- **Streaming pipeline** — reads video, processes frames, writes video (no intermediate files). Supports HEVC NVENC encoding with ffmpeg 7.1
 
 ## Project Structure
 
@@ -73,11 +79,12 @@ reference-code/ Git submodules: SCUNet, NAFNet, DISTS, RAFT, etc.
 
 | Script | Purpose |
 |--------|---------|
-| `training/train_nafnet.py` | Distillation training loop with DISTS + FFT loss |
+| `training/train_nafnet.py` | Distillation training with configurable architecture, profiling, graceful stop |
 | `training/losses.py` | All loss functions: Charbonnier, DISTS, Focal Frequency |
 | `cloud/modal_train.py` | Modal wrapper — upload data, train on H100, download checkpoints |
-| `pipelines/denoise_nafnet.py` | Local NAFNet inference pipeline |
-| `pipelines/denoise_batch.py` | Production SCUNet batch pipeline with threaded I/O |
+| `pipelines/denoise_nafnet.py` | NAFNet inference pipeline (configurable arch, torch.compile, NVENC) |
+| `pipelines/denoise_gpu.py` | Zero-copy GPU pipeline (PyNvVideoCodec NVDEC/NVENC) |
+| `tools/stop_training.py` | Graceful stop for Modal training runs |
 | `bench/compare.py` | PSNR/SSIM metrics and side-by-side comparison |
 
 ## Quick Start
@@ -131,6 +138,27 @@ The training loop generates at each validation step:
 - **Sample comparison images** (input | teacher target | model prediction)
 - **Loss curve charts** (pixel, perceptual, FFT, total loss + validation PSNR)
 - **JSON training log** for custom analysis
+
+## Zero-Copy GPU Pipeline
+
+The current pipeline bounces frames through CPU memory. A zero-copy path keeps everything on the GPU:
+
+```
+NVDEC (hw decode) ──> CUDA tensor ──> NAFNet (inference) ──> CUDA tensor ──> NVENC (hw encode)
+                  zero-copy                              zero-copy
+```
+
+Using [PyNvVideoCodec](https://github.com/NVIDIA/VideoProcessingFramework) (NVIDIA's official Python bindings for Video Codec SDK), `torch.from_dlpack()` provides zero-copy interop between the decoder and PyTorch. The encoder accepts GPU buffers directly. All three stages (NVDEC, CUDA cores, NVENC) are separate hardware on the GPU and can run concurrently.
+
+**Current status:** Working end-to-end but not yet pipelined — decode/infer/encode run sequentially. Pipelining should approach the raw 78 fps throughput.
+
+## What's Next
+
+- **Pipeline the GPU path** — concurrent decode/infer/encode to approach 78 fps
+- **Real-time playback** — mpv + VapourSynth + vs-mlrt for live enhancement during playback
+- **TensorRT engine** — export w32-mid4 for ~1.5 GB VRAM, potentially faster than torch.compile
+- **Batch processing** — overnight processing of entire TV libraries at 78 fps
+- **Training experiments** — DISTS perceptual loss, lower detail transfer alpha, temporal consistency
 
 ## Reference Code
 

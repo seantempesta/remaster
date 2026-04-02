@@ -3,6 +3,19 @@
 ## What This Is
 An experimentation platform for improving video quality using ML models. The primary use case is reducing compression artifacts in existing video libraries (e.g., BluRay rips) at native resolution.
 
+### Key Results
+| Metric | Value | Details |
+|--------|-------|---------|
+| Model inference | **78 fps** @ 1080p | NAFNet w32_mid4, 14.3M params, torch.compile, RTX 3060 |
+| End-to-end pipeline | **5.2 fps** @ 1080p | Decode + inference + HEVC encode (bottlenecked by decode/encode) |
+| Model VRAM | **2.3 GB** | fp16, batch 1, with torch.compile CUDA graphs |
+| Model size | **55 MB** | Checkpoint (params only) |
+| Training speed | **2.2 it/s** | H100, bs=32, RAM cache, VGG perceptual loss every iter |
+| Training cost | **~$13** | 25K iters on H100 (~3.2 hrs) |
+| Quality (w32_mid4) | **49.50 dB** PSNR | vs SCUNet GAN+detail teacher targets on held-out val |
+| Quality (w64) | **56.82 dB** PSNR | 40K iters, same teacher targets |
+| Speedup vs teacher | **78x** | SCUNet teacher: ~1 fps; NAFNet w32_mid4: 78 fps raw |
+
 ## Goals
 - Denoise/enhance 1080p video content using learned models
 - Process full episodes in reasonable time on consumer hardware (RTX 3060 6GB)
@@ -10,14 +23,15 @@ An experimentation platform for improving video quality using ML models. The pri
 - Eventually train a custom fast model via distillation
 
 ## Architecture
-- **Local inference** runs on Windows with conda env `upscale` (Python 3.10, PyTorch 2.5.1+cu121)
+- **Local inference** runs on Windows with conda env `upscale` (Python 3.10, PyTorch 2.11.0+cu126)
 - **Cloud training** uses [Modal](https://modal.com) for GPU compute — CLI authenticated, account with billing attached
 - **Streaming pipeline** reads video -> processes frames -> writes video (no intermediate files)
+- **GPU video pipeline** (`pipelines/denoise_gpu.py`) uses PyNvVideoCodec for zero-copy NVDEC decode → inference → NVENC encode (WIP)
 - All scripts are standalone Python — no framework dependencies beyond PyTorch
 
 ## Key Constraints
 - 6GB VRAM — must use fp16, tiling, or half-res tricks to fit
-- Dependencies get overwritten easily — always install PyTorch CUDA from `--index-url https://download.pytorch.org/whl/cu121` LAST or with `--no-deps`
+- Dependencies get overwritten easily — always install PyTorch CUDA from `--index-url https://download.pytorch.org/whl/cu126` LAST or with `--no-deps`
 - Prefer patching code for modern PyTorch over pinning old dependencies
 - xformers is unreliable on Windows — use native `F.scaled_dot_product_attention` instead
 
@@ -33,11 +47,15 @@ An experimentation platform for improving video quality using ML models. The pri
 
 ## Key Scripts
 - `pipelines/denoise_batch.py` — main pipeline: batched SCUNet with threaded IO
-- `pipelines/denoise_nafnet.py` — NAFNet pipeline (for distilled model)
+- `pipelines/denoise_nafnet.py` — NAFNet pipeline (configurable arch, torch.compile, NVENC)
+- `pipelines/denoise_gpu.py` — zero-copy GPU pipeline (PyNvVideoCodec NVDEC/NVENC, WIP)
 - `pipelines/denoise_episode.py` — original episode denoiser (simpler, single-frame)
-- `training/train_nafnet.py` — NAFNet distillation training loop
+- `training/train_nafnet.py` — NAFNet distillation training loop (configurable arch, profiling, graceful stop)
 - `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency
+- `training/dataset.py` — PairedFrameDataset with optional RAM cache
 - `training/viz.py` — Training visualization: sample images + loss curves
+- `tools/stop_training.py` — Send graceful stop signal to Modal training via Dict
+- `tools/verify_arch_configs.py` — Verify weight loading for different NAFNet architectures
 - `bench/compare.py` — PSNR/SSIM metrics and side-by-side comparison
 - `bench/bench_nafnet.py` — NAFNet vs SCUNet benchmark
 
@@ -57,15 +75,39 @@ An experimentation platform for improving video quality using ML models. The pri
 
 **Cloud inference:** NAFNet width64 at **27.9 fps on H100** via `cloud/modal_denoise.py`. ~$2.40/episode. Modal on PyTorch 2.11.0+cu126.
 
-**Local inference:** **1.94 fps** with torch.compile on RTX 3060 (PyTorch 2.11.0+cu126 + triton-windows). TensorRT FP16 also works at 1.92 fps, 96MB VRAM. Full episode = 8.6 hours overnight, free.
+**Local inference (w64):** **1.94 fps** with torch.compile on RTX 3060. TensorRT FP16: 1.92 fps, 96MB VRAM.
 
-**Training:** Experiment C (width32, mid4) active on Modal H100 at 3.2 it/s. Loss: Charbonnier + DISTS perceptual (weight 0.1) + Focal Frequency Loss (weight 500). DISTS replaces VGG19 — better calibrated for compression artifacts, faster (VGG16 backbone + learned structure/texture weights). FFT loss targets high-frequency detail preservation. Training produces sample comparison images + loss curves at each validation step.
+**Local inference (w32_mid4):** **5.2 fps** with torch.compile, **2.3GB VRAM**. Raw model throughput: 78 fps (pipeline-bottlenecked by decode/encode). Zero-copy GPU pipeline via PyNvVideoCodec achieves same 5.4 fps — needs pipelining (decode/infer/encode concurrently) to approach 78 fps.
 
-**Quality:** GAN+detail targets produce sharper output than PSNR-only teacher. Detail transfer adds real texture from original frames (zero hallucination). Best alpha = 0.15.
+**Completed training runs:**
+- **w64 GAN+detail (40K iters, A100):** Best PSNR 56.82 dB. Checkpoint at `checkpoints/nafnet_distill/nafnet_best.pth` (464MB). Final loss 0.055.
+- **w32_mid4 VGG (25K iters, H100):** Best PSNR 49.50 dB, best total loss 0.0629 at iter 11K. Checkpoint at `checkpoints/nafnet_w32_mid4/nafnet_best.pth` (55MB).
+- **w32_mid4 DISTS+FFT:** In progress from VGG weights at `checkpoints/nafnet_w32_mid4_dists/`.
 
-**Experiment C focus:** width32, middle blocks 12→4 (~15-25 fps target, 30 fps goal). Previous VGG run reached 49.50 dB PSNR at 11K iters. New DISTS+FFT run started from those weights at `checkpoints/nafnet_w32_mid4_dists/`.
+**Training infrastructure improvements:**
+- Configurable architecture (--width, --middle-blk-num) with strict=False weight surgery
+- RAM cache eliminates DataLoader bottleneck (64% → 25% data wait, 0.7 → 2.2 it/s)
+- CUDA event profiling (fwd/vgg/bwd/opt breakdown per iteration)
+- Graceful shutdown: SIGINT handler + Modal Dict stop signal (`tools/stop_training.py`)
+- Best model selection by total loss (pixel + perceptual), not PSNR-only
+- Fused AdamW, non_blocking transfers, cuDNN benchmark warmup with cleanup
 
-**Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`.
+**Quality:** GAN+detail targets produce sharper output than PSNR-only teacher. Detail transfer adds real texture from original frames (zero hallucination). Best alpha = 0.15. Concern: alpha=0.15 may transfer too much compression noise — consider lower alpha or GAN-only targets.
+
+**Test clips in data/:**
+- `clip_mid_1080p.mp4` — original source (24s, 720 frames)
+- `clip_mid_1080p_nafnet_psnr.mkv` — w64 PSNR-only distillation (old)
+- `clip_mid_1080p_nafnet_gan_best.mkv` — w64 GAN+detail, best PSNR checkpoint
+- `clip_mid_1080p_nafnet_gan_final.mkv` — w64 GAN+detail, final 40K iter checkpoint
+- `clip_mid_1080p_nafnet_w32mid4.mkv` — w32_mid4 with torch.compile (5.2 fps)
+
+**Next steps:**
+- Pipeline the GPU video path (NVDEC/infer/NVENC concurrent) to approach 78 fps
+- Evaluate DISTS+FFT training quality vs VGG
+- Consider TensorRT for w32_mid4 (~1.5GB VRAM, potentially faster)
+- Real-time playback via mpv + VapourSynth + vs-mlrt (see `docs/realtime-playback-research.md`)
+
+**Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`.
 
 ## Critical Gotchas
 
@@ -91,7 +133,9 @@ An experimentation platform for improving video quality using ML models. The pri
 
 **x265 on Modal:** Prints "Failed to generate CPU mask" and falls back to single-threaded unless you add `pools=4` to x265-params.
 
-**Local ffmpeg:** imageio_ffmpeg ships v4.2.2 — doesn't support modern NVENC presets. Use `libx265` encoder locally or old NVENC syntax (`-rc vbr_hq -cq N`).
+**Local ffmpeg:** Modern ffmpeg 7.1 with NVENC at `bin/ffmpeg.exe`. `lib/ffmpeg_utils.get_ffmpeg()` prefers this over the old imageio_ffmpeg v4.2.2. All pipeline scripts use `get_ffmpeg()`. NVENC presets: `-preset p4 -tune hq -rc vbr -cq N`.
+
+**PyNvVideoCodec:** Installed (v2.1.0). Zero-copy NVDEC decode to CUDA tensors via `torch.from_dlpack()`. NVENC encode from GPU. Needs `os.add_dll_directory()` for PyTorch CUDA DLLs on Windows. RTX 3060 NVDEC cannot decode H264 High 10 (10-bit) — use HEVC sources.
 
 ## Modal Development Guidelines
 
