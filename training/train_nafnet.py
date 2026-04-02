@@ -226,17 +226,20 @@ class PairedFrameDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, data_dir, device, num_frames=10, crop_size=512):
+def validate(model, data_dir, device, pixel_criterion=None, perceptual_criterion=None,
+             perceptual_weight=0.0, crop_size=512):
     """
-    Validate on a few full-resolution crops (larger than training crops).
-    Returns average PSNR in dB.
+    Validate on held-out frames with larger crops than training.
+    Returns dict with PSNR, pixel loss, perceptual loss, and combined loss.
     """
     model.eval()
     input_dir = os.path.join(data_dir, "input")
     target_dir = os.path.join(data_dir, "target")
 
-    input_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))[:num_frames]
+    input_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))
     psnrs = []
+    pixel_losses = []
+    percep_losses = []
 
     for inp_path in input_files:
         fname = os.path.basename(inp_path)
@@ -263,15 +266,27 @@ def validate(model, data_dir, device, num_frames=10, crop_size=512):
         out_t = model(inp_t)
         out_t = out_t.clamp(0, 1)
 
+        # PSNR
         mse = ((out_t - tgt_t) ** 2).mean().item()
-        if mse > 0:
-            psnr = 10 * math.log10(1.0 / mse)
-        else:
-            psnr = 100.0
-        psnrs.append(psnr)
+        psnrs.append(10 * math.log10(1.0 / mse) if mse > 0 else 100.0)
+
+        # Pixel loss
+        if pixel_criterion is not None:
+            pixel_losses.append(pixel_criterion(out_t, tgt_t).item())
+
+        # Perceptual loss (fp32)
+        if perceptual_criterion is not None:
+            p_loss = perceptual_criterion(out_t.float(), tgt_t.float())
+            percep_losses.append(p_loss.item())
 
     model.train()
-    return np.mean(psnrs) if psnrs else 0.0
+    result = {"psnr": np.mean(psnrs) if psnrs else 0.0, "n_frames": len(psnrs)}
+    if pixel_losses:
+        result["pixel_loss"] = np.mean(pixel_losses)
+    if percep_losses:
+        result["percep_loss"] = np.mean(percep_losses)
+        result["combined_loss"] = result.get("pixel_loss", 0) + perceptual_weight * result["percep_loss"]
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -482,13 +497,24 @@ def train(args):
         # ---- Validation ----
         if (iteration + 1) % args.val_freq == 0:
             val_dir = args.val_dir if args.val_dir else args.data_dir
-            psnr = validate(model, val_dir, device,
-                          num_frames=10, crop_size=512)
+            val = validate(model, val_dir, device,
+                          pixel_criterion=criterion,
+                          perceptual_criterion=perceptual_criterion,
+                          perceptual_weight=args.perceptual_weight,
+                          crop_size=512)
+            psnr = val["psnr"]
             is_best = psnr > best_psnr
             if is_best:
                 best_psnr = psnr
-            print(f"  VALIDATION iter {iteration + 1}: PSNR={psnr:.2f} dB "
-                  f"{'(BEST)' if is_best else ''} [best={best_psnr:.2f}]")
+            val_detail = f"PSNR={psnr:.2f} dB"
+            if "pixel_loss" in val:
+                val_detail += f" | px={val['pixel_loss']:.6f}"
+            if "percep_loss" in val:
+                val_detail += f" perc={val['percep_loss']:.4f}"
+            if "combined_loss" in val:
+                val_detail += f" total={val['combined_loss']:.6f}"
+            print(f"  VALIDATION iter {iteration + 1} ({val['n_frames']} frames): "
+                  f"{val_detail} {'(BEST)' if is_best else ''} [best={best_psnr:.2f}]")
             model.train()
 
             # Save best model
