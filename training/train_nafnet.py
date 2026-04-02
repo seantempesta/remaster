@@ -24,12 +24,15 @@ Usage:
 """
 import os
 import sys
+import gc
 import glob
 import time
 import math
 import random
 import argparse
 import json
+import signal
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -148,9 +151,12 @@ class PairedFrameDataset(Dataset):
         data_dir/input/frame_XXXXX.png   (compressed input)
         data_dir/target/frame_XXXXX.png  (SCUNet denoised)
     """
-    def __init__(self, data_dir, crop_size=256, augment=True, max_frames=-1):
+    def __init__(self, data_dir, crop_size=256, augment=True,
+                 max_frames=-1, cache_in_ram=False):
         self.crop_size = crop_size
         self.augment = augment
+        self.cache_in_ram = cache_in_ram
+        self.cached_images = None
 
         input_dir = os.path.join(data_dir, "input")
         target_dir = os.path.join(data_dir, "target")
@@ -171,24 +177,55 @@ class PairedFrameDataset(Dataset):
             self.pairs = self.pairs[:max_frames]
 
         if not self.pairs:
-            raise FileNotFoundError(f"No matching pairs found in {data_dir}")
-        print(f"Dataset: {len(self.pairs)} pairs, crop={crop_size}, augment={augment}")
+            raise FileNotFoundError(
+                f"No matching pairs found in {data_dir}")
+
+        if cache_in_ram:
+            self._load_all_into_ram()
+
+        print(f"Dataset: {len(self.pairs)} pairs, crop={crop_size}, "
+              f"augment={augment}, cached={cache_in_ram}")
+
+    def _load_all_into_ram(self):
+        """Pre-load all images as float32 numpy arrays."""
+        import psutil
+        print(f"  Caching {len(self.pairs)} pairs into RAM...")
+        t0 = time.time()
+        self.cached_images = []
+        for i, (inp_path, tgt_path) in enumerate(self.pairs):
+            inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
+            tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
+            tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
+            # Store as uint8 to save RAM (convert to float in __getitem__)
+            self.cached_images.append((inp, tgt))
+            if (i + 1) % 200 == 0:
+                mb = psutil.Process().memory_info().rss / 1024**2
+                print(f"    {i+1}/{len(self.pairs)} loaded, "
+                      f"RAM: {mb:.0f}MB")
+        elapsed = time.time() - t0
+        mb = psutil.Process().memory_info().rss / 1024**2
+        print(f"  Cached {len(self.pairs)} pairs in {elapsed:.1f}s, "
+              f"RAM: {mb:.0f}MB")
 
     def __len__(self):
-        # Return a large number so DataLoader can iterate indefinitely
-        # (we control training by iteration count, not epochs)
         return len(self.pairs) * 100
 
     def __getitem__(self, idx):
-        # Pick a random pair (better than cycling through in order)
         pair_idx = idx % len(self.pairs)
-        inp_path, tgt_path = self.pairs[pair_idx]
 
-        # Read images (BGR -> RGB -> float32 [0,1])
-        inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
-        tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
-        inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        if self.cached_images is not None:
+            inp, tgt = self.cached_images[pair_idx]
+            inp = inp.astype(np.float32) / 255.0
+            tgt = tgt.astype(np.float32) / 255.0
+        else:
+            inp_path, tgt_path = self.pairs[pair_idx]
+            inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
+            tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(
+                np.float32) / 255.0
+            tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(
+                np.float32) / 255.0
 
         h, w, _ = inp.shape
         cs = self.crop_size
@@ -201,21 +238,17 @@ class PairedFrameDataset(Dataset):
 
         # Augmentation: random flip and rotation
         if self.augment:
-            # Horizontal flip
             if random.random() < 0.5:
                 inp = inp[:, ::-1, :].copy()
                 tgt = tgt[:, ::-1, :].copy()
-            # Vertical flip
             if random.random() < 0.5:
                 inp = inp[::-1, :, :].copy()
                 tgt = tgt[::-1, :, :].copy()
-            # Random 90-degree rotation
             k = random.randint(0, 3)
             if k > 0:
                 inp = np.rot90(inp, k).copy()
                 tgt = np.rot90(tgt, k).copy()
 
-        # HWC -> CHW tensor
         inp = torch.from_numpy(inp.transpose(2, 0, 1))
         tgt = torch.from_numpy(tgt.transpose(2, 0, 1))
         return inp, tgt
@@ -290,6 +323,27 @@ def validate(model, data_dir, device, pixel_criterion=None, perceptual_criterion
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Checkpoint saving
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _save_checkpoint(model, optimizer, scheduler, scaler, iteration, best_psnr, args, ckpt_dir):
+    """Save a full training checkpoint (model + optimizer + scheduler state).
+
+    Filters callable attributes from args to avoid serialization issues.
+    """
+    ckpt_data = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "iteration": iteration,
+        "best_psnr": best_psnr,
+        "args": {k: v for k, v in vars(args).items() if not callable(v)},
+    }
+    return ckpt_data
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -301,11 +355,13 @@ def train(args):
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     # ---- Model ----
+    enc_blk_nums = [int(x) for x in args.enc_blk_nums.split(",")]
+    dec_blk_nums = [int(x) for x in args.dec_blk_nums.split(",")]
     model = NAFNet(
-        img_channel=3, width=64,
-        middle_blk_num=12,
-        enc_blk_nums=[2, 2, 4, 8],
-        dec_blk_nums=[2, 2, 2, 2],
+        img_channel=3, width=args.width,
+        middle_blk_num=args.middle_blk_num,
+        enc_blk_nums=enc_blk_nums,
+        dec_blk_nums=dec_blk_nums,
     )
 
     # Load pretrained weights (skip if resuming from a training checkpoint)
@@ -315,8 +371,22 @@ def train(args):
         print(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=True)
         state_dict = ckpt.get("params", ckpt.get("params_ema", ckpt.get("state_dict", ckpt)))
-        model.load_state_dict(state_dict, strict=True)
-        print("  Loaded SIDD pretrained weights")
+        # Use strict=False to handle architecture mismatches (e.g. fewer middle blocks)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            print(f"  Skipped {len(unexpected)} unexpected keys (arch mismatch):")
+            for k in unexpected[:10]:
+                print(f"    {k}")
+            if len(unexpected) > 10:
+                print(f"    ... and {len(unexpected) - 10} more")
+        if missing:
+            print(f"  {len(missing)} missing keys (will be randomly initialized):")
+            for k in missing[:10]:
+                print(f"    {k}")
+            if len(missing) > 10:
+                print(f"    ... and {len(missing) - 10} more")
+        if not missing and not unexpected:
+            print("  Loaded pretrained weights (exact match)")
     else:
         print("WARNING: Training from scratch (no pretrained weights)")
 
@@ -324,15 +394,17 @@ def train(args):
     model.train()
 
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"NAFNet-width64: {params_m:.2f}M parameters")
+    print(f"NAFNet w={args.width} mid={args.middle_blk_num} enc={enc_blk_nums} dec={dec_blk_nums}: {params_m:.2f}M parameters")
     if device.type == "cuda":
         print(f"  Model VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
 
     # ---- Dataset ----
+    cache_in_ram = getattr(args, 'cache_in_ram', False)
     dataset = PairedFrameDataset(
         args.data_dir,
         crop_size=args.crop_size,
         augment=True,
+        cache_in_ram=cache_in_ram,
     )
     dataloader = DataLoader(
         dataset,
@@ -369,17 +441,20 @@ def train(args):
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.9),  # NAFNet uses (0.9, 0.9)
+        fused=device.type == "cuda",  # single fused kernel for optimizer step
     )
 
     # ---- LR Scheduler: cosine with linear warmup ----
     warmup_iters = args.warmup_iters
     def lr_lambda(step):
         if step < warmup_iters:
-            return step / max(warmup_iters, 1)
+            return max(step / max(warmup_iters, 1), 1e-8)  # avoid exact 0 at step 0
         progress = (step - warmup_iters) / max(args.max_iters - warmup_iters, 1)
         return max(args.eta_min / args.lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ---- Checkpoint dir ----
     ckpt_dir = os.path.abspath(args.checkpoint_dir)
@@ -420,16 +495,92 @@ def train(args):
     print(f"  checkpoints: {ckpt_dir}")
     print()
 
+    # ---- cuDNN benchmark warmup ----
     torch.backends.cudnn.benchmark = True
 
+    # Run one full training step (including perceptual loss) to trigger
+    # cudnn.benchmark algorithm selection, then free scratch memory.
+    print("  cuDNN benchmark warmup...")
+    _wb = next(iter(dataloader))
+    _wi, _wt = _wb[0].to(device, non_blocking=True), _wb[1].to(device, non_blocking=True)
+    with torch.amp.autocast("cuda", enabled=use_amp):
+        _wo = model(_wi)
+        _wl = criterion(_wo, _wt)
+    if perceptual_criterion is not None:
+        with torch.amp.autocast("cuda", enabled=False):
+            _pl = perceptual_criterion(_wo.float(), _wt.float())
+        _wl = _wl + args.perceptual_weight * _pl
+    _wl.backward()
+    optimizer.zero_grad(set_to_none=True)
+    del _wb, _wi, _wt, _wo, _wl
+    if perceptual_criterion is not None:
+        del _pl
+    torch.cuda.empty_cache()
+    gc.collect()
+    peak_gb = torch.cuda.max_memory_reserved() / 1024**3
+    curr_gb = torch.cuda.memory_reserved() / 1024**3
+    print(f"  cuDNN benchmark done. Peak: {peak_gb:.1f}GB, settled: {curr_gb:.1f}GB")
+    torch.cuda.reset_peak_memory_stats()
+
+    # ---- Training state ----
     data_iter = iter(dataloader)
     loss_sum = 0.0
     pixel_loss_sum = 0.0
     percep_loss_sum = 0.0
     loss_count = 0
+    percep_count = 0
+    data_time_sum = 0.0
+    compute_time_sum = 0.0
     start_time = time.time()
+    t_data_start = time.time()
 
+    stop_check = getattr(args, 'stop_check', None)
+    stop_check_freq = getattr(args, 'stop_check_freq', 50)
+    percep_freq = getattr(args, 'perceptual_freq', 5)
+
+    # CUDA event profiling — measures GPU time per phase, logged every print_freq
+    profile_on = device.type == "cuda"
+    if profile_on:
+        ev_fwd_start = torch.cuda.Event(enable_timing=True)
+        ev_fwd_end = torch.cuda.Event(enable_timing=True)
+        ev_vgg_end = torch.cuda.Event(enable_timing=True)
+        ev_bwd_end = torch.cuda.Event(enable_timing=True)
+        ev_opt_end = torch.cuda.Event(enable_timing=True)
+
+    # ---- Signal handler for graceful interrupts ----
+    def _save_emergency(it):
+        """Save checkpoint on interrupt/signal."""
+        ckpt_data = _save_checkpoint(model, optimizer, scheduler, scaler,
+                                     it, best_psnr, args, ckpt_dir)
+        path = os.path.join(ckpt_dir, "nafnet_latest.pth")
+        torch.save(ckpt_data, path)
+        torch.save({"params": model.state_dict()},
+                    os.path.join(ckpt_dir, "nafnet_final.pth"))
+        print(f"  Saved checkpoint at iter {it}: {path}")
+
+    _current_iter = start_iter
+    interrupted = False
+    def _handle_interrupt(signum, frame):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            print(f"\n  SIGINT received at iter {_current_iter}. "
+                  f"Saving checkpoint...")
+            _save_emergency(_current_iter)
+            print("  Checkpoint saved. Exiting.")
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, _handle_interrupt)
+
+    # ---- Main training loop ----
     for iteration in range(start_iter, args.max_iters):
+        _current_iter = iteration
+        # Graceful stop check
+        if stop_check and (iteration + 1) % stop_check_freq == 0:
+            if stop_check():
+                print(f"\n  STOP signal at iter {iteration + 1}.")
+                _save_emergency(iteration + 1)
+                return
+
         # Get batch (restart iterator if exhausted)
         try:
             inp_batch, tgt_batch = next(data_iter)
@@ -437,21 +588,38 @@ def train(args):
             data_iter = iter(dataloader)
             inp_batch, tgt_batch = next(data_iter)
 
-        inp_batch = inp_batch.to(device)
-        tgt_batch = tgt_batch.to(device)
+        inp_batch = inp_batch.to(device, non_blocking=True)
+        tgt_batch = tgt_batch.to(device, non_blocking=True)
+        t_compute_start = time.time()
+        data_time_sum += t_compute_start - t_data_start
+
+        # CUDA event profiling (on print iters)
+        is_print_iter = (iteration + 1) % args.print_freq == 0
+        do_profile = profile_on and is_print_iter
+        if do_profile:
+            torch.cuda.synchronize()
+            ev_fwd_start.record()
 
         # Forward with AMP
         with torch.amp.autocast("cuda", enabled=use_amp):
             pred = model(inp_batch)
             pixel_loss = criterion(pred, tgt_batch)
 
+        if do_profile:
+            ev_fwd_end.record()
+
         # Perceptual loss runs in fp32 (VGG is numerically unstable in fp16)
-        if perceptual_criterion is not None:
+        # Only compute every N iters to save GPU time (scale up to compensate)
+        if perceptual_criterion is not None and (iteration % percep_freq == 0):
             with torch.amp.autocast("cuda", enabled=False):
                 p_loss = perceptual_criterion(pred.float(), tgt_batch.float())
-            loss = pixel_loss + args.perceptual_weight * p_loss
+            loss = pixel_loss + args.perceptual_weight * percep_freq * p_loss
         else:
+            p_loss = None
             loss = pixel_loss
+
+        if do_profile:
+            ev_vgg_end.record()
 
         # Backward with scaler
         optimizer.zero_grad(set_to_none=True)
@@ -462,14 +630,24 @@ def train(args):
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
+        if do_profile:
+            ev_bwd_end.record()
+
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
 
+        if do_profile:
+            ev_opt_end.record()
+
+        t_data_start = time.time()
+        compute_time_sum += t_data_start - t_compute_start
+
         loss_sum += loss.item()
         pixel_loss_sum += pixel_loss.item()
-        if perceptual_criterion is not None:
+        if p_loss is not None:
             percep_loss_sum += p_loss.item()
+            percep_count += 1
         loss_count += 1
 
         # ---- Logging ----
@@ -479,20 +657,40 @@ def train(args):
             iters_per_sec = (iteration + 1 - start_iter) / elapsed
             eta = (args.max_iters - iteration - 1) / max(iters_per_sec, 0.01)
             lr_now = optimizer.param_groups[0]["lr"]
-            vram = torch.cuda.memory_allocated() / 1024**2 if device.type == "cuda" else 0
+            vram = torch.cuda.max_memory_reserved() / 1024**3 if device.type == "cuda" else 0
+            total_t = data_time_sum + compute_time_sum
+            data_pct = data_time_sum / total_t * 100 if total_t > 0 else 0
             loss_detail = f"loss={avg_loss:.6f}"
-            if perceptual_criterion is not None:
+            if perceptual_criterion is not None and percep_count > 0:
                 avg_px = pixel_loss_sum / loss_count
-                avg_pc = percep_loss_sum / loss_count
+                avg_pc = percep_loss_sum / percep_count
                 loss_detail = f"loss={avg_loss:.6f} (px={avg_px:.6f} perc={avg_pc:.4f})"
-            print(f"  iter {iteration + 1:6d}/{args.max_iters} | "
-                  f"{loss_detail} | lr={lr_now:.2e} | "
-                  f"{iters_per_sec:.1f} it/s | ETA: {eta / 60:.1f}min | "
-                  f"VRAM: {vram:.0f}MB")
+            profile_str = ""
+            if do_profile:
+                torch.cuda.synchronize()
+                t_fwd = ev_fwd_start.elapsed_time(ev_fwd_end)
+                t_vgg = ev_fwd_end.elapsed_time(ev_vgg_end)
+                t_bwd = ev_vgg_end.elapsed_time(ev_bwd_end)
+                t_opt = ev_bwd_end.elapsed_time(ev_opt_end)
+                t_total = t_fwd + t_vgg + t_bwd + t_opt
+                profile_str = (
+                    f"\n    fwd={t_fwd:.0f} vgg={t_vgg:.0f} "
+                    f"bwd={t_bwd:.0f} opt={t_opt:.0f} "
+                    f"total={t_total:.0f}ms")
+            print(
+                f"  {iteration + 1:5d}/{args.max_iters} | "
+                f"{loss_detail} | lr={lr_now:.2e} | "
+                f"{iters_per_sec:.1f}it/s "
+                f"ETA:{eta / 60:.0f}m | "
+                f"{vram:.1f}GB | data:{data_pct:.0f}%"
+                f"{profile_str}")
             loss_sum = 0.0
             pixel_loss_sum = 0.0
             percep_loss_sum = 0.0
             loss_count = 0
+            percep_count = 0
+            data_time_sum = 0.0
+            compute_time_sum = 0.0
 
         # ---- Validation ----
         if (iteration + 1) % args.val_freq == 0:
@@ -525,15 +723,8 @@ def train(args):
 
         # ---- Checkpoint ----
         if (iteration + 1) % args.save_freq == 0:
-            ckpt_data = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
-                "iteration": iteration + 1,
-                "best_psnr": best_psnr,
-                "args": vars(args),
-            }
+            ckpt_data = _save_checkpoint(model, optimizer, scheduler, scaler,
+                                         iteration + 1, best_psnr, args, ckpt_dir)
             ckpt_path = os.path.join(ckpt_dir, f"nafnet_iter{iteration + 1:06d}.pth")
             torch.save(ckpt_data, ckpt_path)
             print(f"  Saved checkpoint: {ckpt_path}")
@@ -571,6 +762,16 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=2,
                         help="DataLoader workers")
 
+    # Architecture
+    parser.add_argument("--width", type=int, default=64,
+                        help="NAFNet channel width (default: 64)")
+    parser.add_argument("--middle-blk-num", type=int, default=12,
+                        help="Number of middle blocks (default: 12)")
+    parser.add_argument("--enc-blk-nums", type=str, default="2,2,4,8",
+                        help="Encoder block counts, comma-separated (default: 2,2,4,8)")
+    parser.add_argument("--dec-blk-nums", type=str, default="2,2,2,2",
+                        help="Decoder block counts, comma-separated (default: 2,2,2,2)")
+
     # Model
     parser.add_argument("--pretrained", type=str,
                         default=os.environ.get("PRETRAINED_PATH",
@@ -603,6 +804,8 @@ def parse_args():
                         help="Disable AMP mixed precision")
     parser.add_argument("--perceptual-weight", type=float, default=0.0,
                         help="VGG perceptual loss weight (0 = disabled, try 0.05)")
+    parser.add_argument("--perceptual-freq", type=int, default=5,
+                        help="Compute perceptual loss every N iters (default: 5, saves ~60%% GPU time)")
 
     # Logging / checkpoints
     parser.add_argument("--checkpoint-dir", type=str,
@@ -624,4 +827,10 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    # Ensure enc/dec blk nums are strings (parse_args gives strings, but
+    # when constructed programmatically they might already be strings)
+    if not isinstance(args.enc_blk_nums, str):
+        args.enc_blk_nums = ",".join(str(x) for x in args.enc_blk_nums)
+    if not isinstance(args.dec_blk_nums, str):
+        args.dec_blk_nums = ",".join(str(x) for x in args.dec_blk_nums)
     train(args)

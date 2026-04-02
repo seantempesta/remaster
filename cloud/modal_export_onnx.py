@@ -9,8 +9,8 @@ VOL_MOUNT = "/mnt/data"
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
-        "torch==2.7.1", "torchvision==0.22.1",
-        extra_index_url="https://download.pytorch.org/whl/cu124",
+        "torch==2.11.0", "torchvision",
+        extra_index_url="https://download.pytorch.org/whl/cu126",
     )
     .pip_install("onnx", "numpy")
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
