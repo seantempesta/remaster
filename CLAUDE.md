@@ -25,7 +25,7 @@ An experimentation platform for improving video quality using ML models. The pri
 - `lib/` — shared importable code: paths, ffmpeg utils, metrics, NAFNet architecture
 - `pipelines/` — production streaming denoisers (SCUNet batch, NAFNet, episode)
 - `experiments/` — one-off experiments and older approaches
-- `training/` — NAFNet distillation training scripts
+- `training/` — NAFNet distillation training (train_nafnet.py, losses.py, dataset.py, viz.py)
 - `cloud/` — Modal remote GPU execution scripts
 - `bench/` — benchmarking and quality comparison
 - `tools/` — small utilities (clip extraction, probing, MP4 repair)
@@ -36,6 +36,8 @@ An experimentation platform for improving video quality using ML models. The pri
 - `pipelines/denoise_nafnet.py` — NAFNet pipeline (for distilled model)
 - `pipelines/denoise_episode.py` — original episode denoiser (simpler, single-frame)
 - `training/train_nafnet.py` — NAFNet distillation training loop
+- `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency
+- `training/viz.py` — Training visualization: sample images + loss curves
 - `bench/compare.py` — PSNR/SSIM metrics and side-by-side comparison
 - `bench/bench_nafnet.py` — NAFNet vs SCUNet benchmark
 
@@ -43,6 +45,7 @@ An experimentation platform for improving video quality using ML models. The pri
 - `SCUNet/` — Swin-Conv-UNet denoiser (current best approach, patched: thop try/except)
 - `RAFT/` — optical flow estimation
 - `NAFNet/` — NAFNet architecture reference (pretrained weights)
+- `DISTS/` — Deep Image Structure and Texture Similarity (perceptual loss, patched: modern torchvision API)
 - `Video-Depth-Anything/` — temporally consistent depth maps (patched: xformers→SDPA)
 - `FlashVSR/`, `FlashVSR-Pro/`, `BasicVSR_PlusPlus/` — video SR references
 - `KAIR/` — image restoration toolkit reference
@@ -52,19 +55,15 @@ An experimentation platform for improving video quality using ML models. The pri
 
 ## Current Status (2026-04-02)
 
-**Cloud inference:** NAFNet width64 at **27.9 fps on H100** via `cloud/modal_denoise.py`. ~$2.40/episode. Modal still on PyTorch 2.7.1+cu124 — needs upgrade to 2.11.0+cu126.
+**Cloud inference:** NAFNet width64 at **27.9 fps on H100** via `cloud/modal_denoise.py`. ~$2.40/episode. Modal on PyTorch 2.11.0+cu126.
 
 **Local inference:** **1.94 fps** with torch.compile on RTX 3060 (PyTorch 2.11.0+cu126 + triton-windows). TensorRT FP16 also works at 1.92 fps, 96MB VRAM. Full episode = 8.6 hours overnight, free.
 
-**Training:** Active run on Modal with GAN+detail targets (SCUNet GAN + α=0.15 high-pass detail transfer). VGG perceptual loss + Charbonnier. 25K checkpoint showed +2.39 dB over original on held-out val set.
+**Training:** Experiment C (width32, mid4) active on Modal H100 at 3.2 it/s. Loss: Charbonnier + DISTS perceptual (weight 0.1) + Focal Frequency Loss (weight 500). DISTS replaces VGG19 — better calibrated for compression artifacts, faster (VGG16 backbone + learned structure/texture weights). FFT loss targets high-frequency detail preservation. Training produces sample comparison images + loss curves at each validation step.
 
 **Quality:** GAN+detail targets produce sharper output than PSNR-only teacher. Detail transfer adds real texture from original frames (zero hallucination). Best alpha = 0.15.
 
-**Next:** Three parallel experiments to shrink the model for ~30 fps local:
-- A: width64, middle blocks 12→4 (~3-4 fps)
-- B: width32, full depth (~8 fps)
-- C: width32, middle blocks 12→4 (~15-25 fps, target 30 fps)
-See plan at `.claude/plans/groovy-hugging-rossum.md`.
+**Experiment C focus:** width32, middle blocks 12→4 (~15-25 fps target, 30 fps goal). Previous VGG run reached 49.50 dB PSNR at 11K iters. New DISTS+FFT run started from those weights at `checkpoints/nafnet_w32_mid4_dists/`.
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`.
 

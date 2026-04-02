@@ -496,7 +496,7 @@ def train(args):
             if percep_count > 0:
                 parts.append(f"perc={percep_loss_sum / percep_count:.4f}")
             if fft_count > 0:
-                parts.append(f"fft={fft_loss_sum / fft_count:.4f}")
+                parts.append(f"fft={fft_loss_sum / fft_count:.2e}")
             loss_detail = f"loss={avg_loss:.6f} ({' '.join(parts)})"
 
             # Log to training logger
@@ -580,7 +580,7 @@ def train(args):
             if "percep_loss" in val:
                 val_detail += f" perc={val['percep_loss']:.4f}"
             if "fft_loss" in val:
-                val_detail += f" fft={val['fft_loss']:.4f}"
+                val_detail += f" fft={val['fft_loss']:.2e}"
             if "combined_loss" in val:
                 val_detail += f" total={val['combined_loss']:.6f}"
             best_str = (f"best_loss={best_val_loss:.6f}"
