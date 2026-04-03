@@ -55,3 +55,6 @@
 [submodule "reference-code/XLSR"]
 	path = reference-code/XLSR
 	url = https://github.com/cxzhou95/XLSR.git
+[submodule "reference-code/Real-ESRGAN"]
+	path = reference-code/Real-ESRGAN
+	url = https://github.com/xinntao/Real-ESRGAN

@@ -72,11 +72,14 @@ def build_model(args):
         desc = (f"NAFNet w={args.width} mid={args.middle_blk_num} "
                 f"enc={enc_blk_nums} dec={dec_blk_nums}")
     elif model_type == 'plain':
+        full_res = getattr(args, 'full_res', True)
         model = PlainDenoise(
             in_nc=3, nc=getattr(args, 'nc', 64),
-            nb=getattr(args, 'nb', 15), use_bn=True, deploy=False,
+            nb=getattr(args, 'nb', 15), full_res=full_res,
+            use_bn=True, deploy=False,
         )
-        desc = f"PlainDenoise nc={args.nc} nb={args.nb}"
+        res_tag = "fullres" if full_res else "halfres"
+        desc = f"PlainDenoise nc={args.nc} nb={args.nb} ({res_tag})"
     elif model_type == 'unet':
         nb_enc = tuple(int(x) for x in getattr(args, 'nb_enc', '2,2').split(","))
         nb_dec = tuple(int(x) for x in getattr(args, 'nb_dec', '2,2').split(","))
@@ -893,6 +896,10 @@ def parse_args():
                         help="Decoder blocks per level (unet)")
     parser.add_argument("--nb-mid", type=int, default=2,
                         help="Middle blocks (unet)")
+    parser.add_argument("--full-res", action="store_true", default=True,
+                        help="Process at full resolution (default, better quality)")
+    parser.add_argument("--half-res", action="store_false", dest="full_res",
+                        help="Process at half resolution via PixelUnshuffle (faster)")
 
     # EMA
     parser.add_argument("--ema", action="store_true", default=False,

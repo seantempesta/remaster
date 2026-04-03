@@ -60,7 +60,7 @@ image = (
 app = modal.App("train-plainnet", image=image)
 
 @app.function(
-    gpu="H100",   # T4 for debug (~$0.20/hr), H100 for production (~$3.50/hr)
+    gpu="A10G",    # A10G (~$1.10/hr), H100 (~$3.50/hr), T4 for debug (~$0.20/hr)
     volumes={VOL_MOUNT: vol},
     timeout=28800,
     memory=65536,  # 64GB for RAM cache
@@ -152,8 +152,10 @@ def train_remote(
     args.perceptual_freq = perceptual_freq
     args.fft_weight = fft_weight
     args.fft_alpha = fft_alpha
-    args.cache_on_gpu = True   # Always use GPU cache on cloud (80GB VRAM)
-    args.cache_in_ram = False  # Not needed with GPU cache
+    # A10G has 24GB VRAM — not enough for GPU cache (dataset is ~16GB)
+    # Use RAM cache instead (64GB system RAM on Modal)
+    args.cache_on_gpu = False
+    args.cache_in_ram = True
     args.amp = True
     args.checkpoint_dir = checkpoint_dir
     args.print_freq = 10
@@ -168,6 +170,7 @@ def train_remote(
     args.nb_enc = nb_enc
     args.nb_dec = nb_dec
     args.nb_mid = nb_mid
+    args.full_res = True  # Full resolution processing (default)
     # NAFNet args (needed even if not used, build_model checks them)
     args.width = nc
     args.middle_blk_num = nb_mid

@@ -163,31 +163,42 @@ class RepConvBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# PlainDenoise: Sequential Conv+BN+ReLU at half resolution
+# PlainDenoise: Sequential Conv+BN+ReLU
 # ---------------------------------------------------------------------------
 class PlainDenoise(nn.Module):
-    """FFDNet-style half-res denoiser with plain Conv+BN+ReLU.
+    """Plain CNN denoiser with Conv+BN+ReLU. All INT8-friendly ops.
 
-    All INT8-friendly ops. Processes at 540p internally (4x fewer ops).
+    Supports full-res (default) or half-res processing:
+    - full_res=True:  3ch@1080p → nc → 3ch@1080p (DnCNN-style, better quality)
+    - full_res=False: PixelUnshuffle to 540p, process, PixelShuffle back (faster)
 
     Args:
         in_nc: input channels (3 for RGB)
         nc: internal channel count (32, 48, 64, 96)
         nb: number of conv layers (10, 12, 15, 20)
+        full_res: process at full resolution (True) or half-res via PixelUnshuffle (False)
         use_bn: use BatchNorm (fuses with Conv in TRT, helps INT8 calibration)
         deploy: if True, use fused single-conv blocks (for inference/export)
     """
 
-    def __init__(self, in_nc=3, nc=64, nb=15, use_bn=True, deploy=False):
+    def __init__(self, in_nc=3, nc=64, nb=15, full_res=True,
+                 use_bn=True, deploy=False):
         super().__init__()
         self.in_nc = in_nc
+        self.full_res = full_res
 
-        # PixelUnshuffle 2x: 3ch@1080p → 12ch@540p
-        self.unshuffle = nn.PixelUnshuffle(2)
+        if full_res:
+            head_in = in_nc
+            tail_out = in_nc
+        else:
+            self.unshuffle = nn.PixelUnshuffle(2)
+            self.shuffle = nn.PixelShuffle(2)
+            head_in = in_nc * 4   # 12 channels after unshuffle
+            tail_out = in_nc * 4  # 12 channels before shuffle
 
-        # Head: 12 → nc (plain conv, no reparam needed for channel change)
+        # Head: input → nc
         self.head = nn.Sequential(
-            nn.Conv2d(in_nc * 4, nc, 3, 1, 1, bias=not use_bn),
+            nn.Conv2d(head_in, nc, 3, 1, 1, bias=not use_bn),
             nn.BatchNorm2d(nc) if use_bn else nn.Identity(),
             nn.ReLU(inplace=True),
         )
@@ -198,30 +209,31 @@ class PlainDenoise(nn.Module):
             for _ in range(nb - 2)
         ])
 
-        # Tail: nc → 12 (no activation — residual output)
-        self.tail = nn.Conv2d(nc, in_nc * 4, 3, 1, 1, bias=True)
-
-        # PixelShuffle 2x: 12ch@540p → 3ch@1080p
-        self.shuffle = nn.PixelShuffle(2)
+        # Tail: nc → output (no activation — residual output)
+        self.tail = nn.Conv2d(nc, tail_out, 3, 1, 1, bias=True)
 
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # Pad to even dims (PixelUnshuffle requires even H, W)
-        pad_h = H % 2
-        pad_w = W % 2
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+        if self.full_res:
+            # Full-res: model learns noise residual, output = input + correction
+            feat = self.head(x)
+            feat = self.body(feat)
+            return x + self.tail(feat)
+        else:
+            # Half-res: PixelUnshuffle → process → PixelShuffle
+            pad_h = H % 2
+            pad_w = W % 2
+            if pad_h or pad_w:
+                x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
 
-        # Half-res processing with global residual
-        x_down = self.unshuffle(x)         # B, 12, H/2, W/2
-        feat = self.head(x_down)           # B, nc, H/2, W/2
-        feat = self.body(feat)             # B, nc, H/2, W/2
-        correction = self.tail(feat)       # B, 12, H/2, W/2
-        x_clean = x_down + correction      # Residual in unshuffled space
-        out = self.shuffle(x_clean)        # B, 3, H, W
-
-        return out[:, :, :H, :W]
+            x_down = self.unshuffle(x)
+            feat = self.head(x_down)
+            feat = self.body(feat)
+            correction = self.tail(feat)
+            x_clean = x_down + correction
+            out = self.shuffle(x_clean)
+            return out[:, :, :H, :W]
 
     def fuse_reparam(self):
         """Fuse all RepConvBlocks for inference. Call before export/benchmark."""
