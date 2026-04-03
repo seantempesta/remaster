@@ -47,7 +47,7 @@ image = (
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
     .add_local_file("lib/paths.py", remote_path="/root/project/lib/paths.py")
     .add_local_file("lib/__init__.py", remote_path="/root/project/lib/__init__.py")
-    .add_local_file("training/train_plainnet.py", remote_path="/root/project/training/train_plainnet.py")
+    .add_local_file("training/train.py", remote_path="/root/project/training/train.py")
     .add_local_file("training/losses.py", remote_path="/root/project/training/losses.py")
     .add_local_file("training/dataset.py", remote_path="/root/project/training/dataset.py")
     .add_local_file("training/viz.py", remote_path="/root/project/training/viz.py")
@@ -118,7 +118,7 @@ def train_remote(
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    from training.train_plainnet import train
+    from training.train import train
 
     class Args:
         pass
@@ -129,7 +129,18 @@ def train_remote(
     args.batch_size = batch_size
     args.num_workers = num_workers
     args.pretrained = pretrained_path if pretrained_path and os.path.exists(pretrained_path) else None
-    args.resume = os.path.join(checkpoint_dir, "plainnet_latest.pth") if resume else None
+    # Check both old (plainnet_latest.pth) and new (latest.pth) checkpoint names
+    if resume:
+        for name in ["latest.pth", "plainnet_latest.pth"]:
+            path = os.path.join(checkpoint_dir, name)
+            if os.path.exists(path):
+                args.resume = path
+                break
+        else:
+            args.resume = None
+            print("  No checkpoint found to resume from")
+    else:
+        args.resume = None
     args.max_iters = max_iters
     args.lr = lr
     args.eta_min = 1e-7
@@ -150,13 +161,18 @@ def train_remote(
     args.save_freq = save_freq
     args.device = "cuda"
 
-    # Architecture
-    args.arch = arch
+    # Architecture — train.py uses --model, not --arch
+    args.model = arch
     args.nc = nc
     args.nb = nb
     args.nb_enc = nb_enc
     args.nb_dec = nb_dec
     args.nb_mid = nb_mid
+    # NAFNet args (needed even if not used, build_model checks them)
+    args.width = nc
+    args.middle_blk_num = nb_mid
+    args.enc_blk_nums = nb_enc
+    args.dec_blk_nums = nb_dec
 
     # Enhancements
     args.ema = ema

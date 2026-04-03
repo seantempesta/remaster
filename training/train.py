@@ -136,6 +136,70 @@ def init_weights_small(model, scale=0.1):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 2:4 Structured Sparsity (APEX ASP)
+# From https://developer.nvidia.com/blog/sparsity-in-int8-training-workflow-and-best-practices-for-tensorrt-acceleration/
+# Pipeline: train dense → prune 2:4 + fine-tune → QAT → TRT --int8 --sparsity=enable
+# ──────────────────────────────────────────────────────────────────────────────
+
+def prepare_sparsity(model, optimizer):
+    """Initialize 2:4 structured sparsity via APEX ASP.
+
+    Prunes a pretrained dense model to 2:4 pattern (2 of every 4 weights zeroed).
+    Ampere tensor cores skip zero multiplications in hardware → ~1.3-1.4x speedup
+    on top of INT8.
+
+    Requires: apex with sparsity support (pip install apex or build from source).
+    Call AFTER loading pretrained weights, BEFORE fine-tuning.
+    """
+    from apex.contrib.sparsity import ASP
+    ASP.prune_trained_model(model, optimizer)
+    print("  2:4 structured sparsity applied via APEX ASP")
+    return model
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Quantization-Aware Training (QAT)
+# From XLSR QAT recipe: train dense → QAT fine-tune at lower LR → export with Q/DQ nodes
+# ──────────────────────────────────────────────────────────────────────────────
+
+def prepare_qat(model):
+    """Prepare model for Quantization-Aware Training.
+
+    Inserts FakeQuantize modules that simulate INT8 rounding during forward pass.
+    Uses symmetric per-channel quantization for weights, per-tensor for activations
+    — matches TensorRT's INT8 scheme.
+
+    QAT trains in FP32 (fake quant is a FP32 operation). Disable AMP when using QAT.
+    """
+    from torch.ao.quantization import (
+        QConfig, FakeQuantize,
+        MovingAverageMinMaxObserver,
+        MovingAveragePerChannelMinMaxObserver,
+    )
+
+    act_fq = FakeQuantize.with_args(
+        observer=MovingAverageMinMaxObserver,
+        quant_min=-128, quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_tensor_symmetric,
+        reduce_range=False,
+    )
+    weight_fq = FakeQuantize.with_args(
+        observer=MovingAveragePerChannelMinMaxObserver,
+        quant_min=-128, quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_channel_symmetric,
+        reduce_range=False,
+    )
+
+    model.qconfig = QConfig(activation=act_fq, weight=weight_fq)
+    model.train()
+    torch.ao.quantization.prepare_qat(model, inplace=True)
+    print("  QAT prepared: FakeQuantize nodes inserted")
+    return model
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Intensity scaling augmentation — from XLSR
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -364,6 +428,20 @@ def train(args):
         betas=(0.9, 0.9),  # NAFNet uses (0.9, 0.9)
         fused=device.type == "cuda",  # single fused kernel for optimizer step
     )
+
+    # ---- 2:4 Sparsity (after optimizer, before scheduler) ----
+    use_sparse = getattr(args, 'sparse', False)
+    if use_sparse:
+        print("Applying 2:4 structured sparsity (APEX ASP)...")
+        model = prepare_sparsity(model, optimizer)
+
+    # ---- QAT (after optimizer, before scheduler) ----
+    use_qat = getattr(args, 'qat', False)
+    if use_qat:
+        print("Preparing Quantization-Aware Training...")
+        model = prepare_qat(model)
+        use_amp = False  # AMP and QAT don't mix
+        print("  AMP disabled (incompatible with QAT)")
 
     # ---- LR Scheduler: cosine with linear warmup ----
     warmup_iters = args.warmup_iters
@@ -826,6 +904,12 @@ def parse_args():
                         help="Load entire dataset into GPU VRAM")
     parser.add_argument("--intensity-aug", action="store_true", default=False,
                         help="Intensity scaling augmentation (from XLSR)")
+
+    # Sparsity + QAT (advanced optimization stages)
+    parser.add_argument("--sparse", action="store_true", default=False,
+                        help="Apply 2:4 structured sparsity (requires APEX, pretrained checkpoint)")
+    parser.add_argument("--qat", action="store_true", default=False,
+                        help="Enable Quantization-Aware Training (INT8 fake quantize)")
 
     # Model
     parser.add_argument("--pretrained", type=str,
