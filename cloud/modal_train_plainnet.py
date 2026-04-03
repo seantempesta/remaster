@@ -42,6 +42,7 @@ image = (
         "numpy",
         "psutil",
         "matplotlib",
+        "prodigyopt",
     )
     .add_local_file("lib/plainnet_arch.py", remote_path="/root/project/lib/plainnet_arch.py")
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
@@ -55,6 +56,11 @@ image = (
     .add_local_file("reference-code/DISTS/DISTS_pytorch/DISTS_pt.py", remote_path="/root/project/reference-code/DISTS/DISTS_pytorch/DISTS_pt.py")
     .add_local_file("reference-code/DISTS/DISTS_pytorch/__init__.py", remote_path="/root/project/reference-code/DISTS/DISTS_pytorch/__init__.py")
     .add_local_file("reference-code/DISTS/DISTS_pytorch/weights.pt", remote_path="/root/project/reference-code/DISTS/DISTS_pytorch/weights.pt")
+    # KAIR DRUNet architecture + pretrained teacher weights
+    .add_local_file("reference-code/KAIR/models/network_unet.py", remote_path="/root/project/reference-code/KAIR/models/network_unet.py")
+    .add_local_file("reference-code/KAIR/models/basicblock.py", remote_path="/root/project/reference-code/KAIR/models/basicblock.py")
+    .add_local_file("reference-code/KAIR/models/__init__.py", remote_path="/root/project/reference-code/KAIR/models/__init__.py")
+    .add_local_file("reference-code/KAIR/model_zoo/drunet_deblocking_color.pth", remote_path="/root/project/reference-code/KAIR/model_zoo/drunet_deblocking_color.pth")
 )
 
 app = modal.App("train-plainnet", image=image)
@@ -96,6 +102,14 @@ def train_remote(
     sparse: bool = False,
     cache_in_ram: bool = True,
     num_workers: int = 16,
+    # Teacher distillation
+    teacher_path: str = "",
+    teacher_model: str = "drunet_full",
+    teacher_noise_level: int = 15,
+    # Optimizer
+    optimizer_type: str = "adamw",
+    # DRUNet
+    nc_list: str = "16,32,64,128",
 ):
     """Run training on a cloud GPU."""
     import sys
@@ -105,12 +119,17 @@ def train_remote(
 
     # Verify data
     input_dir = os.path.join(data_dir, "input")
-    target_dir = os.path.join(data_dir, "target")
     n_input = len(glob.glob(os.path.join(input_dir, "*.png")))
-    n_target = len(glob.glob(os.path.join(target_dir, "*.png")))
-    print(f"Training data: {n_input} inputs, {n_target} targets")
-    if n_input == 0 or n_target == 0:
-        raise FileNotFoundError(f"No training pairs in {data_dir}")
+    if teacher_path:
+        print(f"Training data: {n_input} inputs (teacher provides targets)")
+        if n_input == 0:
+            raise FileNotFoundError(f"No input images in {input_dir}")
+    else:
+        target_dir = os.path.join(data_dir, "target")
+        n_target = len(glob.glob(os.path.join(target_dir, "*.png")))
+        print(f"Training data: {n_input} inputs, {n_target} targets")
+        if n_input == 0 or n_target == 0:
+            raise FileNotFoundError(f"No training pairs in {data_dir}")
 
     if val_dir:
         n_val = len(glob.glob(os.path.join(val_dir, "input", "*.png")))
@@ -177,6 +196,26 @@ def train_remote(
     args.enc_blk_nums = nb_enc
     args.dec_blk_nums = nb_dec
 
+    # DRUNet nc-list
+    args.nc_list = nc_list
+
+    # Teacher (online distillation)
+    args.teacher = teacher_path if teacher_path else None
+    args.teacher_model = teacher_model
+    args.teacher_noise_level = teacher_noise_level
+    # Teacher architecture args (for building the teacher model)
+    args.teacher_width = 64
+    args.teacher_middle_blk_num = 12
+    args.teacher_enc_blk_nums = '2,2,4,8'
+    args.teacher_dec_blk_nums = '2,2,2,2'
+    args.teacher_nc_list = '64,128,256,512'
+    args.teacher_nb = 4
+    args.teacher_nc = 64
+    args.teacher_nb_mid = 4
+
+    # Optimizer
+    args.optimizer = optimizer_type
+
     # Enhancements
     args.ema = ema
     args.ema_decay = ema_decay
@@ -236,18 +275,28 @@ def main(
     qat: bool = False,
     sparse: bool = False,
     gpu: str = "T4",
+    # Teacher distillation
+    teacher: str = "",
+    teacher_model: str = "drunet_full",
+    teacher_noise_level: int = 15,
+    # Optimizer
+    optimizer: str = "adamw",
+    # DRUNet
+    nc_list: str = "16,32,64,128",
 ):
     """
-    Train PlainDenoise/UNetDenoise on Modal GPU.
+    Train denoising models on Modal GPU.
 
-    Default config: UNet nc=64 mid=2 (2.5M params, 32 fps FP16, ~64 fps INT8)
+    Supports: NAFNet, PlainDenoise, UNetDenoise, DRUNet (via --arch flag).
 
     Examples:
-        # Debug run on cheap T4 (~$0.20/hr)
-        modal run cloud/modal_train_plainnet.py --gpu T4 --max-iters 200 --val-freq 100
+        # DRUNet student with DRUNet teacher (online distillation, Prodigy LR)
+        modal run cloud/modal_train_plainnet.py --arch drunet --nc-list 16,32,64,128 \\
+            --teacher reference-code/KAIR/model_zoo/drunet_deblocking_color.pth \\
+            --optimizer prodigy --batch-size 32
 
-        # Full training on H100 (~$3.50/hr, ~$13 for 25K iters)
-        modal run cloud/modal_train_plainnet.py --gpu H100 --batch-size 32
+        # Debug run on cheap T4
+        modal run cloud/modal_train_plainnet.py --gpu T4 --max-iters 200
 
         # With DISTS perceptual loss
         modal run cloud/modal_train_plainnet.py --gpu H100 --perceptual-weight 0.05
@@ -258,12 +307,17 @@ def main(
     input_dir = os.path.join(data_dir, "input")
     target_dir = os.path.join(data_dir, "target")
 
-    if not os.path.isdir(input_dir) or not os.path.isdir(target_dir):
-        raise FileNotFoundError(f"Training pairs not found in {data_dir}")
-
     input_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))
-    target_files = sorted(glob.glob(os.path.join(target_dir, "*.png")))
-    print(f"Training data: {len(input_files)} inputs, {len(target_files)} targets")
+    target_files = sorted(glob.glob(os.path.join(target_dir, "*.png"))) if os.path.isdir(target_dir) else []
+
+    if teacher:
+        if not input_files:
+            raise FileNotFoundError(f"No input images in {input_dir}")
+        print(f"Training data: {len(input_files)} inputs (teacher provides targets)")
+    else:
+        if not input_files or not target_files:
+            raise FileNotFoundError(f"Training pairs not found in {data_dir}")
+        print(f"Training data: {len(input_files)} inputs, {len(target_files)} targets")
 
     # Validation data
     val_dir = os.path.abspath(val_dir)
@@ -297,6 +351,12 @@ def main(
         pretrained_local = os.path.abspath(pretrained)
         vol_pretrained = f"{VOL_MOUNT}/pretrained/{os.path.basename(pretrained_local)}"
 
+    # Teacher weights (for online distillation)
+    vol_teacher = ""
+    if teacher and os.path.exists(teacher):
+        teacher_local = os.path.abspath(teacher)
+        vol_teacher = f"{VOL_MOUNT}/pretrained/{os.path.basename(teacher_local)}"
+
     # Upload data
     print(f"\nUploading data to Modal volume...")
     t0 = time.time()
@@ -305,6 +365,10 @@ def main(
         if pretrained and os.path.exists(pretrained):
             batch.put_file(os.path.abspath(pretrained),
                           vol_pretrained.replace(VOL_MOUNT, ""))
+        if teacher and os.path.exists(teacher):
+            batch.put_file(os.path.abspath(teacher),
+                          vol_teacher.replace(VOL_MOUNT, ""))
+            print(f"  Uploading teacher weights ({os.path.basename(teacher)})...")
 
         for f in input_files:
             batch.put_file(f, f"/{data_name}/input/{os.path.basename(f)}")
@@ -359,7 +423,12 @@ def main(
         intensity_aug=intensity_aug,
         qat=qat,
         sparse=sparse,
-        cache_in_ram=True,  # Always cache — eliminates data loading bottleneck
+        cache_in_ram=True,
+        teacher_path=vol_teacher if teacher else "",
+        teacher_model=teacher_model,
+        teacher_noise_level=teacher_noise_level,
+        optimizer_type=optimizer,
+        nc_list=nc_list,
     )
     print(f"\nTraining complete. Best model at: {result_path}")
 
