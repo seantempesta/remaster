@@ -148,12 +148,13 @@ def build_teacher(args):
         )
         needs_noise_map = False
     elif teacher_type == 'drunet_full':
-        # Full DRUNet with noise level map (in_nc=4)
+        # Full DRUNet with noise level map (in_nc=4), pretrained uses bias=False
         add_kair_to_path()
         from models.network_unet import UNetRes
         nc_list = [int(x) for x in getattr(args, 'teacher_nc_list', '64,128,256,512').split(",")]
         nb = getattr(args, 'teacher_nb', 4)
-        teacher = UNetRes(in_nc=4, out_nc=3, nc=nc_list, nb=nb)
+        teacher = UNetRes(in_nc=4, out_nc=3, nc=nc_list, nb=nb,
+                         act_mode='R', bias=False)
         needs_noise_map = True
     elif teacher_type == 'drunet':
         # DRUNet without noise level map (in_nc=3)
@@ -161,7 +162,8 @@ def build_teacher(args):
         from models.network_unet import UNetRes
         nc_list = [int(x) for x in getattr(args, 'teacher_nc_list', '64,128,256,512').split(",")]
         nb = getattr(args, 'teacher_nb', 4)
-        teacher = UNetRes(in_nc=3, out_nc=3, nc=nc_list, nb=nb)
+        teacher = UNetRes(in_nc=3, out_nc=3, nc=nc_list, nb=nb,
+                         act_mode='R', bias=False)
         needs_noise_map = False
     elif teacher_type == 'plain':
         teacher = PlainDenoise(
@@ -515,6 +517,15 @@ def train(args):
             crop_size=args.crop_size,
             augment=True,
             cache_in_ram=cache_in_ram,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=args.num_workers > 0,
         )
         print(f"Data pipeline: input-only (teacher generates targets online)")
     else:

@@ -238,10 +238,10 @@ def train_remote(
     vol.commit()
     print("Training complete, volume committed.")
 
-    best_path = os.path.join(checkpoint_dir, "plainnet_best.pth")
+    best_path = os.path.join(checkpoint_dir, "best.pth")
     if os.path.exists(best_path):
         return best_path
-    return os.path.join(checkpoint_dir, "plainnet_final.pth")
+    return os.path.join(checkpoint_dir, "final.pth")
 
 
 @app.local_entrypoint()
@@ -437,7 +437,7 @@ def main(
     local_ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ckpt_rel)
     os.makedirs(local_ckpt_dir, exist_ok=True)
 
-    for name in ["plainnet_best.pth", "plainnet_final.pth", "training_curves.png",
+    for name in ["best.pth", "final.pth", "training_curves.png",
                   "training_log.json"]:
         vol_path = f"/{ckpt_rel}/{name}"
         local_path = os.path.join(local_ckpt_dir, name)
