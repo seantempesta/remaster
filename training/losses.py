@@ -101,6 +101,9 @@ class DISTSPerceptualLoss(nn.Module):
         weights = torch.load(weights_path, weights_only=True)
         self._net.alpha.data = weights['alpha']
         self._net.beta.data = weights['beta']
+        # VGG weights need requires_grad=True so gradients flow through
+        # to our denoiser. They're NOT added to the optimizer so they
+        # won't be updated — just used as a differentiable feature extractor.
         self.eval()
 
     def forward(self, pred, target):

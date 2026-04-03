@@ -28,3 +28,30 @@
 [submodule "reference-code/DISTS"]
 	path = reference-code/DISTS
 	url = https://github.com/dingkeyan93/DISTS.git
+[submodule "reference-code/vapoursynth"]
+	path = reference-code/vapoursynth
+	url = https://github.com/vapoursynth/vapoursynth.git
+[submodule "reference-code/vs-mlrt"]
+	path = reference-code/vs-mlrt
+	url = https://github.com/AmusementClub/vs-mlrt.git
+[submodule "reference-code/bestsource"]
+	path = reference-code/bestsource
+	url = https://github.com/vapoursynth/bestsource.git
+[submodule "reference-code/torch-tensorrt"]
+	path = reference-code/torch-tensorrt
+	url = https://github.com/pytorch/TensorRT.git
+[submodule "reference-code/TensorRT"]
+	path = reference-code/TensorRT
+	url = https://github.com/NVIDIA/TensorRT.git
+[submodule "reference-code/TensorRT-Model-Optimizer"]
+	path = reference-code/TensorRT-Model-Optimizer
+	url = https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
+[submodule "reference-code/ECBSR"]
+	path = reference-code/ECBSR
+	url = https://github.com/xindongzhang/ECBSR.git
+[submodule "reference-code/SPAN"]
+	path = reference-code/SPAN
+	url = https://github.com/hongyuanyu/SPAN.git
+[submodule "reference-code/XLSR"]
+	path = reference-code/XLSR
+	url = https://github.com/cxzhou95/XLSR.git

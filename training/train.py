@@ -119,6 +119,36 @@ class ModelEMA:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Small weight init — from XLSR (helps tiny models avoid early instability)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def init_weights_small(model, scale=0.1):
+    """Initialize conv weights with scaled Kaiming normal."""
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            m.weight.data.mul_(scale)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Intensity scaling augmentation — from XLSR
+# ──────────────────────────────────────────────────────────────────────────────
+
+def apply_intensity_aug(inp, tgt, scales=(0.5, 0.7, 1.0)):
+    """Randomly scale intensity of input+target pair (same scale for both)."""
+    idx = torch.randint(len(scales), (1,)).item()
+    scale = scales[idx]
+    if scale != 1.0:
+        return inp * scale, tgt * scale
+    return inp, tgt
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Validation
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -263,6 +293,10 @@ def train(args):
             print("  Loaded pretrained weights (exact match)")
     else:
         print("WARNING: Training from scratch (no pretrained weights)")
+        # Small init helps tiny models (PlainDenoise/UNetDenoise) avoid instability
+        if getattr(args, 'model', 'nafnet') != 'nafnet':
+            init_weights_small(model, scale=0.1)
+            print("  Applied small initialization (0.1x Kaiming)")
 
     model = model.to(device)
     model.train()
@@ -457,10 +491,10 @@ def train(args):
         """Save checkpoint on interrupt/signal."""
         ckpt_data = _save_checkpoint(model, optimizer, scheduler, scaler,
                                      it, best_psnr, args, ckpt_dir, ema=ema)
-        path = os.path.join(ckpt_dir, "nafnet_latest.pth")
+        path = os.path.join(ckpt_dir, "latest.pth")
         torch.save(ckpt_data, path)
         torch.save({"params": model.state_dict()},
-                    os.path.join(ckpt_dir, "nafnet_final.pth"))
+                    os.path.join(ckpt_dir, "final.pth"))
         logger.flush()
         print(f"  Saved checkpoint at iter {it}: {path}")
 
@@ -498,6 +532,11 @@ def train(args):
                 inp_batch, tgt_batch = next(data_iter)
             inp_batch = inp_batch.to(device, non_blocking=True)
             tgt_batch = tgt_batch.to(device, non_blocking=True)
+
+        # Intensity scaling augmentation (from XLSR)
+        if getattr(args, 'intensity_aug', False):
+            inp_batch, tgt_batch = apply_intensity_aug(inp_batch, tgt_batch)
+
         t_compute_start = time.time()
         data_time_sum += t_compute_start - t_data_start
 
@@ -611,10 +650,11 @@ def train(args):
                     f"\n    fwd={t_fwd:.0f} aux={t_aux:.0f} "
                     f"bwd={t_bwd:.0f} opt={t_opt:.0f} "
                     f"total={t_total:.0f}ms")
+            samples_per_sec = iters_per_sec * args.batch_size
             print(
                 f"  {iteration + 1:5d}/{args.max_iters} | "
                 f"{loss_detail} | lr={lr_now:.2e} | "
-                f"{iters_per_sec:.1f}it/s "
+                f"{iters_per_sec:.1f}it/s ({samples_per_sec:.0f}samp/s) "
                 f"ETA:{eta / 60:.0f}m | "
                 f"{vram:.1f}GB | data:{data_pct:.0f}%"
                 f"{profile_str}")
@@ -704,17 +744,17 @@ def train(args):
         if (iteration + 1) % args.save_freq == 0:
             ckpt_data = _save_checkpoint(model, optimizer, scheduler, scaler,
                                          iteration + 1, best_psnr, args, ckpt_dir, ema=ema)
-            ckpt_path = os.path.join(ckpt_dir, f"nafnet_iter{iteration + 1:06d}.pth")
+            ckpt_path = os.path.join(ckpt_dir, f"iter{iteration + 1:06d}.pth")
             torch.save(ckpt_data, ckpt_path)
             print(f"  Saved checkpoint: {ckpt_path}")
 
             # Also save latest (for easy resume)
-            latest_path = os.path.join(ckpt_dir, "nafnet_latest.pth")
+            latest_path = os.path.join(ckpt_dir, "latest.pth")
             torch.save(ckpt_data, latest_path)
             logger.flush()
 
     # ---- Final save ----
-    final_path = os.path.join(ckpt_dir, "nafnet_final.pth")
+    final_path = os.path.join(ckpt_dir, "final.pth")
     torch.save({"params": model.state_dict()}, final_path)
     logger.flush()
 
@@ -727,7 +767,7 @@ def train(args):
     print(f"\nTraining complete. Final model: {final_path}")
     print(f"Best PSNR: {best_psnr:.2f} dB")
 
-    best_ckpt = os.path.join(ckpt_dir, "nafnet_best.pth")
+    best_ckpt = os.path.join(ckpt_dir, "best.pth")
     if os.path.exists(best_ckpt):
         print(f"Best model: {best_ckpt}")
 
@@ -784,12 +824,13 @@ def parse_args():
     # GPU dataset caching
     parser.add_argument("--cache-on-gpu", action="store_true", default=False,
                         help="Load entire dataset into GPU VRAM")
+    parser.add_argument("--intensity-aug", action="store_true", default=False,
+                        help="Intensity scaling augmentation (from XLSR)")
 
     # Model
     parser.add_argument("--pretrained", type=str,
-                        default=os.environ.get("PRETRAINED_PATH",
-                            str(REFERENCE_CODE / "NAFNet" / "experiments" / "pretrained_models" / "NAFNet-SIDD-width64.pth")),
-                        help="Pretrained checkpoint path")
+                        default=os.environ.get("PRETRAINED_PATH", ""),
+                        help="Pretrained checkpoint path (empty = train from scratch)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume training from checkpoint")
 
