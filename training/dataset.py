@@ -147,6 +147,96 @@ class PairedFrameDataset(Dataset):
         return inp, tgt
 
 
+class InputOnlyDataset(Dataset):
+    """
+    Loads only input frames (no targets needed) for online teacher distillation.
+
+    Directory structure:
+        data_dir/input/frame_XXXXX.png   (compressed input)
+
+    Returns (input_crop, input_crop) — target slot is a dummy copy of input.
+    The caller is expected to override the target with teacher output.
+    """
+    def __init__(self, data_dir, crop_size=256, augment=True,
+                 max_frames=-1, cache_in_ram=False):
+        self.crop_size = crop_size
+        self.augment = augment
+        self.cache_in_ram = cache_in_ram
+        self.cached_images = None
+
+        input_dir = os.path.join(data_dir, "input")
+        input_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))
+        if not input_files:
+            raise FileNotFoundError(f"No PNG files in {input_dir}")
+
+        self.files = input_files
+        if max_frames > 0:
+            self.files = self.files[:max_frames]
+
+        if cache_in_ram:
+            self._load_all_into_ram()
+
+        print(f"InputOnlyDataset: {len(self.files)} frames, crop={crop_size}, "
+              f"augment={augment}, cached={cache_in_ram}")
+
+    def _load_all_into_ram(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import psutil
+
+        n = len(self.files)
+        print(f"  Caching {n} input frames into RAM...")
+        t0 = time.time()
+
+        def _load(idx):
+            img = cv2.imread(self.files[idx], cv2.IMREAD_COLOR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return idx, img
+
+        self.cached_images = [None] * n
+        n_workers = min(16, os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_load, i): i for i in range(n)}
+            for fut in as_completed(futures):
+                idx, img = fut.result()
+                self.cached_images[idx] = img
+
+        elapsed = time.time() - t0
+        mb = psutil.Process().memory_info().rss / 1024**2
+        print(f"  Cached {n} frames in {elapsed:.1f}s, RAM: {mb:.0f}MB")
+
+    def __len__(self):
+        return len(self.files) * 100
+
+    def __getitem__(self, idx):
+        file_idx = idx % len(self.files)
+
+        if self.cached_images is not None:
+            inp = self.cached_images[file_idx].astype(np.float32) / 255.0
+        else:
+            inp = cv2.imread(self.files[file_idx], cv2.IMREAD_COLOR)
+            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+        h, w, _ = inp.shape
+        cs = self.crop_size
+
+        top = random.randint(0, h - cs)
+        left = random.randint(0, w - cs)
+        inp = inp[top:top + cs, left:left + cs]
+
+        if self.augment:
+            if random.random() < 0.5:
+                inp = inp[:, ::-1, :].copy()
+            if random.random() < 0.5:
+                inp = inp[::-1, :, :].copy()
+            k = random.randint(0, 3)
+            if k > 0:
+                inp = np.rot90(inp, k).copy()
+
+        inp = torch.from_numpy(inp.transpose(2, 0, 1))
+        # Return inp twice — caller overrides second with teacher output
+        return inp, inp.clone()
+
+
 class GPUCachedDataset:
     """Entire dataset resident on GPU as uint8 tensors.
 

@@ -1,7 +1,7 @@
 """
 Unified training script for all denoising model architectures.
 
-Supports: NAFNet, PlainDenoise, UNetDenoise (via --model flag).
+Supports: NAFNet, PlainDenoise, UNetDenoise, DRUNet (via --model flag).
 
 Features:
     - Charbonnier / PSNRLoss / L1 pixel loss + DISTS perceptual + Focal Frequency
@@ -10,6 +10,8 @@ Features:
     - CUDA event profiling, graceful stop (SIGINT + Modal Dict)
     - Validation with PSNR + all losses + sample comparison images + loss curves
     - Checkpoint save/resume with full optimizer + scheduler + EMA state
+    - Online teacher distillation (--teacher): compute targets live from a frozen
+      teacher model instead of loading pre-computed target/ PNGs from disk
 
 Usage:
     # NAFNet (original)
@@ -20,6 +22,18 @@ Usage:
 
     # PlainDenoise (sequential CNN)
     python training/train_nafnet.py --model plain --nc 64 --nb 15
+
+    # DRUNet student (fast, 1.06M params)
+    python training/train_nafnet.py --model drunet --nc-list 16,32,64,128 --nb 2
+
+    # Online teacher distillation (DRUNet student from NAFNet teacher)
+    python training/train_nafnet.py --model drunet --nc-list 16,32,64,128 --nb 2 \\
+        --teacher checkpoints/nafnet_distill/best.pth --teacher-model nafnet
+
+    # Online distillation from pretrained DRUNet teacher (with noise map)
+    python training/train_nafnet.py --model drunet --nc-list 16,32,64,128 --nb 2 \\
+        --teacher checkpoints/drunet_full/drunet_color.pth --teacher-model drunet_full \\
+        --teacher-noise-level 15
 
     # Environment variables for Modal: DATA_DIR, CHECKPOINT_DIR, MAX_ITERS, etc.
 """
@@ -43,12 +57,12 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.nafnet_arch import NAFNet
 from lib.plainnet_arch import PlainDenoise, UNetDenoise, count_params as _count_params
-from lib.paths import PROJECT_ROOT, REFERENCE_CODE, CHECKPOINTS_DIR
+from lib.paths import PROJECT_ROOT, REFERENCE_CODE, CHECKPOINTS_DIR, add_kair_to_path
 from training.losses import (
     CharbonnierLoss, PSNRLoss, FocalFrequencyLoss, DISTSPerceptualLoss,
     build_pixel_criterion,
 )
-from training.dataset import PairedFrameDataset, GPUCachedDataset
+from training.dataset import PairedFrameDataset, InputOnlyDataset, GPUCachedDataset
 from training.viz import TrainingLogger, save_val_samples
 
 
@@ -90,12 +104,105 @@ def build_model(args):
             use_bn=True, deploy=False,
         )
         desc = f"UNetDenoise nc={args.nc} mid={args.nb_mid}"
+    elif model_type == 'drunet':
+        # DRUNet (UNetRes from KAIR) — residual U-Net denoiser
+        # Student variant: in_nc=3 (RGB only, no noise map), out_nc=3
+        add_kair_to_path()
+        from models.network_unet import UNetRes
+        nc_list = [int(x) for x in getattr(args, 'nc_list', '16,32,64,128').split(",")]
+        nb = getattr(args, 'nb', 2)
+        model = UNetRes(in_nc=3, out_nc=3, nc=nc_list, nb=nb)
+        desc = f"DRUNet nc={nc_list} nb={nb}"
     else:
         raise ValueError(f"Unknown model: {model_type}")
 
     params = sum(p.numel() for p in model.parameters())
     print(f"{desc}: {params/1e6:.2f}M parameters")
     return model, desc
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Teacher model builder — for online distillation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_teacher(args):
+    """Build and load a frozen teacher model for online distillation.
+
+    Supports all model types. For DRUNet teacher ('drunet_full'), the pretrained
+    model expects in_nc=4 (3 RGB + 1 noise level map). The noise level map is
+    concatenated at inference time.
+
+    Returns (teacher_model, needs_noise_map: bool).
+    """
+    teacher_type = args.teacher_model
+
+    if teacher_type == 'nafnet':
+        enc_blk_nums = [int(x) for x in getattr(args, 'teacher_enc_blk_nums', '2,2,4,8').split(",")]
+        dec_blk_nums = [int(x) for x in getattr(args, 'teacher_dec_blk_nums', '2,2,2,2').split(",")]
+        teacher = NAFNet(
+            img_channel=3,
+            width=getattr(args, 'teacher_width', 64),
+            middle_blk_num=getattr(args, 'teacher_middle_blk_num', 12),
+            enc_blk_nums=enc_blk_nums,
+            dec_blk_nums=dec_blk_nums,
+        )
+        needs_noise_map = False
+    elif teacher_type == 'drunet_full':
+        # Full DRUNet with noise level map (in_nc=4)
+        add_kair_to_path()
+        from models.network_unet import UNetRes
+        nc_list = [int(x) for x in getattr(args, 'teacher_nc_list', '64,128,256,512').split(",")]
+        nb = getattr(args, 'teacher_nb', 4)
+        teacher = UNetRes(in_nc=4, out_nc=3, nc=nc_list, nb=nb)
+        needs_noise_map = True
+    elif teacher_type == 'drunet':
+        # DRUNet without noise level map (in_nc=3)
+        add_kair_to_path()
+        from models.network_unet import UNetRes
+        nc_list = [int(x) for x in getattr(args, 'teacher_nc_list', '64,128,256,512').split(",")]
+        nb = getattr(args, 'teacher_nb', 4)
+        teacher = UNetRes(in_nc=3, out_nc=3, nc=nc_list, nb=nb)
+        needs_noise_map = False
+    elif teacher_type == 'plain':
+        teacher = PlainDenoise(
+            in_nc=3, nc=getattr(args, 'teacher_nc', 64),
+            nb=getattr(args, 'teacher_nb', 15), full_res=True,
+            use_bn=True, deploy=False,
+        )
+        needs_noise_map = False
+    elif teacher_type == 'unet':
+        teacher = UNetDenoise(
+            in_nc=3, nc=getattr(args, 'teacher_nc', 64),
+            nb_enc=(2, 2), nb_dec=(2, 2),
+            nb_mid=getattr(args, 'teacher_nb_mid', 2),
+            use_bn=True, deploy=False,
+        )
+        needs_noise_map = False
+    else:
+        raise ValueError(f"Unknown teacher model: {teacher_type}")
+
+    # Load teacher weights
+    teacher_path = args.teacher
+    print(f"Loading teacher: {teacher_path} (type={teacher_type})")
+    ckpt = torch.load(teacher_path, map_location="cpu", weights_only=True)
+    state_dict = ckpt.get("params", ckpt.get("params_ema", ckpt.get("state_dict", ckpt)))
+    missing, unexpected = teacher.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        print(f"  Teacher: skipped {len(unexpected)} unexpected keys")
+    if missing:
+        print(f"  Teacher: {len(missing)} missing keys")
+    if not missing and not unexpected:
+        print(f"  Teacher: loaded weights (exact match)")
+
+    params = sum(p.numel() for p in teacher.parameters())
+    print(f"  Teacher: {params/1e6:.2f}M parameters, frozen")
+
+    # Freeze teacher
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    return teacher, needs_noise_map
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,6 +478,17 @@ def train(args):
     if device.type == "cuda":
         print(f"  Model VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
 
+    # ---- Online Teacher (for distillation without pre-computed targets) ----
+    teacher_model = None
+    teacher_needs_noise_map = False
+    teacher_noise_level = getattr(args, 'teacher_noise_level', 15) / 255.0
+    use_teacher = getattr(args, 'teacher', None) and os.path.exists(args.teacher)
+    if use_teacher:
+        teacher_model, teacher_needs_noise_map = build_teacher(args)
+        teacher_model = teacher_model.to(device)
+        if device.type == "cuda":
+            print(f"  Teacher VRAM: {torch.cuda.memory_allocated() / 1024**2:.0f}MB")
+
     # ---- EMA ----
     use_ema = getattr(args, 'ema', False)
     ema = None
@@ -385,11 +503,20 @@ def train(args):
     gpu_dataset = None
     dataloader = None
 
-    if cache_on_gpu and device.type == "cuda":
+    if cache_on_gpu and device.type == "cuda" and not use_teacher:
         gpu_dataset = GPUCachedDataset(
             args.data_dir, crop_size=args.crop_size, device=device,
         )
         print(f"Data pipeline: GPU-cached ({gpu_dataset.n} pairs in VRAM)")
+    elif use_teacher:
+        # Online teacher distillation: only need input frames
+        dataset = InputOnlyDataset(
+            args.data_dir,
+            crop_size=args.crop_size,
+            augment=True,
+            cache_in_ram=cache_in_ram,
+        )
+        print(f"Data pipeline: input-only (teacher generates targets online)")
     else:
         dataset = PairedFrameDataset(
             args.data_dir,
@@ -424,13 +551,25 @@ def train(args):
         print(f"FFT loss: Focal Frequency (alpha={args.fft_alpha}), weight={args.fft_weight}")
 
     # ---- Optimizer ----
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.9),  # NAFNet uses (0.9, 0.9)
-        fused=device.type == "cuda",  # single fused kernel for optimizer step
-    )
+    opt_type = getattr(args, 'optimizer', 'adamw')
+    if opt_type == 'prodigy':
+        from prodigyopt import Prodigy
+        optimizer = Prodigy(
+            model.parameters(),
+            lr=1.0,  # Prodigy auto-tunes — this is just a multiplier
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.999),  # Prodigy's recommended defaults
+        )
+        print(f"Optimizer: Prodigy (parameter-free LR, auto-tuning)")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.9),
+            fused=device.type == "cuda",
+        )
+        print(f"Optimizer: AdamW (lr={args.lr}, betas=(0.9, 0.9))")
 
     # ---- 2:4 Sparsity (after optimizer, before scheduler) ----
     use_sparse = getattr(args, 'sparse', False)
@@ -503,6 +642,10 @@ def train(args):
     print(f"  grad_clip:   {args.grad_clip}")
     print(f"  amp:         {use_amp}")
     print(f"  checkpoints: {ckpt_dir}")
+    if use_teacher:
+        print(f"  teacher:     {args.teacher} ({args.teacher_model})")
+        if teacher_needs_noise_map:
+            print(f"  teacher noise level: {teacher_noise_level * 255:.0f}/255")
     print()
 
     # ---- cuDNN benchmark warmup ----
@@ -516,6 +659,16 @@ def train(args):
     else:
         _wb = next(iter(dataloader))
         _wi, _wt = _wb[0].to(device, non_blocking=True), _wb[1].to(device, non_blocking=True)
+    # Generate teacher targets for warmup if using online distillation
+    if teacher_model is not None:
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+            if teacher_needs_noise_map:
+                _nm = torch.full((_wi.shape[0], 1, _wi.shape[2], _wi.shape[3]),
+                                 teacher_noise_level, device=device, dtype=_wi.dtype)
+                _wt = teacher_model(torch.cat([_wi, _nm], dim=1)).clamp(0, 1)
+                del _nm
+            else:
+                _wt = teacher_model(_wi).clamp(0, 1)
     with torch.amp.autocast("cuda", enabled=use_amp):
         _wo = model(_wi)
         _wl = criterion(_wo, _wt)
@@ -617,6 +770,21 @@ def train(args):
         # Intensity scaling augmentation (from XLSR)
         if getattr(args, 'intensity_aug', False):
             inp_batch, tgt_batch = apply_intensity_aug(inp_batch, tgt_batch)
+
+        # Online teacher: compute targets from teacher model
+        if teacher_model is not None:
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+                if teacher_needs_noise_map:
+                    # DRUNet full: concatenate noise level map as 4th channel
+                    noise_map = torch.full(
+                        (inp_batch.shape[0], 1, inp_batch.shape[2], inp_batch.shape[3]),
+                        teacher_noise_level,
+                        device=device, dtype=inp_batch.dtype,
+                    )
+                    teacher_input = torch.cat([inp_batch, noise_map], dim=1)
+                else:
+                    teacher_input = inp_batch
+                tgt_batch = teacher_model(teacher_input).clamp(0, 1)
 
         t_compute_start = time.time()
         data_time_sum += t_compute_start - t_data_start
@@ -872,8 +1040,8 @@ def parse_args():
 
     # Model type
     parser.add_argument("--model", type=str, default="nafnet",
-                        choices=["nafnet", "plain", "unet"],
-                        help="Model architecture (nafnet, plain, unet)")
+                        choices=["nafnet", "plain", "unet", "drunet"],
+                        help="Model architecture (nafnet, plain, unet, drunet)")
 
     # NAFNet architecture
     parser.add_argument("--width", type=int, default=64,
@@ -885,11 +1053,14 @@ def parse_args():
     parser.add_argument("--dec-blk-nums", type=str, default="2,2,2,2",
                         help="Decoder block counts, comma-separated (default: 2,2,2,2)")
 
-    # PlainDenoise / UNetDenoise architecture
+    # PlainDenoise / UNetDenoise / DRUNet architecture
     parser.add_argument("--nc", type=int, default=64,
                         help="Base channel count (plain/unet)")
     parser.add_argument("--nb", type=int, default=15,
-                        help="Number of conv layers (plain)")
+                        help="Number of conv layers (plain) or res blocks per level (drunet)")
+    parser.add_argument("--nc-list", type=str, default="16,32,64,128",
+                        dest="nc_list",
+                        help="Channel widths per level for DRUNet, comma-separated (default: 16,32,64,128)")
     parser.add_argument("--nb-enc", type=str, default="2,2",
                         help="Encoder blocks per level (unet)")
     parser.add_argument("--nb-dec", type=str, default="2,2",
@@ -918,6 +1089,31 @@ def parse_args():
     parser.add_argument("--qat", action="store_true", default=False,
                         help="Enable Quantization-Aware Training (INT8 fake quantize)")
 
+    # Online teacher distillation
+    parser.add_argument("--teacher", type=str, default=None,
+                        help="Teacher checkpoint path for online distillation (replaces target/ images)")
+    parser.add_argument("--teacher-model", type=str, default="nafnet",
+                        choices=["nafnet", "drunet", "drunet_full", "plain", "unet"],
+                        help="Teacher model architecture")
+    parser.add_argument("--teacher-noise-level", type=float, default=15,
+                        help="Noise level for DRUNet teacher noise map (0-255, default: 15)")
+    parser.add_argument("--teacher-width", type=int, default=64,
+                        help="Teacher NAFNet width (default: 64)")
+    parser.add_argument("--teacher-middle-blk-num", type=int, default=12,
+                        help="Teacher NAFNet middle blocks (default: 12)")
+    parser.add_argument("--teacher-enc-blk-nums", type=str, default="2,2,4,8",
+                        help="Teacher NAFNet encoder blocks (default: 2,2,4,8)")
+    parser.add_argument("--teacher-dec-blk-nums", type=str, default="2,2,2,2",
+                        help="Teacher NAFNet decoder blocks (default: 2,2,2,2)")
+    parser.add_argument("--teacher-nc-list", type=str, default="64,128,256,512",
+                        help="Teacher DRUNet channel widths (default: 64,128,256,512)")
+    parser.add_argument("--teacher-nb", type=int, default=4,
+                        help="Teacher DRUNet res blocks per level (default: 4)")
+    parser.add_argument("--teacher-nc", type=int, default=64,
+                        help="Teacher PlainDenoise/UNetDenoise base channels (default: 64)")
+    parser.add_argument("--teacher-nb-mid", type=int, default=2,
+                        help="Teacher UNetDenoise middle blocks (default: 2)")
+
     # Model
     parser.add_argument("--pretrained", type=str,
                         default=os.environ.get("PRETRAINED_PATH", ""),
@@ -943,6 +1139,9 @@ def parse_args():
     parser.add_argument("--loss", type=str, default="charbonnier",
                         choices=["charbonnier", "psnr", "l1"],
                         help="Pixel loss function")
+    parser.add_argument("--optimizer", type=str, default="adamw",
+                        choices=["adamw", "prodigy"],
+                        help="Optimizer: adamw (manual LR) or prodigy (auto LR)")
     parser.add_argument("--amp", action="store_true", default=True,
                         help="Use AMP mixed precision (default: on)")
     parser.add_argument("--no-amp", action="store_false", dest="amp",

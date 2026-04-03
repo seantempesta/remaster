@@ -78,3 +78,25 @@ def add_depth_to_path():
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
     return d
+
+
+def resolve_kair_dir():
+    """Search reference-code/KAIR, legacy KAIR/, Modal /root/KAIR."""
+    candidates = [
+        REFERENCE_CODE / "KAIR",
+        PROJECT_ROOT / "KAIR",
+        Path("/root/KAIR"),
+    ]
+    for d in candidates:
+        if (d / "models" / "network_unet.py").exists():
+            return d
+    raise FileNotFoundError("KAIR not found")
+
+
+def add_kair_to_path():
+    """Add KAIR to sys.path so `from models.network_unet import UNetRes` works.
+    Returns the KAIR directory path."""
+    d = resolve_kair_dir()
+    if str(d) not in sys.path:
+        sys.path.insert(0, str(d))
+    return d
