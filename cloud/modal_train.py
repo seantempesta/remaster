@@ -67,7 +67,7 @@ app = modal.App("remaster-train", image=image)
     volumes={VOL_MOUNT: vol},
     timeout=28800,
     memory=32768,  # 32GB (sufficient without RAM cache, 128GB if caching 2400+ pairs)
-    secrets=[modal.Secret.from_name("wandb-api-key", required_modules=[])],
+    secrets=[modal.Secret.from_name("wandb-api-key")],
 )
 def train_remote(
     data_dir: str,
@@ -368,13 +368,13 @@ def main(
     vol_pretrained = ""
     if pretrained and os.path.exists(pretrained):
         pretrained_local = os.path.abspath(pretrained)
-        vol_pretrained = f"{VOL_MOUNT}/pretrained/{os.path.basename(pretrained_local)}"
+        vol_pretrained = f"{VOL_MOUNT}/pretrained/student_{os.path.basename(pretrained_local)}"
 
     # Teacher weights (for online distillation)
     vol_teacher = ""
     if teacher and os.path.exists(teacher):
         teacher_local = os.path.abspath(teacher)
-        vol_teacher = f"{VOL_MOUNT}/pretrained/{os.path.basename(teacher_local)}"
+        vol_teacher = f"{VOL_MOUNT}/pretrained/teacher_{os.path.basename(teacher_local)}"
 
     # Upload data
     print(f"\nUploading data to Modal volume...")
