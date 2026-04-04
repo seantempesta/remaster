@@ -93,6 +93,7 @@ def train_remote(
     nb_dec: str = "2,2",
     nb_mid: int = 2,
     pretrained_path: str = "",
+    fresh_optimizer: bool = False,
     ema: bool = True,
     ema_decay: float = 0.999,
     intensity_aug: bool = True,
@@ -165,6 +166,7 @@ def train_remote(
             print("  No checkpoint found to resume from")
     else:
         args.resume = None
+    args.fresh_optimizer = fresh_optimizer
     args.max_iters = max_iters
     args.lr = lr
     args.eta_min = 1e-7
@@ -285,6 +287,7 @@ def main(
     nb_mid: int = 2,
     checkpoint_dir: str = "",
     pretrained: str = "",
+    fresh_optimizer: bool = False,
     ema: bool = True,
     ema_decay: float = 0.999,
     intensity_aug: bool = True,
@@ -442,6 +445,7 @@ def main(
         nb_dec=nb_dec,
         nb_mid=nb_mid,
         pretrained_path=vol_pretrained,
+        fresh_optimizer=fresh_optimizer,
         ema=ema,
         ema_decay=ema_decay,
         intensity_aug=intensity_aug,

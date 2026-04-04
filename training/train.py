@@ -757,23 +757,30 @@ def train(args):
     start_iter = 0
     best_psnr = 0.0
     best_val_loss = None
+    fresh_optimizer = getattr(args, 'fresh_optimizer', False)
     if args.resume and os.path.exists(args.resume):
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        if "scaler" in ckpt and use_amp:
-            scaler.load_state_dict(ckpt["scaler"])
-        start_iter = ckpt["iteration"]
-        best_psnr = ckpt.get("best_psnr", 0.0)
+        if fresh_optimizer:
+            print("  Fresh optimizer (--fresh-optimizer): skipping optimizer/scheduler state")
+            print(f"  Model weights loaded from iter {ckpt.get('iteration', '?')}")
+        else:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            if "scaler" in ckpt and use_amp:
+                scaler.load_state_dict(ckpt["scaler"])
+            start_iter = ckpt["iteration"]
+            best_psnr = ckpt.get("best_psnr", 0.0)
         if "ema" in ckpt and ema is not None:
             ema.load_state_dict(ckpt["ema"])
             print("  Restored EMA weights")
         if "feat_criterion" in ckpt and feat_criterion is not None:
             feat_criterion.load_state_dict(ckpt["feat_criterion"])
             print("  Restored feature matching adapter weights")
-        print(f"  Resumed at iter {start_iter}, best_psnr={best_psnr:.2f}")
+        if not fresh_optimizer:
+            print(f"  Resumed at iter {start_iter}, best_psnr={best_psnr:.2f}")
+        del ckpt
 
     # ---- Print config ----
     print(f"\nTraining config:")
@@ -1423,6 +1430,9 @@ def parse_args():
                         help="Pretrained checkpoint path (empty = train from scratch)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume training from checkpoint")
+    parser.add_argument("--fresh-optimizer", action="store_true", default=False,
+                        dest="fresh_optimizer",
+                        help="Resume model weights but reset optimizer/scheduler (fresh Prodigy)")
 
     # Training
     parser.add_argument("--max-iters", type=int,
