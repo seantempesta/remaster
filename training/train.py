@@ -564,6 +564,7 @@ def train(args):
             augment=True,
             cache_in_ram=cache_in_ram,
         )
+        prefetch = getattr(args, 'prefetch_factor', 4) if args.num_workers > 0 else None
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -572,8 +573,10 @@ def train(args):
             pin_memory=True,
             drop_last=True,
             persistent_workers=args.num_workers > 0,
+            prefetch_factor=prefetch,
         )
-        print(f"Data pipeline: input-only (teacher generates targets online)")
+        print(f"Data pipeline: input-only (teacher generates targets online)"
+              f", workers={args.num_workers}, prefetch={prefetch}")
     else:
         dataset = PairedFrameDataset(
             args.data_dir,
@@ -581,6 +584,7 @@ def train(args):
             augment=True,
             cache_in_ram=cache_in_ram,
         )
+        prefetch = getattr(args, 'prefetch_factor', 4) if args.num_workers > 0 else None
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -589,7 +593,10 @@ def train(args):
             pin_memory=True,
             drop_last=True,
             persistent_workers=args.num_workers > 0,
+            prefetch_factor=prefetch,
         )
+        print(f"Data pipeline: paired, cached={cache_in_ram}"
+              f", workers={args.num_workers}, prefetch={prefetch}")
 
     # ---- Losses ----
     criterion = build_pixel_criterion(args.loss)
@@ -1197,6 +1204,9 @@ def parse_args():
                         help="Validation pairs directory (separate from training data)")
     parser.add_argument("--num-workers", type=int, default=2,
                         help="DataLoader workers")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        dest="prefetch_factor",
+                        help="Batches to prefetch per DataLoader worker (default: 4)")
 
     # Model type
     parser.add_argument("--model", type=str, default="nafnet",

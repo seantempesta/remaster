@@ -65,7 +65,7 @@ app = modal.App("remaster-train", image=image)
     gpu="A10G",    # A10G (~$1.10/hr), H100 (~$3.50/hr), T4 for debug (~$0.20/hr)
     volumes={VOL_MOUNT: vol},
     timeout=28800,
-    memory=65536,  # 64GB for RAM cache
+    memory=32768,  # 32GB (sufficient without RAM cache, 128GB if caching 2400+ pairs)
 )
 def train_remote(
     data_dir: str,
@@ -170,7 +170,7 @@ def train_remote(
     # A10G has 24GB VRAM — not enough for GPU cache (dataset is ~16GB)
     # Use RAM cache instead (64GB system RAM on Modal)
     args.cache_on_gpu = False
-    args.cache_in_ram = True
+    args.cache_in_ram = cache_in_ram
     args.amp = True
     args.checkpoint_dir = checkpoint_dir
     args.print_freq = 10
@@ -274,6 +274,7 @@ def main(
     intensity_aug: bool = True,
     qat: bool = False,
     sparse: bool = False,
+    cache_in_ram: bool = True,
     gpu: str = "T4",
     # Teacher distillation
     teacher: str = "",
@@ -423,7 +424,7 @@ def main(
         intensity_aug=intensity_aug,
         qat=qat,
         sparse=sparse,
-        cache_in_ram=True,
+        cache_in_ram=cache_in_ram,
         teacher_path=vol_teacher if teacher else "",
         teacher_model=teacher_model,
         teacher_noise_level=teacher_noise_level,
