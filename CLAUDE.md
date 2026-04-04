@@ -59,6 +59,7 @@ A production pipeline for removing compression artifacts from video libraries us
 - `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency, Feature Matching
 - `training/dataset.py` — PairedFrameDataset with optional RAM cache
 - `training/viz.py` — Training visualization: sample images + loss curves
+- `tools/download_training.py` — Download training artifacts from Modal (samples, curves, checkpoints)
 - `tools/stop_training.py` — Send graceful stop signal to Modal training via Dict
 - `tools/verify_arch_configs.py` — Verify weight loading for different NAFNet architectures
 - `cloud/modal_export_onnx_w32.py` — Export NAFNet w32_mid4 to ONNX on Modal
@@ -167,6 +168,8 @@ A production pipeline for removing compression artifacts from video libraries us
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`.
 
 ## Critical Gotchas
+
+**Windows cp1252 encoding — NEVER use unicode arrows/emoji in print() or strings that hit stdout.** Python on Windows defaults to cp1252 which can't encode characters like `→`, `✓`, `─`. Use ASCII equivalents (`->`, `OK`, `-`). This applies to all scripts, not just Modal.
 
 **LOCAL MACHINE HAS ONLY 16GB RAM — MEMORY IS THE BOTTLENECK, NOT VRAM.**
 - Training checkpoints are 1.3GB each (model + optimizer). Loading multiple on CPU will fill RAM and cause swap thrashing that freezes the machine.
