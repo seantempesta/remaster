@@ -63,10 +63,10 @@ image = (
 app = modal.App("remaster-train", image=image)
 
 @app.function(
-    gpu="A10G",    # A10G (~$1.10/hr), H100 (~$3.50/hr), T4 for debug (~$0.20/hr)
+    gpu="L40S",    # L40S ($1.95/hr, 48GB, best value), A10G ($1.10/hr), H100 ($3.50/hr)
     volumes={VOL_MOUNT: vol},
     timeout=28800,
-    memory=32768,  # 32GB (sufficient without RAM cache, 128GB if caching 2400+ pairs)
+    memory=65536,  # 64GB for RAM cache (2400+ 1080p pairs ~30GB)
     secrets=[modal.Secret.from_name("wandb-api-key")],
 )
 def train_remote(
@@ -99,6 +99,7 @@ def train_remote(
     qat: bool = False,
     sparse: bool = False,
     cache_in_ram: bool = True,
+    cache_on_gpu: bool = False,
     num_workers: int = 16,
     # Teacher distillation
     teacher_path: str = "",
@@ -116,6 +117,7 @@ def train_remote(
     wandb_project: str = "remaster",
     wandb_entity: str = "",
     wandb_run_name: str = "",
+    snapshot_freq: int = 250,
 ):
     """Run training on a cloud GPU."""
     import sys
@@ -176,7 +178,7 @@ def train_remote(
     args.fft_alpha = fft_alpha
     # A10G has 24GB VRAM — not enough for GPU cache (dataset is ~16GB)
     # Use RAM cache instead (64GB system RAM on Modal)
-    args.cache_on_gpu = False
+    args.cache_on_gpu = cache_on_gpu
     args.cache_in_ram = cache_in_ram
     args.amp = True
     args.checkpoint_dir = checkpoint_dir
@@ -228,6 +230,7 @@ def train_remote(
     args.wandb_project = wandb_project
     args.wandb_entity = wandb_entity if wandb_entity else None
     args.wandb_run_name = wandb_run_name if wandb_run_name else None
+    args.snapshot_freq = snapshot_freq
 
     # Enhancements
     args.ema = ema
@@ -288,6 +291,7 @@ def main(
     qat: bool = False,
     sparse: bool = False,
     cache_in_ram: bool = True,
+    cache_on_gpu: bool = False,
     gpu: str = "T4",
     # Teacher distillation
     teacher: str = "",
@@ -305,6 +309,7 @@ def main(
     wandb_project: str = "remaster",
     wandb_entity: str = "",
     wandb_run_name: str = "",
+    snapshot_freq: int = 250,
 ):
     """
     Train denoising models on Modal GPU.
@@ -443,6 +448,7 @@ def main(
         qat=qat,
         sparse=sparse,
         cache_in_ram=cache_in_ram,
+        cache_on_gpu=cache_on_gpu,
         teacher_path=vol_teacher if teacher else "",
         teacher_model=teacher_model,
         teacher_noise_level=teacher_noise_level,
@@ -454,6 +460,7 @@ def main(
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         wandb_run_name=wandb_run_name,
+        snapshot_freq=snapshot_freq,
     )
     print(f"\nTraining complete. Best model at: {result_path}")
 

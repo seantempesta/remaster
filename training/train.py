@@ -55,7 +55,7 @@ from training.losses import (
     FeatureMatchingLoss, build_pixel_criterion,
 )
 from training.dataset import PairedFrameDataset, InputOnlyDataset, GPUCachedDataset
-from training.viz import TrainingLogger, save_val_samples
+from training.viz import TrainingLogger, save_val_samples, build_snapshot_composite
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1055,6 +1055,24 @@ def train(args):
             feat_count += 1
         loss_count += 1
 
+        # ---- Training snapshot (cheap side-by-side from current batch) ----
+        snapshot_freq = getattr(args, 'snapshot_freq', 250)
+        if _wandb is not None and snapshot_freq > 0 and (iteration + 1) % snapshot_freq == 0:
+            snap = build_snapshot_composite(
+                inp_batch, tgt_batch, pred.detach(),
+                iteration + 1,
+                has_teacher=use_teacher,
+            )
+            if snap is not None:
+                _wandb.log({
+                    "train/snapshot": _wandb.Image(
+                        snap["composite"],
+                        caption=f"iter {iteration+1} | "
+                                f"Input {snap['inp_psnr']:.1f}dB | "
+                                f"Model {snap['pred_psnr']:.1f}dB",
+                    ),
+                }, step=iteration + 1)
+
         # ---- Logging ----
         if (iteration + 1) % args.print_freq == 0:
             avg_loss = loss_sum / loss_count
@@ -1227,21 +1245,16 @@ def train(args):
                     if best_val_loss is not None:
                         wb_val["val/best_loss"] = best_val_loss
 
-                # Log side-by-side sample images
+                # Log side-by-side composites with fixed keys so wandb
+                # step slider shows progression across val checkpoints
                 if samples:
                     for i, s in enumerate(samples):
-                        # Composite (input | target | student) with labels
-                        wb_val[f"samples/{s['fname']}"] = _wandb.Image(
+                        wb_val[f"val/sample_{i}"] = _wandb.Image(
                             s["composite"],
-                            caption=f"Input {s['inp_psnr']:.1f}dB | Target | Student {s['student_psnr']:.1f}dB",
+                            caption=f"iter {iteration+1} | "
+                                    f"Input {s['inp_psnr']:.1f}dB | "
+                                    f"Model {s['student_psnr']:.1f}dB",
                         )
-                        # Individual panels for W&B image comparison slider
-                        wb_val[f"compare/input_{s['fname']}"] = _wandb.Image(
-                            s["input"], caption=f"Input ({s['inp_psnr']:.1f} dB)")
-                        wb_val[f"compare/target_{s['fname']}"] = _wandb.Image(
-                            s["target"], caption="Target (reference)")
-                        wb_val[f"compare/student_{s['fname']}"] = _wandb.Image(
-                            s["student"], caption=f"Student ({s['student_psnr']:.1f} dB)")
 
                 _wandb.log(wb_val, step=iteration + 1)
 
@@ -1482,6 +1495,9 @@ def parse_args():
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         dest="wandb_run_name",
                         help="W&B run name (auto-generated if omitted)")
+    parser.add_argument("--snapshot-freq", type=int, default=250,
+                        dest="snapshot_freq",
+                        help="Log training snapshot image every N iters (0=disabled, default: 250)")
     parser.add_argument("--cache-in-ram", action="store_true", default=False,
                         help="Cache dataset in RAM (eliminates disk I/O)")
 

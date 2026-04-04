@@ -189,6 +189,65 @@ def _compute_psnr(img_a, img_b):
     return 10 * math.log10(1.0 / mse) if mse > 0 else 100.0
 
 
+def build_snapshot_composite(inp_t, tgt_t, pred_t, iteration,
+                             has_teacher=False):
+    """Build a side-by-side composite from training batch tensors (zero cost).
+
+    Grabs the first sample from each batch tensor, converts to uint8 RGB,
+    composites with labels and PSNR. No extra inference — just tensor copies.
+
+    Args:
+        inp_t: input batch (B, 3, H, W) float [0,1] on GPU
+        tgt_t: target/teacher batch (B, 3, H, W) float [0,1] on GPU
+        pred_t: model prediction batch (B, 3, H, W) float [0,1] on GPU
+        iteration: current training iteration (for label)
+        has_teacher: if True, label middle panel "Teacher" else "Target"
+
+    Returns:
+        dict with keys: composite (uint8 RGB), input, target, prediction,
+        inp_psnr, pred_psnr. Returns None if tensors are empty.
+    """
+    if inp_t.shape[0] == 0:
+        return None
+
+    # Grab first sample, move to CPU (non-blocking since we don't need it immediately)
+    inp_np = (inp_t[0].detach().clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    tgt_np = (tgt_t[0].detach().clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    pred_np = (pred_t[0].detach().clamp(0, 1).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+
+    inp_psnr = _compute_psnr(inp_np, tgt_np)
+    pred_psnr = _compute_psnr(pred_np, tgt_np)
+
+    # Build composite: input | target/teacher | prediction
+    h, w = inp_np.shape[:2]
+    label_h = 32
+    canvas = np.full((h + label_h, w * 3, 3), 255, dtype=np.uint8)
+    canvas[label_h:, 0:w] = inp_np
+    canvas[label_h:, w:w*2] = tgt_np
+    canvas[label_h:, w*2:w*3] = pred_np
+
+    target_label = "Teacher" if has_teacher else "Target"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(canvas, f"Input ({inp_psnr:.1f} dB)", (8, 22),
+                font, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"{target_label} (reference)", (w + 8, 22),
+                font, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Model iter {iteration} ({pred_psnr:.1f} dB)", (w*2 + 8, 22),
+                font, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+    cv2.line(canvas, (w, 0), (w, h + label_h), (180, 180, 180), 1)
+    cv2.line(canvas, (w*2, 0), (w*2, h + label_h), (180, 180, 180), 1)
+
+    return {
+        "composite": canvas,
+        "input": inp_np,
+        "target": tgt_np,
+        "prediction": pred_np,
+        "inp_psnr": inp_psnr,
+        "pred_psnr": pred_psnr,
+    }
+
+
 def save_val_samples(model, val_dir, output_dir, iteration, device,
                      num_samples=3, crop_size=512, teacher_model=None,
                      teacher_needs_noise_map=False, teacher_noise_level=0.0):
