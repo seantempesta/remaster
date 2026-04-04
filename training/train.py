@@ -106,12 +106,12 @@ def build_model(args):
         desc = f"UNetDenoise nc={args.nc} mid={args.nb_mid}"
     elif model_type == 'drunet':
         # DRUNet (UNetRes from KAIR) — residual U-Net denoiser
-        # Student variant: in_nc=3 (RGB only, no noise map), out_nc=3
         add_kair_to_path()
         from models.network_unet import UNetRes
         nc_list = [int(x) for x in getattr(args, 'nc_list', '16,32,64,128').split(",")]
         nb = getattr(args, 'nb', 2)
-        model = UNetRes(in_nc=3, out_nc=3, nc=nc_list, nb=nb)
+        model = UNetRes(in_nc=3, out_nc=3, nc=nc_list, nb=nb,
+                       act_mode='R', bias=False)
         desc = f"DRUNet nc={nc_list} nb={nb}"
     else:
         raise ValueError(f"Unknown model: {model_type}")
