@@ -1273,11 +1273,19 @@ def train(args):
 
             model.train()
 
-            # Save best model
+            # Save best model (always save latest validated model — "best" means
+            # most recent, not highest metric, since metrics aren't comparable
+            # across runs with different loss configs)
+            best_params = ema.state_dict() if ema is not None else model.state_dict()
+            best_path = os.path.join(ckpt_dir, "best.pth")
+            torch.save({
+                "params": best_params,
+                "iteration": iteration + 1,
+                "psnr": psnr,
+            }, best_path)
             if is_best:
-                best_params = ema.state_dict() if ema is not None else model.state_dict()
-                best_path = os.path.join(ckpt_dir, "best.pth")
-                torch.save({"params": best_params}, best_path)
+                print(f"  Saved best model (NEW BEST): {best_path}")
+            else:
                 print(f"  Saved best model: {best_path}")
 
         # ---- Checkpoint ----
