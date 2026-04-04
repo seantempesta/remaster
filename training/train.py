@@ -1,39 +1,28 @@
 """
-Unified training script for all denoising model architectures.
+Unified training script for remaster model architectures.
 
 Supports: NAFNet, PlainDenoise, UNetDenoise, DRUNet (via --model flag).
 
 Features:
     - Charbonnier / PSNRLoss / L1 pixel loss + DISTS perceptual + Focal Frequency
+    - Feature matching loss for teacher→student encoder alignment (--feature-matching-weight)
+    - Online teacher distillation (--teacher): targets from frozen teacher, not disk
+    - Prodigy optimizer (--optimizer prodigy): auto-tuned learning rate
     - EMA weights (--ema), GPU dataset caching (--cache-on-gpu)
-    - Intensity scaling augmentation, small initialization for tiny models
     - CUDA event profiling, graceful stop (SIGINT + Modal Dict)
-    - Validation with PSNR + all losses + sample comparison images + loss curves
+    - Validation with PSNR + sample comparison images + loss curves
     - Checkpoint save/resume with full optimizer + scheduler + EMA state
-    - Online teacher distillation (--teacher): compute targets live from a frozen
-      teacher model instead of loading pre-computed target/ PNGs from disk
 
 Usage:
-    # NAFNet (original)
-    python training/train_nafnet.py --model nafnet --width 32 --middle-blk-num 4
+    # DRUNet student with feature matching distillation (recommended)
+    python training/train.py --model drunet --nc-list 16,32,64,128 --nb 2 \\
+        --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \\
+        --feature-matching-weight 0.1 --optimizer prodigy
 
-    # UNetDenoise (INT8-native, 67 fps TRT INT8)
-    python training/train_nafnet.py --model unet --nc 64 --nb-mid 2 --ema --cache-on-gpu
-
-    # PlainDenoise (sequential CNN)
-    python training/train_nafnet.py --model plain --nc 64 --nb 15
-
-    # DRUNet student (fast, 1.06M params)
-    python training/train_nafnet.py --model drunet --nc-list 16,32,64,128 --nb 2
-
-    # Online teacher distillation (DRUNet student from NAFNet teacher)
-    python training/train_nafnet.py --model drunet --nc-list 16,32,64,128 --nb 2 \\
-        --teacher checkpoints/nafnet_distill/best.pth --teacher-model nafnet
-
-    # Online distillation from pretrained DRUNet teacher (with noise map)
-    python training/train_nafnet.py --model drunet --nc-list 16,32,64,128 --nb 2 \\
-        --teacher checkpoints/drunet_full/drunet_color.pth --teacher-model drunet_full \\
-        --teacher-noise-level 15
+    # Cloud training via Modal
+    modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \\
+        --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \\
+        --feature-matching-weight 0.1 --optimizer prodigy
 
     # Environment variables for Modal: DATA_DIR, CHECKPOINT_DIR, MAX_ITERS, etc.
 """
@@ -60,10 +49,49 @@ from lib.plainnet_arch import PlainDenoise, UNetDenoise, count_params as _count_
 from lib.paths import PROJECT_ROOT, REFERENCE_CODE, CHECKPOINTS_DIR, add_kair_to_path
 from training.losses import (
     CharbonnierLoss, PSNRLoss, FocalFrequencyLoss, DISTSPerceptualLoss,
-    build_pixel_criterion,
+    FeatureMatchingLoss, build_pixel_criterion,
 )
 from training.dataset import PairedFrameDataset, InputOnlyDataset, GPUCachedDataset
 from training.viz import TrainingLogger, save_val_samples
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature extraction for UNetRes (DRUNet) — used by feature matching loss
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_drunet_features(model, x0, needs_noise_map=False, noise_level=0.0):
+    """Run UNetRes forward and return (output, encoder_features).
+
+    Replicates UNetRes.forward() but also captures the intermediate
+    encoder features [x1, x2, x3, x4] needed for feature matching loss.
+
+    Args:
+        model: UNetRes instance (any channel config)
+        x0: input tensor (B, C, H, W)
+        needs_noise_map: if True, concatenates a noise level map channel
+        noise_level: noise level value (0-1 range) for the noise map
+
+    Returns:
+        (output, [x1, x2, x3, x4]) where x1..x4 are encoder features
+        at progressively lower spatial resolutions.
+    """
+    if needs_noise_map:
+        noise_map = torch.full(
+            (x0.shape[0], 1, x0.shape[2], x0.shape[3]),
+            noise_level, device=x0.device, dtype=x0.dtype,
+        )
+        x0 = torch.cat([x0, noise_map], dim=1)
+
+    x1 = model.m_head(x0)
+    x2 = model.m_down1(x1)
+    x3 = model.m_down2(x2)
+    x4 = model.m_down3(x3)
+    x = model.m_body(x4)
+    x = model.m_up3(x + x4)
+    x = model.m_up2(x + x3)
+    x = model.m_up1(x + x2)
+    x = model.m_tail(x + x1)
+    return x, [x1, x2, x3, x4]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -331,9 +359,13 @@ def apply_intensity_aug(inp, tgt, scales=(0.5, 0.7, 1.0)):
 @torch.no_grad()
 def validate(model, data_dir, device, pixel_criterion=None,
              perceptual_criterion=None, fft_criterion=None,
-             perceptual_weight=0.0, fft_weight=0.0, crop_size=512):
+             perceptual_weight=0.0, fft_weight=0.0, crop_size=512,
+             teacher_model=None, teacher_needs_noise_map=False,
+             teacher_noise_level=0.0):
     """
     Validate on held-out frames with larger crops than training.
+    When teacher_model is provided, uses live teacher output as reference.
+    Otherwise falls back to target/ PNGs on disk.
     Returns dict with PSNR, pixel loss, perceptual loss, FFT loss, and combined loss.
     """
     import cv2
@@ -350,14 +382,9 @@ def validate(model, data_dir, device, pixel_criterion=None,
 
     for inp_path in input_files:
         fname = os.path.basename(inp_path)
-        tgt_path = os.path.join(target_dir, fname)
-        if not os.path.exists(tgt_path):
-            continue
 
         inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
-        tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
         inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
         h, w, _ = inp.shape
         # Center crop for validation (deterministic)
@@ -365,10 +392,27 @@ def validate(model, data_dir, device, pixel_criterion=None,
         top = (h - cs) // 2
         left = (w - cs) // 2
         inp = inp[top:top + cs, left:left + cs]
-        tgt = tgt[top:top + cs, left:left + cs]
 
         inp_t = torch.from_numpy(inp.transpose(2, 0, 1)).unsqueeze(0).to(device)
-        tgt_t = torch.from_numpy(tgt.transpose(2, 0, 1)).unsqueeze(0).to(device)
+
+        # Reference: live teacher output or pre-computed target from disk
+        if teacher_model is not None:
+            if teacher_needs_noise_map:
+                noise_map = torch.full(
+                    (1, 1, inp_t.shape[2], inp_t.shape[3]),
+                    teacher_noise_level, device=device, dtype=inp_t.dtype,
+                )
+                tgt_t = teacher_model(torch.cat([inp_t, noise_map], dim=1)).clamp(0, 1)
+            else:
+                tgt_t = teacher_model(inp_t).clamp(0, 1)
+        else:
+            tgt_path = os.path.join(target_dir, fname)
+            if not os.path.exists(tgt_path):
+                continue
+            tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+            tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            tgt = tgt[top:top + cs, left:left + cs]
+            tgt_t = torch.from_numpy(tgt.transpose(2, 0, 1)).unsqueeze(0).to(device)
 
         out_t = model(inp_t)
         out_t = out_t.clamp(0, 1)
@@ -415,8 +459,8 @@ def validate(model, data_dir, device, pixel_criterion=None,
 # Checkpoint saving
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _save_checkpoint(model, optimizer, scheduler, scaler, iteration, best_psnr, args, ckpt_dir, ema=None):
-    """Save a full training checkpoint (model + optimizer + scheduler state)."""
+def _save_checkpoint(model, optimizer, scheduler, scaler, iteration, best_psnr, args, ckpt_dir, ema=None, feat_criterion=None):
+    """Save a full training checkpoint (model + optimizer + scheduler + adapters)."""
     ckpt_data = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -426,6 +470,8 @@ def _save_checkpoint(model, optimizer, scheduler, scaler, iteration, best_psnr, 
         "best_psnr": best_psnr,
         "args": {k: v for k, v in vars(args).items() if not callable(v)},
     }
+    if feat_criterion is not None:
+        ckpt_data["feat_criterion"] = feat_criterion.state_dict()
     if ema is not None:
         ckpt_data["ema"] = ema.state_dict()
     return ckpt_data
@@ -561,20 +607,44 @@ def train(args):
         fft_criterion = FocalFrequencyLoss(alpha=args.fft_alpha)
         print(f"FFT loss: Focal Frequency (alpha={args.fft_alpha}), weight={args.fft_weight}")
 
+    feat_criterion = None
+    feat_weight = getattr(args, 'feature_matching_weight', 0.0)
+    use_feat_matching = feat_weight > 0 and use_teacher and getattr(args, 'model', 'nafnet') == 'drunet'
+    if use_feat_matching:
+        student_nc = [int(x) for x in getattr(args, 'nc_list', '16,32,64,128').split(",")]
+        teacher_nc = [int(x) for x in getattr(args, 'teacher_nc_list', '64,128,256,512').split(",")]
+        feat_criterion = FeatureMatchingLoss(student_nc, teacher_nc).to(device)
+        print(f"Feature matching loss: weight={feat_weight}, "
+              f"student={student_nc} → teacher={teacher_nc}")
+    elif feat_weight > 0 and not use_teacher:
+        print(f"WARNING: --feature-matching-weight={feat_weight} ignored (requires --teacher)")
+    elif feat_weight > 0 and getattr(args, 'model', 'nafnet') != 'drunet':
+        print(f"WARNING: --feature-matching-weight={feat_weight} ignored (only supported for --model drunet)")
+
     # ---- Optimizer ----
+    # Collect all trainable params: model + feature matching adapters (if any)
+    train_params = list(model.parameters())
+    if feat_criterion is not None:
+        train_params += list(feat_criterion.parameters())
+
     opt_type = getattr(args, 'optimizer', 'adamw')
-    if opt_type == 'prodigy':
+    use_prodigy = opt_type == 'prodigy'
+    if use_prodigy:
         from prodigyopt import Prodigy
         optimizer = Prodigy(
-            model.parameters(),
+            train_params,
             lr=1.0,  # Prodigy auto-tunes — this is just a multiplier
+            d_coef=getattr(args, 'd_coef', 1.0),
             weight_decay=args.weight_decay,
-            betas=(0.9, 0.999),  # Prodigy's recommended defaults
+            betas=(0.9, 0.999),
+            safeguard_warmup=True,  # protect D estimate from scheduler LR
+            use_bias_correction=True,  # recommended for fine-tuning
         )
-        print(f"Optimizer: Prodigy (parameter-free LR, auto-tuning)")
+        print(f"Optimizer: Prodigy (d_coef={getattr(args, 'd_coef', 1.0)}, "
+              f"safeguard_warmup=True, bias_correction=True)")
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            train_params,
             lr=args.lr,
             weight_decay=args.weight_decay,
             betas=(0.9, 0.9),
@@ -596,17 +666,25 @@ def train(args):
         use_amp = False  # AMP and QAT don't mix
         print("  AMP disabled (incompatible with QAT)")
 
-    # ---- LR Scheduler: cosine with linear warmup ----
+    # ---- LR Scheduler ----
+    # Prodigy: cosine annealing only (no warmup — warmup confuses D estimation).
+    # AdamW: cosine with linear warmup.
     warmup_iters = args.warmup_iters
-    def lr_lambda(step):
-        if step < warmup_iters:
-            return max(step / max(warmup_iters, 1), 1e-8)  # avoid exact 0 at step 0
-        progress = (step - warmup_iters) / max(args.max_iters - warmup_iters, 1)
-        return max(args.eta_min / args.lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    if use_prodigy:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.max_iters, eta_min=0,
+        )
+        print(f"Scheduler: CosineAnnealingLR (T_max={args.max_iters}, no warmup)")
+    else:
+        def lr_lambda(step):
+            if step < warmup_iters:
+                return max(step / max(warmup_iters, 1), 1e-8)
+            progress = (step - warmup_iters) / max(args.max_iters - warmup_iters, 1)
+            return max(args.eta_min / args.lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ---- Checkpoint dir ----
     ckpt_dir = os.path.abspath(args.checkpoint_dir)
@@ -637,6 +715,9 @@ def train(args):
         if "ema" in ckpt and ema is not None:
             ema.load_state_dict(ckpt["ema"])
             print("  Restored EMA weights")
+        if "feat_criterion" in ckpt and feat_criterion is not None:
+            feat_criterion.load_state_dict(ckpt["feat_criterion"])
+            print("  Restored feature matching adapter weights")
         print(f"  Resumed at iter {start_iter}, best_psnr={best_psnr:.2f}")
 
     # ---- Print config ----
@@ -650,6 +731,7 @@ def train(args):
     print(f"  pixel loss:  {args.loss}")
     print(f"  perceptual:  {args.perceptual_weight}")
     print(f"  fft:         {args.fft_weight} (alpha={args.fft_alpha})")
+    print(f"  feat_match:  {feat_weight}")
     print(f"  grad_clip:   {args.grad_clip}")
     print(f"  amp:         {use_amp}")
     print(f"  checkpoints: {ckpt_dir}")
@@ -671,9 +753,17 @@ def train(args):
         _wb = next(iter(dataloader))
         _wi, _wt = _wb[0].to(device, non_blocking=True), _wb[1].to(device, non_blocking=True)
     # Generate teacher targets for warmup if using online distillation
+    _w_teacher_feats = None
     if teacher_model is not None:
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            if teacher_needs_noise_map:
+            if use_feat_matching:
+                _wt, _w_teacher_feats = extract_drunet_features(
+                    teacher_model, _wi,
+                    needs_noise_map=teacher_needs_noise_map,
+                    noise_level=teacher_noise_level,
+                )
+                _wt = _wt.clamp(0, 1)
+            elif teacher_needs_noise_map:
                 _nm = torch.full((_wi.shape[0], 1, _wi.shape[2], _wi.shape[3]),
                                  teacher_noise_level, device=device, dtype=_wi.dtype)
                 _wt = teacher_model(torch.cat([_wi, _nm], dim=1)).clamp(0, 1)
@@ -681,7 +771,10 @@ def train(args):
             else:
                 _wt = teacher_model(_wi).clamp(0, 1)
     with torch.amp.autocast("cuda", enabled=use_amp):
-        _wo = model(_wi)
+        if use_feat_matching:
+            _wo, _w_student_feats = extract_drunet_features(model, _wi)
+        else:
+            _wo = model(_wi)
         _wl = criterion(_wo, _wt)
     if perceptual_criterion is not None:
         with torch.amp.autocast("cuda", enabled=False):
@@ -690,6 +783,13 @@ def train(args):
     if fft_criterion is not None:
         _fl = fft_criterion(_wo.float(), _wt.float())
         _wl = _wl + args.fft_weight * _fl
+    if feat_criterion is not None and _w_teacher_feats is not None:
+        with torch.amp.autocast("cuda", enabled=False):
+            _fm = feat_criterion(
+                [f.float() for f in _w_student_feats],
+                [f.float() for f in _w_teacher_feats],
+            )
+        _wl = _wl + feat_weight * _fm
     _wl.backward()
     optimizer.zero_grad(set_to_none=True)
     del _wi, _wt, _wo, _wl
@@ -697,6 +797,8 @@ def train(args):
         del _pl
     if fft_criterion is not None:
         del _fl
+    if _w_teacher_feats is not None:
+        del _w_teacher_feats, _w_student_feats, _fm
     torch.cuda.empty_cache()
     gc.collect()
     peak_gb = torch.cuda.max_memory_reserved() / 1024**3
@@ -710,9 +812,11 @@ def train(args):
     pixel_loss_sum = 0.0
     percep_loss_sum = 0.0
     fft_loss_sum = 0.0
+    feat_loss_sum = 0.0
     loss_count = 0
     percep_count = 0
     fft_count = 0
+    feat_count = 0
     data_time_sum = 0.0
     compute_time_sum = 0.0
     start_time = time.time()
@@ -735,7 +839,8 @@ def train(args):
     def _save_emergency(it):
         """Save checkpoint on interrupt/signal."""
         ckpt_data = _save_checkpoint(model, optimizer, scheduler, scaler,
-                                     it, best_psnr, args, ckpt_dir, ema=ema)
+                                     it, best_psnr, args, ckpt_dir, ema=ema,
+                                     feat_criterion=feat_criterion)
         path = os.path.join(ckpt_dir, "latest.pth")
         torch.save(ckpt_data, path)
         torch.save({"params": model.state_dict()},
@@ -783,9 +888,18 @@ def train(args):
             inp_batch, tgt_batch = apply_intensity_aug(inp_batch, tgt_batch)
 
         # Online teacher: compute targets from teacher model
+        teacher_features = None
         if teacher_model is not None:
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-                if teacher_needs_noise_map:
+                if use_feat_matching:
+                    # Extract teacher features for feature matching loss
+                    tgt_batch, teacher_features = extract_drunet_features(
+                        teacher_model, inp_batch,
+                        needs_noise_map=teacher_needs_noise_map,
+                        noise_level=teacher_noise_level,
+                    )
+                    tgt_batch = tgt_batch.clamp(0, 1)
+                elif teacher_needs_noise_map:
                     # DRUNet full: concatenate noise level map as 4th channel
                     noise_map = torch.full(
                         (inp_batch.shape[0], 1, inp_batch.shape[2], inp_batch.shape[3]),
@@ -793,9 +907,9 @@ def train(args):
                         device=device, dtype=inp_batch.dtype,
                     )
                     teacher_input = torch.cat([inp_batch, noise_map], dim=1)
+                    tgt_batch = teacher_model(teacher_input).clamp(0, 1)
                 else:
-                    teacher_input = inp_batch
-                tgt_batch = teacher_model(teacher_input).clamp(0, 1)
+                    tgt_batch = teacher_model(inp_batch).clamp(0, 1)
 
         t_compute_start = time.time()
         data_time_sum += t_compute_start - t_data_start
@@ -809,7 +923,10 @@ def train(args):
 
         # Forward with AMP
         with torch.amp.autocast("cuda", enabled=use_amp):
-            pred = model(inp_batch)
+            if use_feat_matching:
+                pred, student_features = extract_drunet_features(model, inp_batch)
+            else:
+                pred = model(inp_batch)
             pixel_loss = criterion(pred, tgt_batch)
 
         if do_profile:
@@ -819,6 +936,7 @@ def train(args):
         loss = pixel_loss
         p_loss = None
         f_loss = None
+        fm_loss = None
 
         if perceptual_criterion is not None and (iteration % percep_freq == 0):
             with torch.amp.autocast("cuda", enabled=False):
@@ -828,6 +946,14 @@ def train(args):
         if fft_criterion is not None:
             f_loss = fft_criterion(pred.float(), tgt_batch.float())
             loss = loss + args.fft_weight * f_loss
+
+        if feat_criterion is not None and teacher_features is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                fm_loss = feat_criterion(
+                    [f.float() for f in student_features],
+                    [f.float() for f in teacher_features],
+                )
+            loss = loss + feat_weight * fm_loss
 
         if do_profile:
             ev_aux_end.record()
@@ -839,7 +965,10 @@ def train(args):
         # Gradient clipping (prevents explosion during fine-tuning)
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            clip_params = list(model.parameters())
+            if feat_criterion is not None:
+                clip_params += list(feat_criterion.parameters())
+            torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
 
         if do_profile:
             ev_bwd_end.record()
@@ -866,6 +995,9 @@ def train(args):
         if f_loss is not None:
             fft_loss_sum += f_loss.item()
             fft_count += 1
+        if fm_loss is not None:
+            feat_loss_sum += fm_loss.item()
+            feat_count += 1
         loss_count += 1
 
         # ---- Logging ----
@@ -875,6 +1007,8 @@ def train(args):
             iters_per_sec = (iteration + 1 - start_iter) / elapsed
             eta = (args.max_iters - iteration - 1) / max(iters_per_sec, 0.01)
             lr_now = optimizer.param_groups[0]["lr"]
+            # Prodigy: log the auto-tuned D value (effective step size)
+            d_now = optimizer.param_groups[0].get("d", None)
             vram = torch.cuda.max_memory_reserved() / 1024**3 if device.type == "cuda" else 0
             total_t = data_time_sum + compute_time_sum
             data_pct = data_time_sum / total_t * 100 if total_t > 0 else 0
@@ -886,6 +1020,8 @@ def train(args):
                 parts.append(f"perc={percep_loss_sum / percep_count:.4f}")
             if fft_count > 0:
                 parts.append(f"fft={fft_loss_sum / fft_count:.2e}")
+            if feat_count > 0:
+                parts.append(f"feat={feat_loss_sum / feat_count:.4f}")
             loss_detail = f"loss={avg_loss:.6f} ({' '.join(parts)})"
 
             # Log to training logger
@@ -894,6 +1030,7 @@ def train(args):
                 pixel_loss=avg_px,
                 perceptual_loss=percep_loss_sum / percep_count if percep_count > 0 else None,
                 fft_loss=fft_loss_sum / fft_count if fft_count > 0 else None,
+                feat_loss=feat_loss_sum / feat_count if feat_count > 0 else None,
                 total_loss=avg_loss,
                 lr=lr_now,
             )
@@ -911,9 +1048,12 @@ def train(args):
                     f"bwd={t_bwd:.0f} opt={t_opt:.0f} "
                     f"total={t_total:.0f}ms")
             samples_per_sec = iters_per_sec * args.batch_size
+            lr_str = f"lr={lr_now:.2e}"
+            if d_now is not None:
+                lr_str += f" d={d_now:.2e}"
             print(
                 f"  {iteration + 1:5d}/{args.max_iters} | "
-                f"{loss_detail} | lr={lr_now:.2e} | "
+                f"{loss_detail} | {lr_str} | "
                 f"{iters_per_sec:.1f}it/s ({samples_per_sec:.0f}samp/s) "
                 f"ETA:{eta / 60:.0f}m | "
                 f"{vram:.1f}GB | data:{data_pct:.0f}%"
@@ -922,9 +1062,11 @@ def train(args):
             pixel_loss_sum = 0.0
             percep_loss_sum = 0.0
             fft_loss_sum = 0.0
+            feat_loss_sum = 0.0
             loss_count = 0
             percep_count = 0
             fft_count = 0
+            feat_count = 0
             data_time_sum = 0.0
             compute_time_sum = 0.0
 
@@ -938,7 +1080,10 @@ def train(args):
                           fft_criterion=fft_criterion,
                           perceptual_weight=args.perceptual_weight,
                           fft_weight=args.fft_weight,
-                          crop_size=512)
+                          crop_size=512,
+                          teacher_model=teacher_model,
+                          teacher_needs_noise_map=teacher_needs_noise_map,
+                          teacher_noise_level=teacher_noise_level)
             psnr = val["psnr"]
             val_loss = val.get("combined_loss", None)
 
@@ -983,7 +1128,10 @@ def train(args):
 
             # Save sample comparison images
             save_val_samples(val_model, val_dir, ckpt_dir, iteration + 1,
-                           device, num_samples=3, crop_size=512)
+                           device, num_samples=3, crop_size=512,
+                           teacher_model=teacher_model,
+                           teacher_needs_noise_map=teacher_needs_noise_map,
+                           teacher_noise_level=teacher_noise_level)
 
             # Update loss curves chart
             try:
@@ -1003,7 +1151,8 @@ def train(args):
         # ---- Checkpoint ----
         if (iteration + 1) % args.save_freq == 0:
             ckpt_data = _save_checkpoint(model, optimizer, scheduler, scaler,
-                                         iteration + 1, best_psnr, args, ckpt_dir, ema=ema)
+                                         iteration + 1, best_psnr, args, ckpt_dir, ema=ema,
+                                         feat_criterion=feat_criterion)
             ckpt_path = os.path.join(ckpt_dir, f"iter{iteration + 1:06d}.pth")
             torch.save(ckpt_data, ckpt_path)
             print(f"  Saved checkpoint: {ckpt_path}")
@@ -1033,7 +1182,7 @@ def train(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train NAFNet on SCUNet pseudo-GT pairs")
+    parser = argparse.ArgumentParser(description="Train remaster models (distillation, feature matching, Prodigy LR)")
 
     # Data
     parser.add_argument("--data-dir", type=str,
@@ -1153,6 +1302,8 @@ def parse_args():
     parser.add_argument("--optimizer", type=str, default="adamw",
                         choices=["adamw", "prodigy"],
                         help="Optimizer: adamw (manual LR) or prodigy (auto LR)")
+    parser.add_argument("--d-coef", type=float, default=1.0, dest="d_coef",
+                        help="Prodigy d_coef: scales auto-tuned LR (0.5=conservative, 2.0=aggressive)")
     parser.add_argument("--amp", action="store_true", default=True,
                         help="Use AMP mixed precision (default: on)")
     parser.add_argument("--no-amp", action="store_false", dest="amp",
@@ -1169,6 +1320,12 @@ def parse_args():
                         help="Focal frequency loss weight (0 = disabled, try 0.1)")
     parser.add_argument("--fft-alpha", type=float, default=1.0,
                         help="Focal frequency loss alpha (focal exponent, default: 1.0)")
+
+    # Feature matching loss (DRUNet teacher→student encoder feature alignment)
+    parser.add_argument("--feature-matching-weight", type=float, default=0.0,
+                        dest="feature_matching_weight",
+                        help="Feature matching loss weight (0 = disabled, try 0.1). "
+                             "Requires --teacher and --model drunet.")
 
     # Logging / checkpoints
     parser.add_argument("--checkpoint-dir", type=str,

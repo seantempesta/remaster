@@ -25,13 +25,14 @@ class TrainingLogger:
                 self.entries = json.load(f)
 
     def log_train(self, iteration, pixel_loss, perceptual_loss=None,
-                  fft_loss=None, total_loss=None, lr=None):
+                  fft_loss=None, feat_loss=None, total_loss=None, lr=None):
         self.entries.append({
             "type": "train",
             "iter": iteration,
             "px": pixel_loss,
             "perc": perceptual_loss,
             "fft": fft_loss,
+            "feat": feat_loss,
             "total": total_loss,
             "lr": lr,
         })
@@ -67,12 +68,15 @@ class TrainingLogger:
         # Determine which loss components we have
         has_perc = any(e.get("perc") is not None for e in train + val)
         has_fft = any(e.get("fft") is not None for e in train + val)
+        has_feat = any(e.get("feat") is not None for e in train + val)
 
         # Layout: total loss + PSNR always, then optional component panels
         n_panels = 2  # total loss + PSNR
         if has_perc:
             n_panels += 1
         if has_fft:
+            n_panels += 1
+        if has_feat:
             n_panels += 1
 
         fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4))
@@ -156,15 +160,44 @@ class TrainingLogger:
             ax.grid(True, alpha=0.3)
             panel += 1
 
+        # Panel: Feature matching loss
+        if has_feat:
+            ax = axes[panel]
+            if train:
+                iters = [e["iter"] for e in train if e.get("feat") is not None]
+                vals = [e["feat"] for e in train if e.get("feat") is not None]
+                if iters:
+                    ax.plot(iters, vals, "b-", alpha=0.4, linewidth=0.5, label="train")
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("Feature Loss")
+            ax.set_title("Feature Matching")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            panel += 1
+
         plt.suptitle("Training Progress", fontsize=12, y=1.02)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close()
 
 
+def _compute_psnr(img_a, img_b):
+    """PSNR between two uint8 RGB numpy arrays."""
+    a = img_a.astype(np.float64) / 255.0
+    b = img_b.astype(np.float64) / 255.0
+    mse = np.mean((a - b) ** 2)
+    return 10 * math.log10(1.0 / mse) if mse > 0 else 100.0
+
+
 def save_val_samples(model, val_dir, output_dir, iteration, device,
-                     num_samples=3, crop_size=512):
-    """Save comparison images: input | target (teacher) | model prediction.
+                     num_samples=3, crop_size=512, teacher_model=None,
+                     teacher_needs_noise_map=False, teacher_noise_level=0.0):
+    """Save comparison images: input | teacher | student prediction.
+
+    When teacher_model is provided, runs teacher live and measures PSNR for
+    both input and student against the teacher output (teacher = reference).
+
+    When teacher_model is None, falls back to using target/ PNGs from disk.
 
     Picks evenly-spaced frames from val set, runs inference, saves a
     side-by-side PNG for each. Uses center crop to match validation eval.
@@ -189,68 +222,76 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
     with torch.no_grad():
         for inp_path in selected:
             fname = os.path.basename(inp_path)
-            tgt_path = os.path.join(target_dir, fname)
-            if not os.path.exists(tgt_path):
-                continue
 
-            # Load and center-crop
+            # Load and center-crop input
             inp_img = cv2.imread(inp_path, cv2.IMREAD_COLOR)
-            tgt_img = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
             inp_rgb = cv2.cvtColor(inp_img, cv2.COLOR_BGR2RGB)
-            tgt_rgb = cv2.cvtColor(tgt_img, cv2.COLOR_BGR2RGB)
 
             h, w = inp_rgb.shape[:2]
             cs = min(crop_size, h, w)
             top = (h - cs) // 2
             left = (w - cs) // 2
             inp_crop = inp_rgb[top:top+cs, left:left+cs]
-            tgt_crop = tgt_rgb[top:top+cs, left:left+cs]
 
-            # Run model
             inp_t = torch.from_numpy(
                 inp_crop.astype(np.float32).transpose(2, 0, 1) / 255.0
             ).unsqueeze(0).to(device)
-            out_t = model(inp_t).clamp(0, 1)
-            pred_crop = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
 
-            # Composite: input | target | prediction
-            # Add labels as a header strip
+            # Get teacher output (live inference or from disk)
+            if teacher_model is not None:
+                if teacher_needs_noise_map:
+                    noise_map = torch.full(
+                        (1, 1, inp_t.shape[2], inp_t.shape[3]),
+                        teacher_noise_level, device=device, dtype=inp_t.dtype,
+                    )
+                    teacher_out = teacher_model(torch.cat([inp_t, noise_map], dim=1)).clamp(0, 1)
+                else:
+                    teacher_out = teacher_model(inp_t).clamp(0, 1)
+                teacher_crop = (teacher_out.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+            else:
+                tgt_path = os.path.join(target_dir, fname)
+                if not os.path.exists(tgt_path):
+                    continue
+                tgt_img = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+                tgt_rgb = cv2.cvtColor(tgt_img, cv2.COLOR_BGR2RGB)
+                teacher_crop = tgt_rgb[top:top+cs, left:left+cs]
+
+            # Student prediction
+            out_t = model(inp_t).clamp(0, 1)
+            student_crop = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+
+            # PSNR: both measured against teacher (= reference)
+            inp_psnr = _compute_psnr(inp_crop, teacher_crop)
+            student_psnr = _compute_psnr(student_crop, teacher_crop)
+
+            # Composite: input | teacher | student
             label_h = 32
             panel_w = cs
             canvas_w = panel_w * 3
             canvas_h = cs + label_h
             canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
 
-            # Place images
             canvas[label_h:, 0:panel_w] = inp_crop
-            canvas[label_h:, panel_w:panel_w*2] = tgt_crop
-            canvas[label_h:, panel_w*2:panel_w*3] = pred_crop
+            canvas[label_h:, panel_w:panel_w*2] = teacher_crop
+            canvas[label_h:, panel_w*2:panel_w*3] = student_crop
 
-            # Add labels
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.6
             color = (0, 0, 0)
             thickness = 1
-            cv2.putText(canvas, "Input (compressed)", (8, 22),
+            cv2.putText(canvas, f"Input ({inp_psnr:.1f} dB)", (8, 22),
                         font, font_scale, color, thickness, cv2.LINE_AA)
-            cv2.putText(canvas, "Target (teacher)", (panel_w + 8, 22),
+            cv2.putText(canvas, "Teacher (reference)", (panel_w + 8, 22),
                         font, font_scale, color, thickness, cv2.LINE_AA)
-            cv2.putText(canvas, f"Model (iter {iteration})", (panel_w*2 + 8, 22),
+            cv2.putText(canvas, f"Student iter {iteration} ({student_psnr:.1f} dB)", (panel_w*2 + 8, 22),
                         font, font_scale, color, thickness, cv2.LINE_AA)
 
-            # Add thin separator lines
             cv2.line(canvas, (panel_w, 0), (panel_w, canvas_h), (180, 180, 180), 1)
             cv2.line(canvas, (panel_w*2, 0), (panel_w*2, canvas_h), (180, 180, 180), 1)
 
-            # Compute PSNR for the label
-            pred_f = pred_crop.astype(np.float64) / 255.0
-            tgt_f = tgt_crop.astype(np.float64) / 255.0
-            mse = np.mean((pred_f - tgt_f) ** 2)
-            psnr = 10 * math.log10(1.0 / mse) if mse > 0 else 100.0
-
             base = os.path.splitext(fname)[0]
             out_path = os.path.join(
-                samples_dir, f"iter{iteration:06d}_{base}_{psnr:.1f}dB.png"
+                samples_dir, f"iter{iteration:06d}_{base}_{student_psnr:.1f}dB.png"
             )
             cv2.imwrite(out_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 

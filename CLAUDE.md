@@ -39,7 +39,7 @@ A production pipeline for removing compression artifacts from video libraries us
 - `lib/` — shared importable code: paths, ffmpeg utils, metrics, NAFNet architecture, PlainDenoise architecture
 - `pipelines/` — production streaming denoisers (SCUNet batch, NAFNet, episode)
 - `experiments/` — one-off experiments and older approaches
-- `training/` �� distillation training (train_nafnet.py, train_plainnet.py, losses.py, dataset.py, viz.py)
+- `training/` — unified training (train.py, losses.py, dataset.py, viz.py)
 - `cloud/` — Modal remote GPU execution scripts
 - `bench/` — benchmarking and quality comparison
 - `tools/` — small utilities (clip extraction, probing, MP4 repair)
@@ -55,15 +55,14 @@ A production pipeline for removing compression artifacts from video libraries us
 - `pipelines/denoise_gpu_v3.py` — NVDEC decode + ffmpeg pipe encode (5.0 fps, GPU→CPU sync bottleneck)
 - `pipelines/denoise_fast.py` — pipe-based pipeline (ffmpeg NVDEC/NVENC via stdin/stdout, 3.5 fps)
 - `pipelines/denoise_episode.py` — original episode denoiser (simpler, single-frame)
-- `training/train_nafnet.py` — NAFNet distillation training loop (configurable arch, profiling, graceful stop)
-- `training/train_plainnet.py` — PlainDenoise/UNetDenoise training (EMA, QAT, sparsity, intensity aug)
-- `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency, PSNRLoss
+- `training/train.py` — unified training: all architectures, distillation, feature matching, Prodigy optimizer
+- `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency, Feature Matching
 - `training/dataset.py` — PairedFrameDataset with optional RAM cache
 - `training/viz.py` — Training visualization: sample images + loss curves
 - `tools/stop_training.py` — Send graceful stop signal to Modal training via Dict
 - `tools/verify_arch_configs.py` — Verify weight loading for different NAFNet architectures
 - `cloud/modal_export_onnx_w32.py` — Export NAFNet w32_mid4 to ONNX on Modal
-- `cloud/modal_train_plainnet.py` — Modal wrapper for PlainDenoise/UNetDenoise training on H100
+- `cloud/modal_train.py` — Modal cloud training wrapper (all architectures, all features)
 - `playback/enhance.vpy` — VapourSynth script for real-time mpv playback via vs-mlrt TensorRT
 - `remaster/encode.vpy` — VapourSynth batch encoding script (BestSource → vs-mlrt TRT → y4m)
 - `remaster/encode.py` — CLI wrapper: vspipe + ffmpeg NVENC encoding with audio passthrough

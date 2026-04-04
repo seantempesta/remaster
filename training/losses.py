@@ -141,6 +141,53 @@ class DISTSPerceptualLoss(nn.Module):
         return super().train(False)
 
 
+class FeatureMatchingLoss(nn.Module):
+    """Feature matching loss for knowledge distillation.
+
+    Compares intermediate encoder features between a student and teacher network.
+    Uses 1x1 adapter convolutions to project student features (narrow channels)
+    to teacher feature dimensions (wide channels), then computes L1 distance.
+
+    The adapter convs are trainable and should be added to the optimizer.
+    The teacher features are expected to be detached (no grad).
+
+    Args:
+        student_channels: list of channel counts at each encoder level (e.g. [16,32,64,128])
+        teacher_channels: list of channel counts at each encoder level (e.g. [64,128,256,512])
+    """
+    def __init__(self, student_channels, teacher_channels):
+        super().__init__()
+        assert len(student_channels) == len(teacher_channels)
+        self.adapters = nn.ModuleList([
+            nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False)
+            for s_ch, t_ch in zip(student_channels, teacher_channels)
+        ])
+        # Initialize adapters close to identity-like mapping
+        for adapter in self.adapters:
+            nn.init.kaiming_normal_(adapter.weight, mode='fan_out', nonlinearity='relu')
+            adapter.weight.data.mul_(0.1)
+
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"  FeatureMatchingLoss: {len(self.adapters)} levels, "
+              f"{n_params} adapter params")
+
+    def forward(self, student_features, teacher_features):
+        """Compute feature matching loss across all encoder levels.
+
+        Args:
+            student_features: list of tensors [x1, x2, x3, x4] from student encoder
+            teacher_features: list of tensors [x1, x2, x3, x4] from teacher encoder (detached)
+
+        Returns:
+            Scalar loss (mean L1 across all levels).
+        """
+        loss = 0.0
+        for adapter, s_feat, t_feat in zip(self.adapters, student_features, teacher_features):
+            projected = adapter(s_feat)
+            loss = loss + F.l1_loss(projected, t_feat)
+        return loss / len(self.adapters)
+
+
 def build_pixel_criterion(name):
     """Build pixel-level loss by name."""
     if name == "charbonnier":
