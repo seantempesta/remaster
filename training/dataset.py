@@ -61,18 +61,30 @@ class PairedFrameDataset(Dataset):
               f"augment={augment}, cached={cache_in_ram}")
 
     def _load_all_into_ram(self):
-        """Pre-load all images as uint8 numpy arrays using parallel I/O."""
+        """Pre-load all images as uint8 numpy arrays using chunked parallel I/O.
+
+        Loads in batches of CHUNK_SIZE pairs to bound peak transient memory
+        from parallel PNG decoding. Submitting all futures at once causes
+        glibc allocator fragmentation and stalls around 20GB.
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import psutil
 
         n = len(self.pairs)
-        print(f"  Caching {n} pairs into RAM (parallel)...")
+        CHUNK_SIZE = 200
+        n_workers = min(8, os.cpu_count() or 4)
+        print(f"  Caching {n} pairs into RAM "
+              f"(chunks of {CHUNK_SIZE}, {n_workers} workers)...")
         t0 = time.time()
 
         def _load_pair(idx):
             inp_path, tgt_path = self.pairs[idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+            if inp is None:
+                raise IOError(f"Failed to read {inp_path}")
+            if tgt is None:
+                raise IOError(f"Failed to read {tgt_path}")
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
             return idx, inp, tgt
@@ -80,24 +92,28 @@ class PairedFrameDataset(Dataset):
         # Pre-allocate list
         self.cached_images = [None] * n
         loaded = 0
-        n_workers = min(16, os.cpu_count() or 4)
 
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_load_pair, i): i for i in range(n)}
-            for fut in as_completed(futures):
-                idx, inp, tgt = fut.result()
-                self.cached_images[idx] = (inp, tgt)
-                loaded += 1
-                if loaded % 200 == 0:
-                    mb = psutil.Process().memory_info().rss / 1024**2
-                    elapsed = time.time() - t0
-                    rate = loaded / elapsed
-                    print(f"    {loaded}/{n} loaded ({rate:.0f} pairs/s), "
-                          f"RAM: {mb:.0f}MB")
+        # Process in chunks to bound peak transient memory
+        for chunk_start in range(0, n, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, n)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_load_pair, i): i
+                           for i in range(chunk_start, chunk_end)}
+                for fut in as_completed(futures):
+                    idx, inp, tgt = fut.result()
+                    self.cached_images[idx] = (inp, tgt)
+                    loaded += 1
+            # Futures and pool are fully cleaned up here before next chunk
+            if loaded % 200 == 0 or chunk_end == n:
+                mb = psutil.Process().memory_info().rss / 1024**2
+                elapsed = time.time() - t0
+                rate = loaded / elapsed if elapsed > 0 else 0
+                print(f"    {loaded}/{n} loaded ({rate:.0f} pairs/s), "
+                      f"RAM: {mb:.0f}MB")
 
         elapsed = time.time() - t0
         mb = psutil.Process().memory_info().rss / 1024**2
-        rate = n / elapsed
+        rate = n / elapsed if elapsed > 0 else 0
         print(f"  Cached {n} pairs in {elapsed:.1f}s ({rate:.0f} pairs/s), "
               f"RAM: {mb:.0f}MB, workers={n_workers}")
 
@@ -184,21 +200,37 @@ class InputOnlyDataset(Dataset):
         import psutil
 
         n = len(self.files)
-        print(f"  Caching {n} input frames into RAM...")
+        CHUNK_SIZE = 200
+        n_workers = min(8, os.cpu_count() or 4)
+        print(f"  Caching {n} input frames into RAM "
+              f"(chunks of {CHUNK_SIZE}, {n_workers} workers)...")
         t0 = time.time()
 
         def _load(idx):
             img = cv2.imread(self.files[idx], cv2.IMREAD_COLOR)
+            if img is None:
+                raise IOError(f"Failed to read {self.files[idx]}")
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return idx, img
 
         self.cached_images = [None] * n
-        n_workers = min(16, os.cpu_count() or 4)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_load, i): i for i in range(n)}
-            for fut in as_completed(futures):
-                idx, img = fut.result()
-                self.cached_images[idx] = img
+        loaded = 0
+
+        for chunk_start in range(0, n, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, n)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_load, i): i
+                           for i in range(chunk_start, chunk_end)}
+                for fut in as_completed(futures):
+                    idx, img = fut.result()
+                    self.cached_images[idx] = img
+                    loaded += 1
+            if loaded % 200 == 0 or chunk_end == n:
+                mb = psutil.Process().memory_info().rss / 1024**2
+                elapsed = time.time() - t0
+                rate = loaded / elapsed if elapsed > 0 else 0
+                print(f"    {loaded}/{n} loaded ({rate:.0f} pairs/s), "
+                      f"RAM: {mb:.0f}MB")
 
         elapsed = time.time() - t0
         mb = psutil.Process().memory_info().rss / 1024**2
@@ -270,32 +302,42 @@ class GPUCachedDataset:
         if not pairs:
             raise FileNotFoundError(f"No matching pairs in {data_dir}")
 
-        # Parallel load from disk → CPU numpy
-        print(f"  Loading {len(pairs)} pairs to GPU ({device})...")
+        # Chunked parallel load from disk -> CPU numpy
+        CHUNK_SIZE = 200
+        n_workers = min(8, os.cpu_count() or 4)
+        print(f"  Loading {len(pairs)} pairs to GPU ({device}), "
+              f"chunks of {CHUNK_SIZE}...")
         t0 = time.time()
 
         def _load(idx):
             inp_path, tgt_path = pairs[idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+            if inp is None:
+                raise IOError(f"Failed to read {inp_path}")
+            if tgt is None:
+                raise IOError(f"Failed to read {tgt_path}")
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
             return idx, inp, tgt
 
         cpu_pairs = [None] * len(pairs)
-        n_workers = min(16, os.cpu_count() or 4)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(_load, i): i for i in range(len(pairs))}
-            done = 0
-            for f in as_completed(futs):
-                idx, inp, tgt = f.result()
-                cpu_pairs[idx] = (inp, tgt)
-                done += 1
-                if done % 500 == 0:
-                    print(f"    {done}/{len(pairs)} loaded from disk...")
+        done = 0
+        for chunk_start in range(0, len(pairs), CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, len(pairs))
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futs = {pool.submit(_load, i): i
+                        for i in range(chunk_start, chunk_end)}
+                for f in as_completed(futs):
+                    idx, inp, tgt = f.result()
+                    cpu_pairs[idx] = (inp, tgt)
+                    done += 1
+            if done % 200 == 0 or chunk_end == len(pairs):
+                print(f"    {done}/{len(pairs)} loaded from disk...")
 
         load_time = time.time() - t0
-        print(f"  Disk load: {load_time:.1f}s ({len(pairs)/load_time:.0f} pairs/s)")
+        print(f"  Disk load: {load_time:.1f}s "
+              f"({len(pairs)/load_time:.0f} pairs/s)")
 
         # Transfer to GPU as uint8 tensors (HWC format)
         t1 = time.time()
