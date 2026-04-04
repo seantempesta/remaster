@@ -58,3 +58,6 @@
 [submodule "reference-code/Real-ESRGAN"]
 	path = reference-code/Real-ESRGAN
 	url = https://github.com/xinntao/Real-ESRGAN
+[submodule "reference-code/DRUNet-baseline"]
+	path = reference-code/DRUNet-baseline
+	url = https://github.com/FizzzFizzz/New-baseline-for-DRUNet-under-different-assumptions.git

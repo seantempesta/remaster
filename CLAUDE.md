@@ -134,20 +134,36 @@ A production pipeline for removing compression artifacts from video libraries us
 - Python GIL caps all pipeline architectures at ~5-7 fps (GIL contention between decode/infer/encode threads)
 - VLC plugin: not viable (CPU-only filter API). See `docs/realtime-playback-research.md`
 
-**PlainDenoise / UNetDenoise (2026-04-03):** New INT8-native architecture designed from scratch.
-- **Architecture:** FFDNet-style half-res (PixelUnshuffle) + Conv+BN+ReLU blocks (no LayerNorm, no attention, no GELU). Reparameterizable RepConvBlock (3 branches → single conv at inference).
-- **Benchmarked at 1080p FP16:** UNet nc=64 mid=2 = **32.0 fps** (2.5M params, 968MB VRAM). Plain nc=64 nb=12 = **32.8 fps** (427K). Plain nc=48 nb=10 = **54.2 fps** (197K).
-- **INT8 estimate:** ~2x FP16 → UNet nc=64 mid=2 at **~64 fps**, Plain nc=48 nb=10 at **~108 fps**.
-- **2:4 sparsity:** Additional ~1.3x on Ampere → **~85 fps** with INT8+sparse for UNet nc=64.
-- **Training tricks from reference repos:** EMA (SPAN/BasicSR), XLSR-style small init, intensity scaling aug, beta2=0.9 (NAFNet), PSNRLoss option, QAT support, APEX ASP sparsity.
-- **Files:** `lib/plainnet_arch.py`, `training/train_plainnet.py`, `cloud/modal_train_plainnet.py`, `bench/sweep_plainnet.py`.
-- **Reference repos cloned:** ECBSR, SPAN, XLSR (in `reference-code/`).
+**PlainDenoise / UNetDenoise (2026-04-03):** INT8-native architectures designed from scratch.
+- **Architecture:** Conv+BN+ReLU blocks with RepConvBlock (3-branch train → single conv infer).
+- **PlainDenoise:** Sequential CNN, supports full-res and half-res (PixelUnshuffle) modes.
+- **UNetDenoise:** 2-level U-Net variant. Both are 100% INT8/TRT compatible.
+- **Benchmarks:** UNet nc=64 mid=2 = 32 fps FP16, 67 fps TRT INT8 (2.5M params). Plain nc=64 nb=12 = 33 fps FP16 (417K params).
+- **Quality issue:** Trained from scratch, these models couldn't match the teacher (39.3 dB vs teacher's 49.5 dB). Half-res processing lost too much detail. DISTS perceptual loss was counterproductive (rewarded noise as "texture").
 
-**Next steps:**
-- Train UNet nc=64 mid=2 on Modal H100 (~$13, 25K iters) → evaluate quality
-- If quality OK: QAT fine-tune ($5) → 2:4 sparsity fine-tune ($5) → ONNX export → TRT INT8+sparse
-- If quality insufficient: try UNet nc=48 mid=4 (2.3M, 36 fps) or add perceptual loss
-- Integrate best model into VapourSynth pipeline (remaster/)
+**DRUNet teacher (2026-04-04):** Fine-tuned pretrained DRUNet for HEVC artifact removal.
+- **Architecture:** UNetRes from KAIR — Conv+ReLU residual U-Net, 4 levels, nc=[64,128,256,512], nb=4. 32.6M params. 100% INT8 compatible (no LayerNorm, no attention, no BN).
+- **Pretrained:** Started from `drunet_deblocking_color.pth` (Gaussian denoising). Sliced head conv from in_nc=4 to in_nc=3 (dropped noise level map channel).
+- **Fine-tuned:** 10K iters on SCUNet target pairs, Charbonnier loss, A10G. **53.37 dB PSNR** — better than NAFNet w32_mid4 (49.5 dB). Cost: $0.75. Still improving at 10K (not plateaued).
+- **Checkpoint:** `checkpoints/drunet_teacher/best.pth` (124.5 MB).
+- **Speed:** ~5 fps on RTX 3060 (too slow for real-time, but excellent teacher).
+- **DRUNet student variant:** nc=[16,32,64,128] nb=2 = 1.06M params, **30 fps FP16, 55 fps TRT INT8**. Validated end-to-end with TRT.
+
+**Unified training script** (`training/train.py`):
+- Supports all architectures: `--model nafnet|plain|unet|drunet`
+- Online teacher distillation: `--teacher path --teacher-model type`
+- Prodigy optimizer: `--optimizer prodigy` (parameter-free LR, auto-tunes)
+- EMA, GPU dataset caching, intensity aug, graceful stop, CUDA profiling, sample images, loss curves
+- QAT and 2:4 sparsity flags for future optimization stages
+
+**Key finding:** Input-vs-target PSNR baseline is 40.5 dB — the correction signal is very subtle. Models trained from scratch with too-high LR diverge. DRUNet succeeds because it starts from pretrained denoising weights.
+
+**Next step: Gradual structured pruning** of the DRUNet teacher (32.6M → ~2-4M params).
+- Use `torch-pruning` (pip) — handles UNet skip connections via DepGraph
+- Structured channel pruning physically removes channels → actual speedup on any hardware
+- Target: 75% channel removal over ~35K iters of fine-tuning
+- Then INT8 quantize for additional 2x → expected 40-60+ fps
+- See `docs/pruning-plan.md` for transfer prompt and full plan
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`.
 
