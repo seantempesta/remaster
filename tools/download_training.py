@@ -36,12 +36,24 @@ def list_runs(vol):
     return sorted(runs)
 
 
-def download_run(vol, run_name, local_dir):
+def download_run(vol, run_name, local_dir, force=False):
     """Download all artifacts for a training run."""
     remote_prefix = f"checkpoints/{run_name}"
     os.makedirs(local_dir, exist_ok=True)
 
     downloaded = []
+    skipped = []
+
+    def _should_download(local_path, immutable=False):
+        if force:
+            return True
+        if not os.path.exists(local_path):
+            return True
+        if immutable and os.path.getsize(local_path) > 0:
+            # Immutable files (samples, iter checkpoints) don't change
+            return False
+        # Mutable files (best.pth, latest.pth, logs, curves) always re-download
+        return True
 
     # Core files
     for name in ["best.pth", "final.pth", "latest.pth",
@@ -49,6 +61,10 @@ def download_run(vol, run_name, local_dir):
         remote_path = f"/{remote_prefix}/{name}"
         local_path = os.path.join(local_dir, name)
         try:
+            if not _should_download(local_path):
+                size = os.path.getsize(local_path)
+                skipped.append((name, size))
+                continue
             with open(local_path, "wb") as f:
                 vol.read_file_into_fileobj(remote_path, f)
             size = os.path.getsize(local_path)
@@ -68,13 +84,16 @@ def download_run(vol, run_name, local_dir):
             if not name.endswith(".png"):
                 continue
             local_path = os.path.join(samples_dir, name)
+            if not _should_download(local_path, immutable=True):
+                skipped.append((f"samples/{name}", os.path.getsize(local_path)))
+                continue
             with open(local_path, "wb") as f:
                 vol.read_file_into_fileobj(f"/{remote_prefix}/samples/{name}", f)
             downloaded.append((f"samples/{name}", os.path.getsize(local_path)))
     except Exception:
         pass
 
-    return downloaded
+    return downloaded, skipped
 
 
 def print_summary(local_dir, run_name):
@@ -246,6 +265,8 @@ def main():
                         help="Run name (checkpoint dir on volume). Auto-detects if omitted.")
     parser.add_argument("--list", action="store_true",
                         help="List available runs and exit")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-download all files even if they exist locally")
     args = parser.parse_args()
 
     vol = modal.Volume.from_name(VOL_NAME)
@@ -274,18 +295,21 @@ def main():
     local_dir = os.path.abspath(os.path.join(LOCAL_OUTPUT, run_name))
     print(f"Downloading {run_name} -> {local_dir}")
 
-    files = download_run(vol, run_name, local_dir)
+    files, skipped = download_run(vol, run_name, local_dir, force=args.force)
 
-    if not files:
+    if not files and not skipped:
         print("  No files found for this run.")
         return
 
-    print(f"\nDownloaded {len(files)} files:")
-    for name, size in files:
-        if size > 1024 * 1024:
-            print(f"  {name} ({size/1024**2:.1f} MB)")
-        else:
-            print(f"  {name} ({size/1024:.0f} KB)")
+    if files:
+        print(f"\nDownloaded {len(files)} files:")
+        for name, size in files:
+            if size > 1024 * 1024:
+                print(f"  {name} ({size/1024**2:.1f} MB)")
+            else:
+                print(f"  {name} ({size/1024:.0f} KB)")
+    if skipped:
+        print(f"Skipped {len(skipped)} unchanged files")
 
     print_summary(local_dir, run_name)
     plot_curves(local_dir)
