@@ -39,6 +39,7 @@ image = (
         "psutil",
         "matplotlib",
         "prodigyopt",
+        "wandb",
     )
     .add_local_file("lib/plainnet_arch.py", remote_path="/root/project/lib/plainnet_arch.py")
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
@@ -66,6 +67,7 @@ app = modal.App("remaster-train", image=image)
     volumes={VOL_MOUNT: vol},
     timeout=28800,
     memory=32768,  # 32GB (sufficient without RAM cache, 128GB if caching 2400+ pairs)
+    secrets=[modal.Secret.from_name("wandb-api-key", required_modules=[])],
 )
 def train_remote(
     data_dir: str,
@@ -109,6 +111,11 @@ def train_remote(
     nc_list: str = "16,32,64,128",
     # Feature matching
     feature_matching_weight: float = 0.0,
+    # W&B
+    use_wandb: bool = False,
+    wandb_project: str = "remaster",
+    wandb_entity: str = "",
+    wandb_run_name: str = "",
 ):
     """Run training on a cloud GPU."""
     import sys
@@ -216,6 +223,12 @@ def train_remote(
     # Feature matching
     args.feature_matching_weight = feature_matching_weight
 
+    # W&B — enabled if WANDB_API_KEY is in environment (from Modal Secret)
+    args.wandb = use_wandb and os.environ.get("WANDB_API_KEY", "") != ""
+    args.wandb_project = wandb_project
+    args.wandb_entity = wandb_entity if wandb_entity else None
+    args.wandb_run_name = wandb_run_name if wandb_run_name else None
+
     # Enhancements
     args.ema = ema
     args.ema_decay = ema_decay
@@ -287,6 +300,11 @@ def main(
     nc_list: str = "16,32,64,128",
     # Feature matching
     feature_matching_weight: float = 0.0,
+    # W&B
+    wandb: bool = True,
+    wandb_project: str = "remaster",
+    wandb_entity: str = "",
+    wandb_run_name: str = "",
 ):
     """
     Train denoising models on Modal GPU.
@@ -432,6 +450,10 @@ def main(
         d_coef=d_coef,
         nc_list=nc_list,
         feature_matching_weight=feature_matching_weight,
+        use_wandb=wandb,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_run_name=wandb_run_name,
     )
     print(f"\nTraining complete. Best model at: {result_path}")
 

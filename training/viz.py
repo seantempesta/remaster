@@ -192,7 +192,7 @@ def _compute_psnr(img_a, img_b):
 def save_val_samples(model, val_dir, output_dir, iteration, device,
                      num_samples=3, crop_size=512, teacher_model=None,
                      teacher_needs_noise_map=False, teacher_noise_level=0.0):
-    """Save comparison images: input | teacher | student prediction.
+    """Save comparison images: input | target/teacher | student prediction.
 
     When teacher_model is provided, runs teacher live and measures PSNR for
     both input and student against the teacher output (teacher = reference).
@@ -201,6 +201,11 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
 
     Picks evenly-spaced frames from val set, runs inference, saves a
     side-by-side PNG for each. Uses center crop to match validation eval.
+
+    Returns:
+        List of dicts with keys: fname, input, target, student, inp_psnr,
+        student_psnr, composite. Each value is a uint8 RGB numpy array.
+        Empty list if no samples generated.
     """
     import glob
 
@@ -209,7 +214,7 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
     input_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))
 
     if not input_files:
-        return
+        return []
 
     # Pick evenly spaced frames
     indices = np.linspace(0, len(input_files) - 1, num_samples, dtype=int)
@@ -218,6 +223,7 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
     samples_dir = os.path.join(output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
 
+    results = []
     model.eval()
     with torch.no_grad():
         for inp_path in selected:
@@ -237,7 +243,7 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
                 inp_crop.astype(np.float32).transpose(2, 0, 1) / 255.0
             ).unsqueeze(0).to(device)
 
-            # Get teacher output (live inference or from disk)
+            # Get teacher/target output (live inference or from disk)
             if teacher_model is not None:
                 if teacher_needs_noise_map:
                     noise_map = torch.full(
@@ -247,24 +253,24 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
                     teacher_out = teacher_model(torch.cat([inp_t, noise_map], dim=1)).clamp(0, 1)
                 else:
                     teacher_out = teacher_model(inp_t).clamp(0, 1)
-                teacher_crop = (teacher_out.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                target_crop = (teacher_out.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
             else:
                 tgt_path = os.path.join(target_dir, fname)
                 if not os.path.exists(tgt_path):
                     continue
                 tgt_img = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
                 tgt_rgb = cv2.cvtColor(tgt_img, cv2.COLOR_BGR2RGB)
-                teacher_crop = tgt_rgb[top:top+cs, left:left+cs]
+                target_crop = tgt_rgb[top:top+cs, left:left+cs]
 
             # Student prediction
             out_t = model(inp_t).clamp(0, 1)
             student_crop = (out_t.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
 
-            # PSNR: both measured against teacher (= reference)
-            inp_psnr = _compute_psnr(inp_crop, teacher_crop)
-            student_psnr = _compute_psnr(student_crop, teacher_crop)
+            # PSNR: both measured against target (= reference)
+            inp_psnr = _compute_psnr(inp_crop, target_crop)
+            student_psnr = _compute_psnr(student_crop, target_crop)
 
-            # Composite: input | teacher | student
+            # Composite: input | target | student
             label_h = 32
             panel_w = cs
             canvas_w = panel_w * 3
@@ -272,16 +278,17 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
             canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
 
             canvas[label_h:, 0:panel_w] = inp_crop
-            canvas[label_h:, panel_w:panel_w*2] = teacher_crop
+            canvas[label_h:, panel_w:panel_w*2] = target_crop
             canvas[label_h:, panel_w*2:panel_w*3] = student_crop
 
+            target_label = "Teacher" if teacher_model is not None else "Target"
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.6
             color = (0, 0, 0)
             thickness = 1
             cv2.putText(canvas, f"Input ({inp_psnr:.1f} dB)", (8, 22),
                         font, font_scale, color, thickness, cv2.LINE_AA)
-            cv2.putText(canvas, "Teacher (reference)", (panel_w + 8, 22),
+            cv2.putText(canvas, f"{target_label} (reference)", (panel_w + 8, 22),
                         font, font_scale, color, thickness, cv2.LINE_AA)
             cv2.putText(canvas, f"Student iter {iteration} ({student_psnr:.1f} dB)", (panel_w*2 + 8, 22),
                         font, font_scale, color, thickness, cv2.LINE_AA)
@@ -295,4 +302,15 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
             )
             cv2.imwrite(out_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
+            results.append({
+                "fname": base,
+                "input": inp_crop,
+                "target": target_crop,
+                "student": student_crop,
+                "inp_psnr": inp_psnr,
+                "student_psnr": student_psnr,
+                "composite": canvas,
+            })
+
     model.train()
+    return results

@@ -153,6 +153,7 @@ A production pipeline for removing compression artifacts from video libraries us
 - Supports all architectures: `--model nafnet|plain|unet|drunet`
 - Online teacher distillation: `--teacher path --teacher-model type`
 - Prodigy optimizer: `--optimizer prodigy` (parameter-free LR, auto-tunes)
+- W&B logging: `--wandb` (ON by default on Modal, off locally). Logs all losses, PSNR, LR, side-by-side images, best model artifact
 - EMA, GPU dataset caching, intensity aug, graceful stop, CUDA profiling, sample images, loss curves
 - QAT and 2:4 sparsity flags for future optimization stages
 
@@ -166,6 +167,16 @@ A production pipeline for removing compression artifacts from video libraries us
 - See `docs/pruning-plan.md` for transfer prompt and full plan
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`.
+
+## Weights & Biases (W&B)
+
+Project: `remaster` (entity: `seantempesta`). All training runs log to W&B automatically on Modal.
+
+- **Modal**: ON by default. Uses Modal Secret `wandb-api-key` (WANDB_API_KEY env var). Pass `--no-wandb` to disable.
+- **Local**: OFF by default. Pass `--wandb` flag to enable. Auth stored in `~/_netrc`.
+- **What's logged**: train/val losses (pixel, perceptual, FFT, feature matching), PSNR, LR (+ Prodigy D), training speed, VRAM, data wait %, side-by-side sample images (input | target | student), gradient histograms, best model as artifact.
+- **Run naming**: Auto-generated from architecture, e.g. `drunet-nc16_32_64_128-nb2-distill`. Full config (all args + param count + GPU) saved.
+- **CLI args**: `--wandb-project NAME`, `--wandb-entity ENTITY`, `--wandb-run-name NAME`
 
 ## Critical Gotchas
 

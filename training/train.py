@@ -42,6 +42,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+# W&B — imported lazily (only when --wandb flag is set)
+_wandb = None  # set in train() if enabled
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.nafnet_arch import NAFNet
@@ -700,6 +703,51 @@ def train(args):
     # ---- Training logger + viz ----
     logger = TrainingLogger(os.path.join(ckpt_dir, "training_log.json"))
 
+    # ---- W&B (Weights & Biases) ----
+    global _wandb
+    use_wandb = getattr(args, 'wandb', False)
+    if use_wandb:
+        import wandb as _wandb
+
+        # Build a descriptive run name if not provided
+        wandb_name = getattr(args, 'wandb_run_name', None)
+        if not wandb_name:
+            model_tag = getattr(args, 'model', 'nafnet')
+            if model_tag == 'drunet':
+                nc_str = getattr(args, 'nc_list', '16,32,64,128')
+                nb_val = getattr(args, 'nb', 2)
+                wandb_name = f"drunet-nc{nc_str.replace(',','_')}-nb{nb_val}"
+            elif model_tag == 'nafnet':
+                wandb_name = f"nafnet-w{args.width}-mid{args.middle_blk_num}"
+            else:
+                wandb_name = f"{model_tag}-nc{getattr(args, 'nc', 64)}"
+            if use_teacher:
+                wandb_name += "-distill"
+
+        # Collect config — everything useful for comparing runs
+        wandb_config = {k: v for k, v in vars(args).items() if not callable(v)}
+        wandb_config["model_params"] = sum(p.numel() for p in model.parameters())
+        wandb_config["model_desc"] = model_desc
+        if device.type == "cuda":
+            wandb_config["gpu"] = torch.cuda.get_device_name()
+
+        wandb_project = getattr(args, 'wandb_project', 'remaster')
+        wandb_entity = getattr(args, 'wandb_entity', None)
+
+        _wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_name,
+            config=wandb_config,
+            dir=ckpt_dir,
+            resume="allow",
+        )
+        # Track gradients and model topology
+        _wandb.watch(model, log="gradients", log_freq=args.val_freq)
+        print(f"W&B: {_wandb.run.url}")
+    else:
+        _wandb = None
+
     # ---- AMP (mixed precision) ----
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -1042,6 +1090,26 @@ def train(args):
                 lr=lr_now,
             )
 
+            # W&B train metrics
+            if _wandb is not None:
+                wb_log = {
+                    "train/loss": avg_loss,
+                    "train/pixel_loss": avg_px,
+                    "train/lr": lr_now,
+                    "train/iter_per_sec": iters_per_sec,
+                    "train/data_wait_pct": data_pct,
+                    "train/vram_gb": vram,
+                }
+                if percep_count > 0:
+                    wb_log["train/perceptual_loss"] = percep_loss_sum / percep_count
+                if fft_count > 0:
+                    wb_log["train/fft_loss"] = fft_loss_sum / fft_count
+                if feat_count > 0:
+                    wb_log["train/feature_loss"] = feat_loss_sum / feat_count
+                if d_now is not None:
+                    wb_log["train/prodigy_d"] = d_now
+                _wandb.log(wb_log, step=iteration + 1)
+
             profile_str = ""
             if do_profile:
                 torch.cuda.synchronize()
@@ -1134,11 +1202,48 @@ def train(args):
                   f"[{best_str}]")
 
             # Save sample comparison images
-            save_val_samples(val_model, val_dir, ckpt_dir, iteration + 1,
-                           device, num_samples=3, crop_size=512,
-                           teacher_model=teacher_model,
-                           teacher_needs_noise_map=teacher_needs_noise_map,
-                           teacher_noise_level=teacher_noise_level)
+            samples = save_val_samples(
+                val_model, val_dir, ckpt_dir, iteration + 1,
+                device, num_samples=3, crop_size=512,
+                teacher_model=teacher_model,
+                teacher_needs_noise_map=teacher_needs_noise_map,
+                teacher_noise_level=teacher_noise_level,
+            )
+
+            # W&B validation metrics + images
+            if _wandb is not None:
+                wb_val = {
+                    "val/psnr": psnr,
+                    "val/best_psnr": best_psnr,
+                }
+                if "pixel_loss" in val:
+                    wb_val["val/pixel_loss"] = val["pixel_loss"]
+                if "percep_loss" in val:
+                    wb_val["val/perceptual_loss"] = val["percep_loss"]
+                if "fft_loss" in val:
+                    wb_val["val/fft_loss"] = val["fft_loss"]
+                if val_loss is not None:
+                    wb_val["val/combined_loss"] = val_loss
+                    if best_val_loss is not None:
+                        wb_val["val/best_loss"] = best_val_loss
+
+                # Log side-by-side sample images
+                if samples:
+                    for i, s in enumerate(samples):
+                        # Composite (input | target | student) with labels
+                        wb_val[f"samples/{s['fname']}"] = _wandb.Image(
+                            s["composite"],
+                            caption=f"Input {s['inp_psnr']:.1f}dB | Target | Student {s['student_psnr']:.1f}dB",
+                        )
+                        # Individual panels for W&B image comparison slider
+                        wb_val[f"compare/input_{s['fname']}"] = _wandb.Image(
+                            s["input"], caption=f"Input ({s['inp_psnr']:.1f} dB)")
+                        wb_val[f"compare/target_{s['fname']}"] = _wandb.Image(
+                            s["target"], caption="Target (reference)")
+                        wb_val[f"compare/student_{s['fname']}"] = _wandb.Image(
+                            s["student"], caption=f"Student ({s['student_psnr']:.1f} dB)")
+
+                _wandb.log(wb_val, step=iteration + 1)
 
             # Update loss curves chart
             try:
@@ -1186,6 +1291,21 @@ def train(args):
     best_ckpt = os.path.join(ckpt_dir, "best.pth")
     if os.path.exists(best_ckpt):
         print(f"Best model: {best_ckpt}")
+
+    # W&B: log best model as artifact and finish
+    if _wandb is not None:
+        _wandb.summary["best_psnr"] = best_psnr
+        if best_val_loss is not None:
+            _wandb.summary["best_val_loss"] = best_val_loss
+        if os.path.exists(best_ckpt):
+            artifact = _wandb.Artifact(
+                name=f"best-model-{_wandb.run.name}",
+                type="model",
+                description=f"Best checkpoint (PSNR={best_psnr:.2f} dB)",
+            )
+            artifact.add_file(best_ckpt, name="best.pth")
+            _wandb.log_artifact(artifact)
+        _wandb.finish()
 
 
 def parse_args():
@@ -1351,6 +1471,19 @@ def parse_args():
 
     # Device
     parser.add_argument("--device", type=str, default="cuda")
+
+    # W&B (Weights & Biases)
+    parser.add_argument("--wandb", action="store_true", default=False,
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="remaster",
+                        help="W&B project name (default: remaster)")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="W&B entity/team (default: your default entity)")
+    parser.add_argument("--wandb-run-name", type=str, default=None,
+                        dest="wandb_run_name",
+                        help="W&B run name (auto-generated if omitted)")
+    parser.add_argument("--cache-in-ram", action="store_true", default=False,
+                        help="Cache dataset in RAM (eliminates disk I/O)")
 
     return parser.parse_args()
 
