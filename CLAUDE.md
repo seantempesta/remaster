@@ -159,14 +159,39 @@ A production pipeline for removing compression artifacts from video libraries us
 
 **Key finding:** Input-vs-target PSNR baseline is 40.5 dB — the correction signal is very subtle. Models trained from scratch with too-high LR diverge. DRUNet succeeds because it starts from pretrained denoising weights.
 
-**Next step: Gradual structured pruning** of the DRUNet teacher (32.6M → ~2-4M params).
-- Use `torch-pruning` (pip) — handles UNet skip connections via DepGraph
-- Structured channel pruning physically removes channels → actual speedup on any hardware
-- Target: 75% channel removal over ~35K iters of fine-tuning
-- Then INT8 quantize for additional 2x → expected 40-60+ fps
-- See `docs/pruning-plan.md` for transfer prompt and full plan
+**Feature matching distillation (2026-04-04):** Student learns from teacher's internal encoder features, not just output.
+- FeatureMatchingLoss: 1x1 adapter convs per UNet level, L1 loss in fp32
+- Student v1 (HEVC-only teacher): 49.12 dB in 9K iters
+- Student v2 (teacher v2, mixed data): 49.19 dB in 3.9K iters (2.3x faster convergence)
 
-**Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`.
+**Mixed training data (2026-04-04):** HEVC artifact removal + synthetic edge-aware blur recovery.
+- Edge-aware degradation: Sobel-weighted spatially-varying Gaussian blur (sigma 2-8)
+- Sharp areas blurred, soft areas (bokeh, backgrounds) untouched
+- **Key finding:** Model generalizes beyond training — denoises AND sharpens, output exceeds Bluray source quality
+- Sources: Firefly (HEVC), Expanse, One Piece, Dune 2, Squid Game, Foundation
+- See `docs/training-data-plan.md` for full sampling plan
+
+**Teacher v2 (2026-04-04):** DRUNet 32.6M, mixed data, Prodigy optimizer, DISTS perceptual loss.
+- 53.27 dB PSNR at iter 4K with DISTS (matching previous 53.28 dB without DISTS at iter 14K)
+- DISTS provides gradient signal on structure/texture that pixel loss misses at high PSNR
+- Prodigy auto-tunes learning rate, d growing from 1e-6 to 7e-6 (still climbing)
+- Training on L40S ($1.95/hr, 48GB VRAM), batch 64, 64GB RAM cache
+
+**Training infrastructure (2026-04-04):**
+- `cloud/modal_train.py`: unified wrapper, W&B logging, L40S default, --fresh-optimizer flag
+- `tools/download_training.py`: sync training artifacts from Modal, skip unchanged files
+- `tools/extract_synthetic_pairs.py`: edge-aware degradation from any video source
+- `tools/stop_training.py`: graceful stop via Modal Dict
+- Output at `output/training/<run_name>/` and `output/val_*/ for comparisons
+
+**Next steps:**
+1. Expand synthetic data: One Piece, Dune 2, Squid Game, Foundation (3600+ total pairs)
+2. 10% validation split across all sources
+3. Continue teacher v2 training with DISTS until plateau
+4. Retrain student v2 with improved teacher
+5. Eventually: structured pruning or distillation for 30+ fps deployment
+
+**Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`, `docs/training-data-plan.md`, `docs/pruning-plan.md`.
 
 ## Weights & Biases (W&B)
 
@@ -215,6 +240,27 @@ Project: `remaster` (entity: `seantempesta`). All training runs log to W&B autom
 ## Modal Development Guidelines
 
 Full docs: modal.com/docs — markdown for LLMs: modal.com/llms-full.txt — examples: modal.com/docs/examples (github.com/modal-labs/modal-examples)
+
+### GPU Options & Pricing (2026-04-04)
+
+| GPU | VRAM | FP16 TFLOPS | Mem BW (TB/s) | $/hr | TFLOPS/$ | Best for |
+|-----|------|-------------|---------------|------|----------|----------|
+| T4 | 16 GB | 65 | 0.32 | $0.59 | 110 | Debug only |
+| L4 | 24 GB | 121 | 0.30 | $0.80 | 151 | Cheap tests |
+| A10G | 24 GB | 125 | 0.60 | $1.10 | 114 | Quick jobs, ONNX export |
+| **L40S** | **48 GB** | **366** | **0.86** | **$1.95** | **188** | **Best value for training** |
+| A100-40 | 40 GB HBM2e | 312 | 1.56 | $2.10 | 149 | Large batch, bandwidth-heavy |
+| A100-80 | 80 GB HBM2e | 312 | 2.04 | $2.50 | 125 | Very large models |
+| H100 | 80 GB HBM3 | 990 | 3.35 | $3.95 | 251 | Fast production training |
+| H200 | 141 GB HBM3e | 990 | 4.80 | $4.54 | 218 | Auto-upgrade from H100 |
+| **B200** | **192 GB HBM3e** | **2,250** | **8.00** | **$6.25** | **360** | **Fastest, best perf/$** |
+
+**Recommendations for this project:**
+- **L40S ($1.95/hr):** 3x A10G compute for <2x price. 48GB VRAM fits dataset in GPU cache. Best budget training option.
+- **B200 ($6.25/hr):** 2.3x H100 compute at 1.6x price. A 3.2hr H100 run (~$13) takes ~1.4hr on B200 (~$8.75) — cheaper AND faster.
+- **H100 ($3.95/hr):** Still solid, may auto-upgrade to H200. Use `"H100!"` to prevent upgrade.
+- **A10G ($1.10/hr):** Fine for debug/export, not cost-efficient for real training.
+- Billed per-second, no minimum. CPU: $0.047/core/hr, RAM: $0.008/GiB/hr. No egress fees.
 
 ### Style & Conventions
 - Always `import modal` and use qualified names: `modal.App()`, `modal.Image.debian_slim()`, etc.
