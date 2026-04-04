@@ -1,26 +1,36 @@
-# Remaster — Video Enhancement Pipeline
+# Remaster -- Video Enhancement Pipeline
 
 ## What This Is
-A production pipeline for removing compression artifacts from video libraries using trained ML models. Supports real-time playback and batch processing.
+A video remastering pipeline that removes compression artifacts AND recovers detail from video content. Uses a DRUNet teacher-student distillation approach: a large teacher model learns to enhance video, then a small student model learns to replicate it at real-time speeds.
 
-### Key Results
-| Metric | Value | Details |
-|--------|-------|---------|
-| Model inference | **5.5 fps** @ 1080p | NAFNet w32_mid4, 14.3M params, torch.compile, RTX 3060 (180ms/frame, CUDA event timed) |
-| End-to-end pipeline | **5.2 fps** @ 1080p | Decode + inference + HEVC encode (inference-bound, not GIL-bound) |
-| Model VRAM | **3.3 GB** | fp16, batch 1, with torch.compile CUDA graphs |
-| Model size | **55 MB** | Checkpoint (params only) |
-| Training speed | **2.2 it/s** | H100, bs=32, RAM cache, VGG perceptual loss every iter |
-| Training cost | **~$13** | 25K iters on H100 (~3.2 hrs) |
-| Quality (w32_mid4) | **49.50 dB** PSNR | vs SCUNet GAN+detail teacher targets on held-out val |
-| Quality (w64) | **56.82 dB** PSNR | 40K iters, same teacher targets |
-| Speedup vs teacher | **11x** | SCUNet teacher: ~0.5 fps; NAFNet w32_mid4: 5.5 fps |
+### Current Models
+| Model | Params | PSNR | Speed (RTX 3060) | Checkpoint |
+|-------|--------|------|-------------------|------------|
+| **DRUNet Teacher** | 32.6M | 53.27 dB | ~5 fps | `checkpoints/drunet_teacher/best.pth` (125MB) |
+| **DRUNet Student** | 1.06M | 49.19 dB | 30 fps FP16, 55 fps TRT INT8 | `checkpoints/drunet_student/best.pth` (4MB) |
+
+Both are DRUNet (UNetRes from KAIR, MIT license). Same architecture, different sizes:
+- Teacher: nc=[64,128,256,512] nb=4 -- quality ceiling
+- Student: nc=[16,32,64,128] nb=2 -- deployment target
+
+### Checkpoint Format
+`best.pth` contains `{"params": state_dict, "iteration": int, "psnr": float}`.
+Always the latest validated model (not necessarily highest PSNR -- metrics aren't
+comparable across runs with different loss configs). Check `iteration` and `psnr`
+to know what you're loading.
+
+`latest.pth` contains full training state (model + optimizer + scheduler + EMA + adapters).
+Only on Modal volume, not synced locally unless explicitly downloaded.
+
+### Key Finding
+Mixed training data (HEVC artifact removal + synthetic edge-aware blur) produces a model
+that generalizes beyond its training tasks -- it denoises AND sharpens, often exceeding
+the quality of the original Bluray source material.
 
 ## Goals
 - Denoise/enhance 1080p video content using learned models
 - Process full episodes in reasonable time on consumer hardware (RTX 3060 6GB)
-- Compare different approaches: per-frame denoisers, temporal fusion, diffusion models
-- Eventually train a custom fast model via distillation
+- Train via distillation: large teacher -> small real-time student
 
 ## Architecture
 - **Local inference** runs on Windows with conda env `upscale` (Python 3.10, PyTorch 2.11.0+cu126)
@@ -36,35 +46,40 @@ A production pipeline for removing compression artifacts from video libraries us
 - xformers is unreliable on Windows — use native `F.scaled_dot_product_attention` instead
 
 ## Directory Structure
-- `lib/` — shared importable code: paths, ffmpeg utils, metrics, NAFNet architecture, PlainDenoise architecture
-- `pipelines/` — production streaming denoisers (SCUNet batch, NAFNet, episode)
-- `experiments/` — one-off experiments and older approaches
-- `training/` — unified training (train.py, losses.py, dataset.py, viz.py)
-- `cloud/` — Modal remote GPU execution scripts
-- `bench/` — benchmarking and quality comparison
-- `tools/` — small utilities (clip extraction, probing, MP4 repair)
-- `playback/` — mpv + VapourSynth + vs-mlrt real-time playback (enhance.vpy, README)
-- `remaster/` — production VapourSynth pipeline scripts (encode.vpy, play.vpy, encode.py)
-- `docs/` — documentation (setup, architecture, experiment log, approach comparison)
+- `training/` — unified training script, losses, dataset, visualization
+- `cloud/` — Modal cloud training wrapper (`modal_train.py`)
+- `tools/` — utilities: data extraction, training sync, stop signal, frame probing
+- `lib/` — shared code: paths, ffmpeg utils, architecture definitions
+- `checkpoints/` — active model weights (teacher + student)
+- `checkpoints/_archive/` — old models (NAFNet, PlainNet, v1 DRUNet)
+- `output/` — training artifacts synced from Modal, local validation images
+- `data/` — symlink to E:/upscale-data/ (training pairs, synthetic pairs, clips)
+- `remaster/` — production VapourSynth pipeline (encode, playback)
+- `playback/` — mpv + vs-mlrt real-time playback
+- `pipelines/` — older Python streaming pipelines (archive)
+- `bench/` — benchmarking scripts
+- `docs/` — documentation, plans, research notes
 
 ## Key Scripts
-- `pipelines/denoise_batch.py` — main pipeline: batched SCUNet with threaded IO
-- `pipelines/denoise_nafnet.py` — NAFNet pipeline (configurable arch, torch.compile, NVENC)
-- `pipelines/denoise_gpu.py` — zero-copy GPU pipeline (PyNvVideoCodec NVDEC/NVENC, original, 5.4 fps)
-- `pipelines/denoise_gpu_v2.py` — CUDA streams + ring buffers + stream-isolated NVDEC/NVENC (6.8 fps, GIL-limited)
-- `pipelines/denoise_gpu_v3.py` — NVDEC decode + ffmpeg pipe encode (5.0 fps, GPU→CPU sync bottleneck)
-- `pipelines/denoise_fast.py` — pipe-based pipeline (ffmpeg NVDEC/NVENC via stdin/stdout, 3.5 fps)
-- `pipelines/denoise_episode.py` — original episode denoiser (simpler, single-frame)
-- `training/train.py` — unified training: all architectures, distillation, feature matching, Prodigy optimizer
-- `training/losses.py` — Loss functions: Charbonnier, DISTS perceptual, Focal Frequency, Feature Matching
-- `training/dataset.py` — PairedFrameDataset with optional RAM cache
-- `training/viz.py` — Training visualization: sample images + loss curves
-- `tools/download_training.py` — Download training artifacts from Modal (samples, curves, checkpoints)
-- `tools/stop_training.py` — Send graceful stop signal to Modal training via Dict
-- `tools/verify_arch_configs.py` — Verify weight loading for different NAFNet architectures
-- `cloud/modal_export_onnx_w32.py` — Export NAFNet w32_mid4 to ONNX on Modal
-- `cloud/modal_train.py` — Modal cloud training wrapper (all architectures, all features)
-- `playback/enhance.vpy` — VapourSynth script for real-time mpv playback via vs-mlrt TensorRT
+
+### Training
+- `training/train.py` — unified training: DRUNet distillation, feature matching, Prodigy optimizer, DISTS
+- `training/losses.py` — Charbonnier, DISTS perceptual, Focal Frequency, Feature Matching
+- `training/dataset.py` — PairedFrameDataset, InputOnlyDataset, GPUCachedDataset
+- `training/viz.py` — sample images + loss curves (used during training on Modal)
+- `cloud/modal_train.py` — Modal cloud training wrapper (L40S default, W&B logging)
+
+### Tools
+- `tools/extract_synthetic_pairs.py` — edge-aware degradation from any video source
+- `tools/download_training.py` — sync training artifacts from Modal to local
+- `tools/stop_training.py` — graceful stop via Modal Dict
+- `tools/extract_random_frames.py` — extract frames from video for training data
+
+### Deployment
+- `remaster/encode.vpy` — VapourSynth batch encoding (BestSource + vs-mlrt TRT + y4m)
+- `remaster/encode.py` — CLI wrapper: vspipe + ffmpeg NVENC with audio passthrough
+- `remaster/play.vpy` — VapourSynth real-time playback for mpv
+- `playback/enhance.vpy` — mpv + vs-mlrt TensorRT real-time playback
 - `remaster/encode.vpy` — VapourSynth batch encoding script (BestSource → vs-mlrt TRT → y4m)
 - `remaster/encode.py` — CLI wrapper: vspipe + ffmpeg NVENC encoding with audio passthrough
 - `remaster/play.vpy` — VapourSynth real-time playback script for mpv
@@ -92,104 +107,44 @@ A production pipeline for removing compression artifacts from video libraries us
 ## Data Directory
 `data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Contains video clips, extracted frames, model outputs. Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.
 
-## Current Status (2026-04-02)
+## Current Status (2026-04-04)
 
-**VapourSynth pipeline:** Installed and tested end-to-end (VS R73 + vs-mlrt TRT 10.16 + BestSource). **TensorRT is NOT viable for this model** — runs at 4-6 fps vs 78 fps torch.compile, even with torch_tensorrt (no ONNX). Confirmed on Modal A10 (24 GB): torch_tensorrt=6.6 fps, Inductor=10.7 fps. TRT's kernel library cannot fuse NAFNet's DWConv+SimpleGate+SCA+LayerNorm chains like Inductor does. Need GIL-bypass strategy that keeps torch.compile. Downstream components (NVENC p4=202 fps, y4m pipe=761 fps) have massive headroom.
+### Architecture
+- **DRUNet** (UNetRes from KAIR, MIT license): Conv+ReLU residual U-Net, 4 levels, no BN/LayerNorm/attention
+- 100% INT8/TRT compatible. Pretrained from `drunet_deblocking_color.pth` (Gaussian denoising)
+- Student validated at 30 fps FP16, 55 fps TRT INT8 on RTX 3060
 
-**CORRECTION (2026-04-03):** The "78 fps" claim was **wrong**. CUDA event timing shows the model actually runs at **5.5 fps (180ms/frame)** on RTX 3060. The 78 fps was a misinterpretation of pipeline timing that summed non-overlapping component times instead of measuring actual throughput. TRT at 4.3 fps is only 1.3x slower than torch.compile, not 18x. The pipeline is **inference-bound**, not GIL-bound. To reach 30+ fps for real-time playback, we need a faster/smaller model architecture. See `docs/architecture-investigation.md` and `bench/sweep_architectures.py`.
+### Training Approach
+- **Teacher-student distillation** with feature matching (1x1 adapter convs align encoder features)
+- **Mixed training data**: HEVC artifact removal (Firefly) + synthetic edge-aware blur (Expanse, One Piece, Dune 2, Squid Game, Foundation)
+- **Edge-aware degradation**: Sobel-weighted spatially-varying Gaussian blur -- sharp areas blurred, soft areas untouched
+- **Losses**: Charbonnier pixel + DISTS perceptual (teacher), Charbonnier + feature matching (student)
+- **Optimizer**: Prodigy (auto-tuned LR, safeguard_warmup, bias_correction)
+- **Cloud**: Modal L40S ($1.95/hr, 48GB VRAM), W&B logging, 64GB RAM cache
+- See `docs/training-data-plan.md` for data sources and sampling plan
 
-**Cloud inference:** NAFNet width64 at **27.9 fps on H100** via `cloud/modal_denoise.py`. ~$2.40/episode. Modal on PyTorch 2.11.0+cu126.
+### Training Commands
+```bash
+# Resume teacher
+modal run cloud/modal_train.py --arch drunet --nc-list 64,128,256,512 --nb 4 \
+    --checkpoint-dir checkpoints/drunet_teacher --data-dir data/mixed_pairs \
+    --optimizer prodigy --perceptual-weight 0.05 --batch-size 64 \
+    --ema --wandb --resume
 
-**Local inference (w64):** **1.94 fps** with torch.compile on RTX 3060. TensorRT FP16: 1.92 fps, 96MB VRAM.
+# Resume student (with teacher as online distillation target)
+modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
+    --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \
+    --checkpoint-dir checkpoints/drunet_student --data-dir data/mixed_pairs \
+    --feature-matching-weight 0.1 --optimizer prodigy --batch-size 192 \
+    --ema --wandb --resume
+```
 
-**Local inference (w32_mid4):** Raw model: **78 fps** (13ms/frame). Best Python pipeline: **6.8 fps** (`denoise_gpu_v2.py` with CUDA stream isolation). **Python's GIL is the ceiling** — three pipeline threads serialize on the GIL regardless of CUDA stream separation. See `docs/realtime-playback-research.md` for full analysis. Reaching 40+ fps requires a C++ pipeline (TensorRT + Video Codec SDK, or vs-mlrt).
-
-**ONNX exports:** w64 at `checkpoints/nafnet_distill/nafnet_w64_1088x1920.onnx`. w32_mid4 at `checkpoints/nafnet_w32_mid4/nafnet_w32mid4_1088x1920.onnx` (57MB, opset 18, validated). Exported via `cloud/modal_export_onnx_w32.py`.
-
-**Completed training runs:**
-- **w64 GAN+detail (40K iters, A100):** Best PSNR 56.82 dB. Checkpoint at `checkpoints/nafnet_distill/nafnet_best.pth` (464MB). Final loss 0.055.
-- **w32_mid4 VGG (25K iters, H100):** Best PSNR 49.50 dB, best total loss 0.0629 at iter 11K. Checkpoint at `checkpoints/nafnet_w32_mid4/nafnet_best.pth` (55MB).
-- **w32_mid4 DISTS+FFT:** In progress from VGG weights at `checkpoints/nafnet_w32_mid4_dists/`.
-
-**Training infrastructure improvements:**
-- Configurable architecture (--width, --middle-blk-num) with strict=False weight surgery
-- RAM cache eliminates DataLoader bottleneck (64% → 25% data wait, 0.7 → 2.2 it/s)
-- CUDA event profiling (fwd/vgg/bwd/opt breakdown per iteration)
-- Graceful shutdown: SIGINT handler + Modal Dict stop signal (`tools/stop_training.py`)
-- Best model selection by total loss (pixel + perceptual), not PSNR-only
-- Fused AdamW, non_blocking transfers, cuDNN benchmark warmup with cleanup
-
-**Quality:** GAN+detail targets produce sharper output than PSNR-only teacher. Detail transfer adds real texture from original frames (zero hallucination). Best alpha = 0.15. Concern: alpha=0.15 may transfer too much compression noise — consider lower alpha or GAN-only targets.
-
-**Test clips in data/:**
-- `clip_mid_1080p.mp4` — original source (24s, 720 frames)
-- `clip_mid_1080p_nafnet_psnr.mkv` — w64 PSNR-only distillation (old)
-- `clip_mid_1080p_nafnet_gan_best.mkv` — w64 GAN+detail, best PSNR checkpoint
-- `clip_mid_1080p_nafnet_gan_final.mkv` — w64 GAN+detail, final 40K iter checkpoint
-- `clip_mid_1080p_nafnet_w32mid4.mkv` — w32_mid4 with torch.compile (5.2 fps)
-
-**Pipeline findings (2026-04-02):**
-- PyNvVideoCodec accepts `cuda_stream=` (decoder) and `cudastream=` (encoder) for stream isolation
-- torch.compile `reduce-overhead` CUDA graphs replay on **default stream** regardless of `torch.cuda.stream()` context — events must be recorded on `torch.cuda.default_stream()`
-- Python GIL caps all pipeline architectures at ~5-7 fps (GIL contention between decode/infer/encode threads)
-- VLC plugin: not viable (CPU-only filter API). See `docs/realtime-playback-research.md`
-
-**PlainDenoise / UNetDenoise (2026-04-03):** INT8-native architectures designed from scratch.
-- **Architecture:** Conv+BN+ReLU blocks with RepConvBlock (3-branch train → single conv infer).
-- **PlainDenoise:** Sequential CNN, supports full-res and half-res (PixelUnshuffle) modes.
-- **UNetDenoise:** 2-level U-Net variant. Both are 100% INT8/TRT compatible.
-- **Benchmarks:** UNet nc=64 mid=2 = 32 fps FP16, 67 fps TRT INT8 (2.5M params). Plain nc=64 nb=12 = 33 fps FP16 (417K params).
-- **Quality issue:** Trained from scratch, these models couldn't match the teacher (39.3 dB vs teacher's 49.5 dB). Half-res processing lost too much detail. DISTS perceptual loss was counterproductive (rewarded noise as "texture").
-
-**DRUNet teacher (2026-04-04):** Fine-tuned pretrained DRUNet for HEVC artifact removal.
-- **Architecture:** UNetRes from KAIR — Conv+ReLU residual U-Net, 4 levels, nc=[64,128,256,512], nb=4. 32.6M params. 100% INT8 compatible (no LayerNorm, no attention, no BN).
-- **Pretrained:** Started from `drunet_deblocking_color.pth` (Gaussian denoising). Sliced head conv from in_nc=4 to in_nc=3 (dropped noise level map channel).
-- **Fine-tuned:** 10K iters on SCUNet target pairs, Charbonnier loss, A10G. **53.37 dB PSNR** — better than NAFNet w32_mid4 (49.5 dB). Cost: $0.75. Still improving at 10K (not plateaued).
-- **Checkpoint:** `checkpoints/drunet_teacher/best.pth` (124.5 MB).
-- **Speed:** ~5 fps on RTX 3060 (too slow for real-time, but excellent teacher).
-- **DRUNet student variant:** nc=[16,32,64,128] nb=2 = 1.06M params, **30 fps FP16, 55 fps TRT INT8**. Validated end-to-end with TRT.
-
-**Unified training script** (`training/train.py`):
-- Supports all architectures: `--model nafnet|plain|unet|drunet`
-- Online teacher distillation: `--teacher path --teacher-model type`
-- Prodigy optimizer: `--optimizer prodigy` (parameter-free LR, auto-tunes)
-- W&B logging: `--wandb` (ON by default on Modal, off locally). Logs all losses, PSNR, LR, side-by-side images, best model artifact
-- EMA, GPU dataset caching, intensity aug, graceful stop, CUDA profiling, sample images, loss curves
-- QAT and 2:4 sparsity flags for future optimization stages
-
-**Key finding:** Input-vs-target PSNR baseline is 40.5 dB — the correction signal is very subtle. Models trained from scratch with too-high LR diverge. DRUNet succeeds because it starts from pretrained denoising weights.
-
-**Feature matching distillation (2026-04-04):** Student learns from teacher's internal encoder features, not just output.
-- FeatureMatchingLoss: 1x1 adapter convs per UNet level, L1 loss in fp32
-- Student v1 (HEVC-only teacher): 49.12 dB in 9K iters
-- Student v2 (teacher v2, mixed data): 49.19 dB in 3.9K iters (2.3x faster convergence)
-
-**Mixed training data (2026-04-04):** HEVC artifact removal + synthetic edge-aware blur recovery.
-- Edge-aware degradation: Sobel-weighted spatially-varying Gaussian blur (sigma 2-8)
-- Sharp areas blurred, soft areas (bokeh, backgrounds) untouched
-- **Key finding:** Model generalizes beyond training — denoises AND sharpens, output exceeds Bluray source quality
-- Sources: Firefly (HEVC), Expanse, One Piece, Dune 2, Squid Game, Foundation
-- See `docs/training-data-plan.md` for full sampling plan
-
-**Teacher v2 (2026-04-04):** DRUNet 32.6M, mixed data, Prodigy optimizer, DISTS perceptual loss.
-- 53.27 dB PSNR at iter 4K with DISTS (matching previous 53.28 dB without DISTS at iter 14K)
-- DISTS provides gradient signal on structure/texture that pixel loss misses at high PSNR
-- Prodigy auto-tunes learning rate, d growing from 1e-6 to 7e-6 (still climbing)
-- Training on L40S ($1.95/hr, 48GB VRAM), batch 64, 64GB RAM cache
-
-**Training infrastructure (2026-04-04):**
-- `cloud/modal_train.py`: unified wrapper, W&B logging, L40S default, --fresh-optimizer flag
-- `tools/download_training.py`: sync training artifacts from Modal, skip unchanged files
-- `tools/extract_synthetic_pairs.py`: edge-aware degradation from any video source
-- `tools/stop_training.py`: graceful stop via Modal Dict
-- Output at `output/training/<run_name>/` and `output/val_*/ for comparisons
-
-**Next steps:**
-1. Expand synthetic data: One Piece, Dune 2, Squid Game, Foundation (3600+ total pairs)
+### Next Steps
+1. Expand synthetic data: One Piece, Dune 2, Squid Game, Foundation (~3600 total pairs)
 2. 10% validation split across all sources
-3. Continue teacher v2 training with DISTS until plateau
-4. Retrain student v2 with improved teacher
-5. Eventually: structured pruning or distillation for 30+ fps deployment
+3. Continue teacher training with DISTS until plateau
+4. Retrain student with improved teacher
+5. Deploy: ONNX export, TensorRT INT8, vs-mlrt integration
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`, `docs/training-data-plan.md`, `docs/pruning-plan.md`.
 
