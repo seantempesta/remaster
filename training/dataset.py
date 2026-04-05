@@ -61,23 +61,29 @@ class PairedFrameDataset(Dataset):
               f"augment={augment}, cached={cache_in_ram}")
 
     def _load_all_into_ram(self):
-        """Pre-load all images as uint8 numpy arrays using chunked parallel I/O.
+        """Pre-load random crops into RAM instead of full images.
 
-        Loads in batches of CHUNK_SIZE pairs to bound peak transient memory
-        from parallel PNG decoding. Submitting all futures at once causes
-        glibc allocator fragmentation and stalls around 20GB.
+        Caches CROPS_PER_IMAGE random crops per pair as uint8 numpy arrays.
+        At 256x256x3, each crop pair is ~400KB vs ~12MB for full 1080p.
+        Crops are refreshed every epoch via refresh_cache().
+
+        Memory: 6K pairs x 4 crops x 400KB = ~10GB (vs ~80GB for full images).
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import psutil
 
         n = len(self.pairs)
+        self._crops_per_image = 4
         CHUNK_SIZE = 200
         n_workers = min(8, os.cpu_count() or 4)
-        print(f"  Caching {n} pairs into RAM "
-              f"(chunks of {CHUNK_SIZE}, {n_workers} workers)...")
+        total_crops = n * self._crops_per_image
+        print(f"  Caching {n} pairs x {self._crops_per_image} crops = "
+              f"{total_crops} crop pairs into RAM...")
         t0 = time.time()
 
-        def _load_pair(idx):
+        cs = self.crop_size
+
+        def _load_crops(idx):
             inp_path, tgt_path = self.pairs[idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
@@ -87,47 +93,65 @@ class PairedFrameDataset(Dataset):
                 raise IOError(f"Failed to read {tgt_path}")
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
-            return idx, inp, tgt
+            h, w = inp.shape[:2]
 
-        # Pre-allocate list
-        self.cached_images = [None] * n
+            crops = []
+            for _ in range(self._crops_per_image):
+                top = random.randint(0, h - cs)
+                left = random.randint(0, w - cs)
+                crops.append((
+                    inp[top:top + cs, left:left + cs].copy(),
+                    tgt[top:top + cs, left:left + cs].copy(),
+                ))
+            return idx, crops
+
+        self.cached_images = [None] * total_crops
         loaded = 0
 
-        # Process in chunks to bound peak transient memory
         for chunk_start in range(0, n, CHUNK_SIZE):
             chunk_end = min(chunk_start + CHUNK_SIZE, n)
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_load_pair, i): i
+                futures = {pool.submit(_load_crops, i): i
                            for i in range(chunk_start, chunk_end)}
                 for fut in as_completed(futures):
-                    idx, inp, tgt = fut.result()
-                    self.cached_images[idx] = (inp, tgt)
+                    idx, crops = fut.result()
+                    for c, (ic, tc) in enumerate(crops):
+                        self.cached_images[idx * self._crops_per_image + c] = (ic, tc)
                     loaded += 1
-            # Futures and pool are fully cleaned up here before next chunk
             if loaded % 200 == 0 or chunk_end == n:
                 mb = psutil.Process().memory_info().rss / 1024**2
                 elapsed = time.time() - t0
                 rate = loaded / elapsed if elapsed > 0 else 0
-                print(f"    {loaded}/{n} loaded ({rate:.0f} pairs/s), "
+                print(f"    {loaded}/{n} images loaded ({rate:.0f} img/s), "
                       f"RAM: {mb:.0f}MB")
 
         elapsed = time.time() - t0
         mb = psutil.Process().memory_info().rss / 1024**2
         rate = n / elapsed if elapsed > 0 else 0
-        print(f"  Cached {n} pairs in {elapsed:.1f}s ({rate:.0f} pairs/s), "
-              f"RAM: {mb:.0f}MB, workers={n_workers}")
+        print(f"  Cached {total_crops} crops in {elapsed:.1f}s ({rate:.0f} img/s), "
+              f"RAM: {mb:.0f}MB")
+
+    def refresh_cache(self):
+        """Re-generate random crops from disk. Call between epochs for variety."""
+        if self.cached_images is not None and self.cache_in_ram:
+            print("  Refreshing crop cache...")
+            self._load_all_into_ram()
 
     def __len__(self):
+        if self.cached_images is not None:
+            return len(self.cached_images) * 25  # 25 augmentations per crop
         return len(self.pairs) * 100
 
     def __getitem__(self, idx):
-        pair_idx = idx % len(self.pairs)
-
         if self.cached_images is not None:
-            inp, tgt = self.cached_images[pair_idx]
+            # Index into pre-cropped cache
+            crop_idx = idx % len(self.cached_images)
+            inp, tgt = self.cached_images[crop_idx]
             inp = inp.astype(np.float32) / 255.0
             tgt = tgt.astype(np.float32) / 255.0
         else:
+            # Uncached: load from disk and random crop
+            pair_idx = idx % len(self.pairs)
             inp_path, tgt_path = self.pairs[pair_idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
@@ -136,14 +160,12 @@ class PairedFrameDataset(Dataset):
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(
                 np.float32) / 255.0
 
-        h, w, _ = inp.shape
-        cs = self.crop_size
-
-        # Random crop (same location for both)
-        top = random.randint(0, h - cs)
-        left = random.randint(0, w - cs)
-        inp = inp[top:top + cs, left:left + cs]
-        tgt = tgt[top:top + cs, left:left + cs]
+            h, w, _ = inp.shape
+            cs = self.crop_size
+            top = random.randint(0, h - cs)
+            left = random.randint(0, w - cs)
+            inp = inp[top:top + cs, left:left + cs]
+            tgt = tgt[top:top + cs, left:left + cs]
 
         # Augmentation: random flip and rotation
         if self.augment:

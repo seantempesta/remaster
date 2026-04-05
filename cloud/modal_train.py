@@ -68,7 +68,7 @@ app = modal.App("remaster-train", image=image)
     gpu="L40S",    # L40S ($1.95/hr, 48GB, best value), A10G ($1.10/hr), H100 ($3.50/hr)
     volumes={VOL_MOUNT: vol},
     timeout=28800,
-    memory=131072,  # 128GB for RAM cache (~7K 1080p pairs ~83GB)
+    memory=32768,  # 32GB: crop cache (~10GB) + model + overhead
     secrets=[modal.Secret.from_name("wandb-api-key")],
 )
 def train_remote(

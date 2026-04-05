@@ -16,12 +16,12 @@ Features:
 Usage:
     # DRUNet student with feature matching distillation (recommended)
     python training/train.py --model drunet --nc-list 16,32,64,128 --nb 2 \\
-        --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \\
+        --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \\
         --feature-matching-weight 0.1 --optimizer prodigy
 
     # Cloud training via Modal
     modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \\
-        --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \\
+        --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \\
         --feature-matching-weight 0.1 --optimizer prodigy
 
     # Environment variables for Modal: DATA_DIR, CHECKPOINT_DIR, MAX_ITERS, etc.
@@ -940,6 +940,9 @@ def train(args):
             try:
                 inp_batch, tgt_batch = next(data_iter)
             except StopIteration:
+                # Refresh crop cache for new random crops each epoch
+                if hasattr(dataset, 'refresh_cache'):
+                    dataset.refresh_cache()
                 data_iter = iter(dataloader)
                 inp_batch, tgt_batch = next(data_iter)
             inp_batch = inp_batch.to(device, non_blocking=True)
