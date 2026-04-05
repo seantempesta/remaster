@@ -7,11 +7,13 @@ Includes: online teacher distillation, feature matching loss, Prodigy optimizer.
 Usage:
     # DRUNet student with feature matching distillation (recommended)
     modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
-        --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \
+        --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \
+        --data-dir data/training/train --val-dir data/training/val \
         --feature-matching-weight 0.1 --optimizer prodigy
 
     # Quick test
-    modal run cloud/modal_train.py --arch drunet --max-iters 200 --val-freq 100
+    modal run cloud/modal_train.py --arch drunet --max-iters 200 --val-freq 100 \
+        --data-dir data/training/train --val-dir data/training/val
 
     # Resume previous run
     modal run cloud/modal_train.py --resume
@@ -264,7 +266,7 @@ def train_remote(
 
 @app.local_entrypoint()
 def main(
-    data_dir: str = "data/train_pairs",
+    data_dir: str = "data/training/train",
     max_iters: int = 25000,
     batch_size: int = 512,
     lr: float = 1e-3,
@@ -278,7 +280,7 @@ def main(
     perceptual_freq: int = 1,
     fft_weight: float = 0.0,
     fft_alpha: float = 1.0,
-    val_dir: str = "data/val_pairs",
+    val_dir: str = "data/training/val",
     arch: str = "unet",
     nc: int = 64,
     nb: int = 15,
@@ -322,7 +324,7 @@ def main(
     Examples:
         # DRUNet student with feature matching distillation
         modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 \\
-            --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \\
+            --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \\
             --feature-matching-weight 0.1 --optimizer prodigy
 
         # Debug run on cheap T4

@@ -14,13 +14,9 @@ Both are DRUNet (UNetRes from KAIR, MIT license). Same architecture, different s
 - Student: nc=[16,32,64,128] nb=2 -- deployment target
 
 ### Checkpoint Format
-`best.pth` contains `{"params": state_dict, "iteration": int, "psnr": float}`.
-Always the latest validated model (not necessarily highest PSNR -- metrics aren't
-comparable across runs with different loss configs). Check `iteration` and `psnr`
-to know what you're loading.
-
-`latest.pth` contains full training state (model + optimizer + scheduler + EMA + adapters).
-Only on Modal volume, not synced locally unless explicitly downloaded.
+- `final.pth` — `{"params": state_dict}`. Model weights from the most recent checkpoint. **Use this for inference and as teacher weights.**
+- `best.pth` — `{"params": state_dict, "iteration": int, "psnr": float}`. Model at highest validation PSNR. Not always reliable — metrics aren't comparable across runs with different loss configs.
+- `latest.pth` — Full training state (model + optimizer + scheduler + EMA + adapters). For resuming training. Only on Modal volume, not synced locally unless explicitly downloaded.
 
 ### Key Finding
 Mixed training data (HEVC artifact removal + synthetic edge-aware blur) produces a model
@@ -70,10 +66,14 @@ the quality of the original Bluray source material.
 - `cloud/modal_train.py` — Modal cloud training wrapper (L40S default, W&B logging)
 
 ### Tools
-- `tools/extract_synthetic_pairs.py` — edge-aware degradation from any video source
+- `tools/build_training_data.py` — staged data builder: --extract-only, --denoise, --build-inputs
+- `tools/calibrate_sigma.py` — bucket frames by noise, pre-render sigma grids, fit calibration curve
+- `tools/label_sigma.py` — Streamlit app for human sigma labeling
+- `tools/verify_data.py` — check pair completeness, readability, per-source counts
+- `tools/measure_sharpness.py` — compute sharpness metrics for training targets
+- `tools/visualize_sharpness.py` — plot sharpness distributions and sample grids
 - `tools/download_training.py` — sync training artifacts from Modal to local
 - `tools/stop_training.py` — graceful stop via Modal Dict
-- `tools/extract_random_frames.py` — extract frames from video for training data
 
 ### Deployment
 - `remaster/encode.vpy` — VapourSynth batch encoding (BestSource + vs-mlrt TRT + y4m)
@@ -105,9 +105,40 @@ the quality of the original Bluray source material.
 - `bestsource/` — Frame-accurate video source filter for VapourSynth (FFmpeg-based)
 
 ## Data Directory
-`data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Contains video clips, extracted frames, model outputs. Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.
+`data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.
 
-## Current Status (2026-04-04)
+```
+data/
+  originals/       ~7K raw extracted frames + meta.pkl (permanent cache)
+  training/
+    train/         Training pairs (~6,260): input/ + target/
+    val/           Validation pairs (~696): input/ + target/
+    meta.pkl       DataFrame: sigma, split, degradation_type, metrics
+  calibration/     Sigma calibration: grids/, labels.pkl, sigma_model.pkl
+  analysis/        Visualization outputs (sharpness plots, etc.)
+  archive/         Old data, episode comparisons, demo clips
+  output/          Training artifacts synced from Modal
+```
+
+**Staged data pipeline** (see `docs/training-data-plan.md`):
+1. Extract originals (1/500 frames, proportional to content length)
+2. Denoise with SCUNet GAN + light USM(1.0) -> **TARGET** (denoise + sharpen in one pass)
+3. Build degraded **INPUT**: 33% raw original, 33% +noise, 33% +edge-aware blur+noise
+
+Training data sources (proportional sampling, 1 frame per 500 source frames):
+| Prefix | Source | Samples (approx) | Resolution |
+|--------|--------|-------------------|------------|
+| `firefly_*` | Firefly S01 | ~1,876 | 1920x1080 |
+| `expanse_*` | The Expanse S02 | ~1,635 | 1920x1080 |
+| `onepiece_*` | One Piece S01 | ~1,306 | 1920x1080 |
+| `squidgame_*` | Squid Game S02 | ~1,237 | 1920x960 |
+| `dune2_*` | Dune Part Two | ~476 | 1920x802 |
+| `foundation_*` | Foundation S03 | ~426 | 1920x800 |
+| **Total** | | **~6,956** | |
+
+See `docs/training-data-plan.md` for details. Built by `tools/build_training_data.py`.
+
+## Current Status (2026-04-05)
 
 ### Architecture
 - **DRUNet** (UNetRes from KAIR, MIT license): Conv+ReLU residual U-Net, 4 levels, no BN/LayerNorm/attention
@@ -116,8 +147,8 @@ the quality of the original Bluray source material.
 
 ### Training Approach
 - **Teacher-student distillation** with feature matching (1x1 adapter convs align encoder features)
-- **Mixed training data**: HEVC artifact removal (Firefly) + synthetic edge-aware blur (Expanse, One Piece, Dune 2, Squid Game, Foundation)
-- **Edge-aware degradation**: Sobel-weighted spatially-varying Gaussian blur -- sharp areas blurred, soft areas untouched
+- **Targets**: SCUNet GAN (perceptual/adversarial denoiser) + USM(1.0) -- denoise AND sharpen in one pass
+- **Inputs**: 33% raw originals, 33% +noise, 33% +edge-aware blur+noise
 - **Losses**: Charbonnier pixel + DISTS perceptual (teacher), Charbonnier + feature matching (student)
 - **Optimizer**: Prodigy (auto-tuned LR, safeguard_warmup, bias_correction)
 - **Cloud**: Modal L40S ($1.95/hr, 48GB VRAM), W&B logging, 64GB RAM cache
@@ -125,26 +156,25 @@ the quality of the original Bluray source material.
 
 ### Training Commands
 ```bash
-# Resume teacher
+# Resume teacher (fresh optimizer for new data)
 modal run cloud/modal_train.py --arch drunet --nc-list 64,128,256,512 --nb 4 \
-    --checkpoint-dir checkpoints/drunet_teacher --data-dir data/mixed_pairs \
+    --checkpoint-dir checkpoints/drunet_teacher \
     --optimizer prodigy --perceptual-weight 0.05 --batch-size 64 \
-    --ema --wandb --resume
+    --ema --wandb --resume --fresh-optimizer
 
 # Resume student (with teacher as online distillation target)
 modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
-    --teacher checkpoints/drunet_teacher/best.pth --teacher-model drunet \
-    --checkpoint-dir checkpoints/drunet_student --data-dir data/mixed_pairs \
+    --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \
+    --checkpoint-dir checkpoints/drunet_student \
     --feature-matching-weight 0.1 --optimizer prodigy --batch-size 192 \
-    --ema --wandb --resume
+    --ema --wandb --resume --fresh-optimizer
 ```
 
 ### Next Steps
-1. Expand synthetic data: One Piece, Dune 2, Squid Game, Foundation (~3600 total pairs)
-2. 10% validation split across all sources
-3. Continue teacher training with DISTS until plateau
-4. Retrain student with improved teacher
-5. Deploy: ONNX export, TensorRT INT8, vs-mlrt integration
+1. Build inputs (--build-inputs) for the new training data
+2. Resume teacher training with --fresh-optimizer on expanded dataset (6,266 train + 692 val)
+3. Retrain student with improved teacher
+4. Deploy: ONNX export, TensorRT INT8, vs-mlrt integration
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`, `docs/training-data-plan.md`, `docs/pruning-plan.md`.
 

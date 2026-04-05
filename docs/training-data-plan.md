@@ -2,100 +2,115 @@
 
 ## Objective
 
-Build a diverse, high-quality training dataset that teaches the model two skills:
-1. **HEVC artifact removal** — from existing Firefly compressed/denoised pairs
-2. **Detail recovery** — from synthetically degraded high-quality source material
+Build a diverse, high-quality training dataset that teaches the model to denoise, remove compression artifacts, and recover detail from degraded video content.
 
-The synthetic degradation is **edge-aware**: sharp areas (faces, textures, edges) get blurred while soft areas (bokeh, sky, gradients) stay untouched. This teaches the model to recover detail where it existed, not hallucinate everywhere.
+## Staged Pipeline
 
-## Sources
+Data is built in three independent stages, each resumable and skippable:
 
-### HEVC Artifact Removal (existing)
-| Source | Path | Pairs | Notes |
-|--------|------|-------|-------|
-| Firefly (14 episodes) | `data/train_pairs/` | 1,224 | Input=compressed, Target=SCUNet denoised |
+### Stage 1: Extract Originals (`--extract-only`)
 
-### Synthetic Detail Recovery (edge-aware blur)
-| Source | Path | Episodes | Frames | Sigma | Notes |
-|--------|------|----------|--------|-------|-------|
-| The Expanse S2 | `E:/plex/tv/The Expanse Season 2...` | 13 | 1,200 | 2-5 | Dark sci-fi, space, interiors |
-| One Piece S1 | `E:/plex/tv/One.Piece.2023.S01...` | 8 | 400 | 2-8 mix | Colorful, outdoor, costumes, VFX |
-| Dune Part Two | `E:/plex/movies/Dune.Part.Two.2024...` | 1 movie | 300 | 2-8 mix | Desert, fabric, skin, extreme lighting |
-| Squid Game S2 | `E:/plex/tv/Squid Game - Season 2/` | 7 | 350 | 2-8 mix | Faces, neon lighting, indoor/outdoor |
-| Foundation S3 | `E:/plex/tv/foundation.s03e0*.mkv` | 2 | 150 | 2-8 mix | Sci-fi, architecture, costumes |
+- Probe each source video for total frame count
+- Sample proportionally: 1 frame per 500 source frames
+- Extract with NVDEC hwaccel, save raw PNG to `data/originals/`
+- Compute per-frame metrics (noise_level, laplacian_var, sobel_mean)
+- Save DataFrame to `data/originals/meta.pkl`
 
-### Totals
-| Category | Training | Validation (10%) |
-|----------|----------|-------------------|
-| HEVC (Firefly) | 1,224 | ~122 |
-| Synthetic (all sources) | 2,400 | ~240 |
-| **Total** | **3,624** | **~362** |
+### Stage 2: Denoise with SCUNet GAN (`--denoise`)
 
-## Degradation Strategy
+- Run every original through SCUNet GAN (pretrained perceptual/adversarial denoiser)
+- SCUNet GAN denoises AND sharpens in one pass — no sigma tuning needed
+- Apply light unsharp mask (strength=1.0, sigma=1.5) to push detail slightly further
+- Split 90/10 train/val (stratified by source, fixed seed)
+- Save targets to `data/training/{train,val}/target/`
+- ~0.5 fps on RTX 3060 (one-time cost)
 
-Edge-aware Gaussian blur using Sobel magnitude map:
-- Sharp areas (high edge response) get blurred more
-- Soft areas (bokeh, sky, gradients) stay untouched
-- Prevents the model from over-sharpening areas that should be soft
+### Stage 3: Build Inputs (`--build-inputs`)
 
-Sigma distribution (for new sources):
-- 60% moderate: sigma 2-5 (detail recovery)
-- 40% heavy: sigma 4-8 (teaches detail generation for heavily degraded content)
+- For each frame, randomly choose degradation type:
+  - **~33%**: raw original unchanged (model sees real artifacts)
+  - **~33%**: original + light Gaussian noise (sigma 1-5)
+  - **~33%**: original + edge-aware blur (from clean target edge map) + noise
+- Parallel CPU processing (ThreadPoolExecutor, 8 workers)
+- Save inputs to `data/training/{train,val}/input/`
 
-The Expanse frames (already generated) use sigma 2-5 uniformly.
+## Key Design Decisions
 
-Optional per-frame augmentation:
-- 15% chance of 2x downscale + upscale (resolution loss simulation)
+### Why SCUNet GAN instead of DRUNet?
 
-## Validation Strategy
+DRUNet is PSNR-optimized — it removes noise but softens detail. SCUNet GAN was trained with adversarial + VGG perceptual loss, so it denoises while preserving and enhancing texture. No sigma tuning needed — it adapts to the input content automatically. A light unsharp mask (1.0) pushes detail slightly further.
 
-10% holdout from each source, same degradation, separate directory.
-Validation frames are extracted with a different random seed (no overlap with training).
+### Why keep originals?
 
-Current validation (63 frames) is too small and only covers Firefly + Expanse.
-New validation will cover all sources proportionally.
+Raw extracted frames are permanent. If the target generation strategy evolves, we regenerate targets and inputs from cached originals without re-extracting from video.
+
+### Why proportional sampling?
+
+1 frame per 500 source frames ensures each source contributes proportionally to its content length. No more hand-picking arbitrary counts.
+
+### Why mixed inputs?
+
+33% raw originals teach the model to handle real compression artifacts without synthetic degradation. 33% with added noise teaches robustness. 33% with edge-aware blur teaches detail recovery. The model must be stable on all three.
+
+## Sources (Proportional Sampling)
+
+| Source | Total Frames | Episodes | Samples (1/500) |
+|--------|-------------|----------|-----------------|
+| Firefly S01 | ~938K | 14 | ~1,876 |
+| The Expanse S02 | ~818K | 13 | ~1,635 |
+| One Piece S01 | ~653K | 8 | ~1,306 |
+| Squid Game S02 | ~619K | 7 | ~1,237 |
+| Dune Part Two | ~238K | 1 | ~476 |
+| Foundation S03 | ~213K | 3 | ~426 |
+| **Total** | **~3.48M** | | **~6,956** |
 
 ## Directory Structure
 
-Training pairs go into the combined `data/mixed_pairs/` directory:
 ```
-data/mixed_pairs/
-  input/
-    hevc_e01_00001.png          # Firefly HEVC
-    synth_expanse_S02E01_00000.png   # Expanse
-    synth_onepiece_S01E01_00000.png  # One Piece
-    synth_dune2_00000.png            # Dune 2
-    synth_squidgame_S02E01_00000.png # Squid Game
-    synth_foundation_S03E01_00000.png # Foundation
-  target/
-    (matching filenames)
+data/
+  originals/              ~7K raw extracted frames (permanent cache)
+    meta.pkl              DataFrame: noise_level, laplacian_var, sobel_mean per frame
+  training/
+    train/
+      input/              ~6,260 degraded frames
+      target/             ~6,260 clean denoised frames
+    val/
+      input/              ~696 degraded frames
+      target/             ~696 clean denoised frames
+    meta.pkl              DataFrame: sigma, split, degradation_type, all metrics
+  calibration/
+    grids/                Pre-rendered sigma comparison images
+    samples.pkl           Sample frame info for labeling
+    labels.pkl            Human-selected sigma labels
+    sigma_model.pkl       Fitted noise->sigma mapping
+    sigma_curve.png       Visualization of the calibration curve
+  analysis/               Visualization outputs (sharpness plots, etc.)
+  archive/                Old data, episode comparisons, demo clips
+  output/                 Training artifacts from Modal
 ```
 
-Validation:
+## Build Commands
+
+```bash
+# Stage 1: Extract originals (~55 min at ~2 fps)
+python tools/build_training_data.py --extract-only
+
+# Stage 2: Denoise with SCUNet GAN (~4 hrs at ~0.5 fps)
+python tools/build_training_data.py --denoise
+
+# Stage 3: Build inputs (~2 min, parallel)
+python tools/build_training_data.py --build-inputs
+
+# Verify + analyze
+python tools/verify_data.py
+python tools/measure_sharpness.py
+python tools/visualize_sharpness.py
 ```
-data/mixed_val/
-  input/
-    (10% sample from all sources, same naming)
-  target/
-    (matching)
-```
 
-## Key Finding
+## Denoiser Details
 
-The teacher trained on mixed data (HEVC + synthetic) generalizes beyond its training:
-- Removes compression artifacts (trained task)
-- Recovers detail from softness (trained task)
-- Denoises grain in high-quality Bluray source (emergent behavior)
-- Output often exceeds "ground truth" quality on Expanse frames
-
-This happens because the model learns a general "clean + sharpen" objective rather
-than task-specific artifact patterns.
-
-## Scripts
-
-- `tools/extract_synthetic_pairs.py` — frame extraction + edge-aware degradation
-  - `--source-dir` — path to video files
-  - `--sigma-min/--sigma-max` — blur strength range
-  - `--num-frames` — frames per run
-  - `--no-skip` — regenerate existing frames
-  - `--test` — generate 10 test pairs for visual verification
+- **Model:** SCUNet GAN (`scunet_color_real_gan.pth`) — Swin-Conv-UNet with adversarial training
+- **Architecture:** SCUNet, in_nc=3, config=[4,4,4,4,4,4,4], dim=64 (~15M params)
+- **Weights:** `reference-code/SCUNet/model_zoo/scunet_color_real_gan.pth` (69 MB)
+- **Post-processing:** Light unsharp mask (strength=1.0, sigma=1.5) on GAN output
+- **Why GAN:** Perceptual + adversarial loss preserves texture while denoising (vs PSNR models that soften)
