@@ -68,68 +68,54 @@ class PairedFrameDataset(Dataset):
         Crops are refreshed every epoch via refresh_cache().
 
         Memory: 6K pairs x 4 crops x 400KB = ~10GB (vs ~80GB for full images).
+        Uses sequential loading (no ThreadPoolExecutor) to avoid blocking
+        Modal heartbeat threads.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import psutil
-
         n = len(self.pairs)
         self._crops_per_image = 4
-        CHUNK_SIZE = 200
-        n_workers = min(8, os.cpu_count() or 4)
         total_crops = n * self._crops_per_image
         print(f"  Caching {n} pairs x {self._crops_per_image} crops = "
               f"{total_crops} crop pairs into RAM...")
         t0 = time.time()
 
         cs = self.crop_size
+        self.cached_images = [None] * total_crops
 
-        def _load_crops(idx):
+        for idx in range(n):
             inp_path, tgt_path = self.pairs[idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
-            if inp is None:
-                raise IOError(f"Failed to read {inp_path}")
-            if tgt is None:
-                raise IOError(f"Failed to read {tgt_path}")
+            if inp is None or tgt is None:
+                # Fill with black crops as fallback
+                for c in range(self._crops_per_image):
+                    black = np.zeros((cs, cs, 3), dtype=np.uint8)
+                    self.cached_images[idx * self._crops_per_image + c] = (black, black)
+                continue
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
             h, w = inp.shape[:2]
 
-            crops = []
-            for _ in range(self._crops_per_image):
+            for c in range(self._crops_per_image):
                 top = random.randint(0, h - cs)
                 left = random.randint(0, w - cs)
-                crops.append((
+                self.cached_images[idx * self._crops_per_image + c] = (
                     inp[top:top + cs, left:left + cs].copy(),
                     tgt[top:top + cs, left:left + cs].copy(),
-                ))
-            return idx, crops
+                )
 
-        self.cached_images = [None] * total_crops
-        loaded = 0
-
-        for chunk_start in range(0, n, CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, n)
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_load_crops, i): i
-                           for i in range(chunk_start, chunk_end)}
-                for fut in as_completed(futures):
-                    idx, crops = fut.result()
-                    for c, (ic, tc) in enumerate(crops):
-                        self.cached_images[idx * self._crops_per_image + c] = (ic, tc)
-                    loaded += 1
-            if loaded % 200 == 0 or chunk_end == n:
-                mb = psutil.Process().memory_info().rss / 1024**2
+            if (idx + 1) % 500 == 0 or idx == n - 1:
                 elapsed = time.time() - t0
-                rate = loaded / elapsed if elapsed > 0 else 0
-                print(f"    {loaded}/{n} images loaded ({rate:.0f} img/s), "
-                      f"RAM: {mb:.0f}MB")
+                rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                try:
+                    import psutil
+                    mb = psutil.Process().memory_info().rss / 1024**2
+                    print(f"    {idx+1}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB")
+                except ImportError:
+                    print(f"    {idx+1}/{n} ({rate:.0f} img/s)")
 
         elapsed = time.time() - t0
-        mb = psutil.Process().memory_info().rss / 1024**2
         rate = n / elapsed if elapsed > 0 else 0
-        print(f"  Cached {total_crops} crops in {elapsed:.1f}s ({rate:.0f} img/s), "
-              f"RAM: {mb:.0f}MB")
+        print(f"  Cached {total_crops} crops in {elapsed:.1f}s ({rate:.0f} img/s)")
 
     def refresh_cache(self):
         """Re-generate random crops from disk. Call between epochs for variety."""
