@@ -68,9 +68,10 @@ class PairedFrameDataset(Dataset):
         Crops are refreshed every epoch via refresh_cache().
 
         Memory: 6K pairs x 4 crops x 400KB = ~10GB (vs ~80GB for full images).
-        Uses sequential loading (no ThreadPoolExecutor) to avoid blocking
-        Modal heartbeat threads.
+        Uses 3 parallel workers for I/O overlap without saturating network.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         n = len(self.pairs)
         self._crops_per_image = 4
         total_crops = n * self._crops_per_image
@@ -81,37 +82,44 @@ class PairedFrameDataset(Dataset):
         cs = self.crop_size
         self.cached_images = [None] * total_crops
 
-        for idx in range(n):
+        def _load_one(idx):
             inp_path, tgt_path = self.pairs[idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
             if inp is None or tgt is None:
-                # Fill with black crops as fallback
-                for c in range(self._crops_per_image):
-                    black = np.zeros((cs, cs, 3), dtype=np.uint8)
-                    self.cached_images[idx * self._crops_per_image + c] = (black, black)
-                continue
+                black = np.zeros((cs, cs, 3), dtype=np.uint8)
+                return idx, [(black, black)] * self._crops_per_image
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
             h, w = inp.shape[:2]
-
-            for c in range(self._crops_per_image):
+            crops = []
+            for _ in range(self._crops_per_image):
                 top = random.randint(0, h - cs)
                 left = random.randint(0, w - cs)
-                self.cached_images[idx * self._crops_per_image + c] = (
+                crops.append((
                     inp[top:top + cs, left:left + cs].copy(),
                     tgt[top:top + cs, left:left + cs].copy(),
-                )
+                ))
+            return idx, crops
 
-            if (idx + 1) % 500 == 0 or idx == n - 1:
-                elapsed = time.time() - t0
-                rate = (idx + 1) / elapsed if elapsed > 0 else 0
-                try:
-                    import psutil
-                    mb = psutil.Process().memory_info().rss / 1024**2
-                    print(f"    {idx+1}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB")
-                except ImportError:
-                    print(f"    {idx+1}/{n} ({rate:.0f} img/s)")
+        loaded = 0
+        # 3 workers: enough to overlap I/O, not enough to saturate network
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_load_one, i): i for i in range(n)}
+            for fut in as_completed(futures):
+                idx, crops = fut.result()
+                for c, pair in enumerate(crops):
+                    self.cached_images[idx * self._crops_per_image + c] = pair
+                loaded += 1
+                if loaded % 500 == 0 or loaded == n:
+                    elapsed = time.time() - t0
+                    rate = loaded / elapsed if elapsed > 0 else 0
+                    try:
+                        import psutil
+                        mb = psutil.Process().memory_info().rss / 1024**2
+                        print(f"    {loaded}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB")
+                    except ImportError:
+                        print(f"    {loaded}/{n} ({rate:.0f} img/s)")
 
         elapsed = time.time() - t0
         rate = n / elapsed if elapsed > 0 else 0
