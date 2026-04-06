@@ -101,7 +101,7 @@ def train_remote(
     intensity_aug: bool = True,
     qat: bool = False,
     sparse: bool = False,
-    cache_in_ram: bool = True,
+    cache_in_ram: bool = False,
     cache_on_gpu: bool = False,
     num_workers: int = 16,
     # Teacher distillation
@@ -295,7 +295,7 @@ def main(
     intensity_aug: bool = True,
     qat: bool = False,
     sparse: bool = False,
-    cache_in_ram: bool = True,
+    cache_in_ram: bool = False,
     cache_on_gpu: bool = False,
     gpu: str = "T4",
     # Teacher distillation
