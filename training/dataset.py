@@ -17,6 +17,28 @@ import torch
 from torch.utils.data import Dataset
 
 
+def _load_crops_worker(args):
+    """Module-level worker for multiprocessing.Pool (must be picklable)."""
+    idx, inp_path, tgt_path, crop_size, n_crops = args
+    inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
+    tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
+    if inp is None or tgt is None:
+        black = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+        return idx, [(black, black)] * n_crops
+    inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
+    tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
+    h, w = inp.shape[:2]
+    crops = []
+    for _ in range(n_crops):
+        top = random.randint(0, h - crop_size)
+        left = random.randint(0, w - crop_size)
+        crops.append((
+            inp[top:top + crop_size, left:left + crop_size].copy(),
+            tgt[top:top + crop_size, left:left + crop_size].copy(),
+        ))
+    return idx, crops
+
+
 class PairedFrameDataset(Dataset):
     """
     Loads paired input/target frames, returns random crops with augmentation.
@@ -82,38 +104,16 @@ class PairedFrameDataset(Dataset):
         cs = self.crop_size
         self.cached_images = [None] * total_crops
 
-        # Use multiprocessing (separate processes, separate GILs)
+        # Use multiprocessing.Pool (separate processes, separate GILs)
         # to avoid blocking Modal heartbeat thread
         n_workers = min(8, mp.cpu_count() or 4)
-        pairs_list = self.pairs  # list of (inp_path, tgt_path)
 
-        # Worker function for multiprocessing.Pool
-        def _load_one(args):
-            idx, inp_path, tgt_path, crop_size, n_crops = args
-            inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
-            tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
-            if inp is None or tgt is None:
-                black = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
-                return idx, [(black, black)] * n_crops
-            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
-            tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
-            h, w = inp.shape[:2]
-            crops = []
-            for _ in range(n_crops):
-                top = random.randint(0, h - crop_size)
-                left = random.randint(0, w - crop_size)
-                crops.append((
-                    inp[top:top + crop_size, left:left + crop_size].copy(),
-                    tgt[top:top + crop_size, left:left + crop_size].copy(),
-                ))
-            return idx, crops
-
-        work_items = [(i, pairs_list[i][0], pairs_list[i][1], cs, self._crops_per_image)
+        work_items = [(i, self.pairs[i][0], self.pairs[i][1], cs, self._crops_per_image)
                       for i in range(n)]
 
         loaded = 0
         with mp.Pool(n_workers) as pool:
-            for idx, crops in pool.imap_unordered(_load_one, work_items, chunksize=20):
+            for idx, crops in pool.imap_unordered(_load_crops_worker, work_items, chunksize=20):
                 for c, pair in enumerate(crops):
                     self.cached_images[idx * self._crops_per_image + c] = pair
                 loaded += 1
