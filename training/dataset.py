@@ -103,10 +103,10 @@ class PairedFrameDataset(Dataset):
             return idx, crops
 
         loaded = 0
-        BATCH = 100  # small batches to yield CPU to heartbeat thread
+        BATCH = 50  # small batches + GIL yield between them for heartbeat
         for batch_start in range(0, n, BATCH):
             batch_end = min(batch_start + BATCH, n)
-            with ThreadPoolExecutor(max_workers=3) as pool:
+            with ThreadPoolExecutor(max_workers=6) as pool:
                 futures = {pool.submit(_load_one, i): i
                            for i in range(batch_start, batch_end)}
                 for fut in as_completed(futures):
@@ -114,7 +114,8 @@ class PairedFrameDataset(Dataset):
                     for c, pair in enumerate(crops):
                         self.cached_images[idx * self._crops_per_image + c] = pair
                     loaded += 1
-            # Pool fully cleaned up here — yield to heartbeat
+            # Yield GIL to heartbeat thread between batches
+            time.sleep(0.01)
             if loaded % 500 == 0 or batch_end == n:
                 elapsed = time.time() - t0
                 rate = loaded / elapsed if elapsed > 0 else 0
