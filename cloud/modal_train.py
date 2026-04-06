@@ -297,6 +297,7 @@ def main(
     sparse: bool = False,
     cache_in_ram: bool = False,
     cache_on_gpu: bool = False,
+    skip_upload: bool = False,
     gpu: str = "T4",
     # Teacher distillation
     teacher: str = "",
@@ -387,30 +388,43 @@ def main(
         vol_teacher = f"{VOL_MOUNT}/pretrained/teacher_{os.path.basename(teacher_local)}"
 
     # Upload data
-    print(f"\nUploading data to Modal volume...")
-    t0 = time.time()
+    if skip_upload:
+        print(f"\nSkipping data upload (--skip-upload). Using existing data on volume.")
+        # Still upload checkpoint/teacher weights if specified
+        if (pretrained and os.path.exists(pretrained)) or (teacher and os.path.exists(teacher)):
+            with vol.batch_upload(force=True) as batch:
+                if pretrained and os.path.exists(pretrained):
+                    batch.put_file(os.path.abspath(pretrained),
+                                  vol_pretrained.replace(VOL_MOUNT, ""))
+                if teacher and os.path.exists(teacher):
+                    batch.put_file(os.path.abspath(teacher),
+                                  vol_teacher.replace(VOL_MOUNT, ""))
+                    print(f"  Uploaded teacher weights ({os.path.basename(teacher)})")
+    else:
+        print(f"\nUploading data to Modal volume...")
+        t0 = time.time()
 
-    with vol.batch_upload(force=True) as batch:
-        if pretrained and os.path.exists(pretrained):
-            batch.put_file(os.path.abspath(pretrained),
-                          vol_pretrained.replace(VOL_MOUNT, ""))
-        if teacher and os.path.exists(teacher):
-            batch.put_file(os.path.abspath(teacher),
-                          vol_teacher.replace(VOL_MOUNT, ""))
-            print(f"  Uploading teacher weights ({os.path.basename(teacher)})...")
+        with vol.batch_upload(force=True) as batch:
+            if pretrained and os.path.exists(pretrained):
+                batch.put_file(os.path.abspath(pretrained),
+                              vol_pretrained.replace(VOL_MOUNT, ""))
+            if teacher and os.path.exists(teacher):
+                batch.put_file(os.path.abspath(teacher),
+                              vol_teacher.replace(VOL_MOUNT, ""))
+                print(f"  Uploading teacher weights ({os.path.basename(teacher)})...")
 
-        for f in input_files:
-            batch.put_file(f, f"/{data_name}/input/{os.path.basename(f)}")
-        for f in target_files:
-            batch.put_file(f, f"/{data_name}/target/{os.path.basename(f)}")
+            for f in input_files:
+                batch.put_file(f, f"/{data_name}/input/{os.path.basename(f)}")
+            for f in target_files:
+                batch.put_file(f, f"/{data_name}/target/{os.path.basename(f)}")
 
-        if has_val:
-            for f in val_input_files:
-                batch.put_file(f, f"/{val_name}/input/{os.path.basename(f)}")
-            for f in val_target_files:
-                batch.put_file(f, f"/{val_name}/target/{os.path.basename(f)}")
+            if has_val:
+                for f in val_input_files:
+                    batch.put_file(f, f"/{val_name}/input/{os.path.basename(f)}")
+                for f in val_target_files:
+                    batch.put_file(f, f"/{val_name}/target/{os.path.basename(f)}")
 
-    print(f"  Upload done in {time.time()-t0:.0f}s")
+        print(f"  Upload done in {time.time()-t0:.0f}s")
 
     # Run training
     arch_desc = f"{arch} nc={nc} " + (f"mid={nb_mid}" if arch == "unet" else f"nb={nb}")
