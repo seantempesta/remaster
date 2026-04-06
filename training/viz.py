@@ -275,9 +275,9 @@ def save_val_samples(model, val_dir, output_dir, iteration, device,
     if not input_files:
         return []
 
-    # Pick evenly spaced frames
-    indices = np.linspace(0, len(input_files) - 1, num_samples, dtype=int)
-    selected = [input_files[i] for i in indices]
+    # Pick random frames (different each validation run)
+    import random as _rng
+    selected = _rng.sample(input_files, min(num_samples, len(input_files)))
 
     samples_dir = os.path.join(output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)

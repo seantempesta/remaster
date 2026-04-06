@@ -1232,7 +1232,7 @@ def train(args):
             # Save sample comparison images
             samples = save_val_samples(
                 val_model, val_dir, ckpt_dir, iteration + 1,
-                device, num_samples=3, crop_size=512,
+                device, num_samples=8, crop_size=512,
                 teacher_model=teacher_model,
                 teacher_needs_noise_map=teacher_needs_noise_map,
                 teacher_noise_level=teacher_noise_level,
