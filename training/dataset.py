@@ -103,8 +103,8 @@ class PairedFrameDataset(Dataset):
             return idx, crops
 
         loaded = 0
-        # 4 workers: overlap I/O without saturating network
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # 3 workers: overlap I/O without blocking Modal heartbeat
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(_load_one, i): i for i in range(n)}
             for fut in as_completed(futures):
                 idx, crops = fut.result()
