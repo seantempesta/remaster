@@ -70,62 +70,63 @@ class PairedFrameDataset(Dataset):
         Memory: 6K pairs x 4 crops x 400KB = ~10GB (vs ~80GB for full images).
         Uses 3 parallel workers for I/O overlap without saturating network.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import multiprocessing as mp
 
         n = len(self.pairs)
         self._crops_per_image = 4
         total_crops = n * self._crops_per_image
         print(f"  Caching {n} pairs x {self._crops_per_image} crops = "
-              f"{total_crops} crop pairs into RAM...")
+              f"{total_crops} crop pairs into RAM...", flush=True)
         t0 = time.time()
 
         cs = self.crop_size
         self.cached_images = [None] * total_crops
 
-        def _load_one(idx):
-            inp_path, tgt_path = self.pairs[idx]
+        # Use multiprocessing (separate processes, separate GILs)
+        # to avoid blocking Modal heartbeat thread
+        n_workers = min(8, mp.cpu_count() or 4)
+        pairs_list = self.pairs  # list of (inp_path, tgt_path)
+
+        # Worker function for multiprocessing.Pool
+        def _load_one(args):
+            idx, inp_path, tgt_path, crop_size, n_crops = args
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
             if inp is None or tgt is None:
-                black = np.zeros((cs, cs, 3), dtype=np.uint8)
-                return idx, [(black, black)] * self._crops_per_image
+                black = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+                return idx, [(black, black)] * n_crops
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB)
             h, w = inp.shape[:2]
             crops = []
-            for _ in range(self._crops_per_image):
-                top = random.randint(0, h - cs)
-                left = random.randint(0, w - cs)
+            for _ in range(n_crops):
+                top = random.randint(0, h - crop_size)
+                left = random.randint(0, w - crop_size)
                 crops.append((
-                    inp[top:top + cs, left:left + cs].copy(),
-                    tgt[top:top + cs, left:left + cs].copy(),
+                    inp[top:top + crop_size, left:left + crop_size].copy(),
+                    tgt[top:top + crop_size, left:left + crop_size].copy(),
                 ))
             return idx, crops
 
+        work_items = [(i, pairs_list[i][0], pairs_list[i][1], cs, self._crops_per_image)
+                      for i in range(n)]
+
         loaded = 0
-        BATCH = 50  # small batches + GIL yield between them for heartbeat
-        for batch_start in range(0, n, BATCH):
-            batch_end = min(batch_start + BATCH, n)
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                futures = {pool.submit(_load_one, i): i
-                           for i in range(batch_start, batch_end)}
-                for fut in as_completed(futures):
-                    idx, crops = fut.result()
-                    for c, pair in enumerate(crops):
-                        self.cached_images[idx * self._crops_per_image + c] = pair
-                    loaded += 1
-            # Yield GIL to heartbeat thread between batches
-            time.sleep(0.01)
-            if loaded % 500 == 0 or batch_end == n:
-                elapsed = time.time() - t0
-                rate = loaded / elapsed if elapsed > 0 else 0
-                try:
-                    import psutil
-                    mb = psutil.Process().memory_info().rss / 1024**2
-                    print(f"    {loaded}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB",
-                          flush=True)
-                except ImportError:
-                    print(f"    {loaded}/{n} ({rate:.0f} img/s)", flush=True)
+        with mp.Pool(n_workers) as pool:
+            for idx, crops in pool.imap_unordered(_load_one, work_items, chunksize=20):
+                for c, pair in enumerate(crops):
+                    self.cached_images[idx * self._crops_per_image + c] = pair
+                loaded += 1
+                if loaded % 500 == 0 or loaded == n:
+                    elapsed = time.time() - t0
+                    rate = loaded / elapsed if elapsed > 0 else 0
+                    try:
+                        import psutil
+                        mb = psutil.Process().memory_info().rss / 1024**2
+                        print(f"    {loaded}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB",
+                              flush=True)
+                    except ImportError:
+                        print(f"    {loaded}/{n} ({rate:.0f} img/s)", flush=True)
 
         elapsed = time.time() - t0
         rate = n / elapsed if elapsed > 0 else 0
