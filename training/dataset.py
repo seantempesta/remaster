@@ -103,23 +103,28 @@ class PairedFrameDataset(Dataset):
             return idx, crops
 
         loaded = 0
-        # 3 workers: overlap I/O without blocking Modal heartbeat
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(_load_one, i): i for i in range(n)}
-            for fut in as_completed(futures):
-                idx, crops = fut.result()
-                for c, pair in enumerate(crops):
-                    self.cached_images[idx * self._crops_per_image + c] = pair
-                loaded += 1
-                if loaded % 500 == 0 or loaded == n:
-                    elapsed = time.time() - t0
-                    rate = loaded / elapsed if elapsed > 0 else 0
-                    try:
-                        import psutil
-                        mb = psutil.Process().memory_info().rss / 1024**2
-                        print(f"    {loaded}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB")
-                    except ImportError:
-                        print(f"    {loaded}/{n} ({rate:.0f} img/s)")
+        BATCH = 100  # small batches to yield CPU to heartbeat thread
+        for batch_start in range(0, n, BATCH):
+            batch_end = min(batch_start + BATCH, n)
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {pool.submit(_load_one, i): i
+                           for i in range(batch_start, batch_end)}
+                for fut in as_completed(futures):
+                    idx, crops = fut.result()
+                    for c, pair in enumerate(crops):
+                        self.cached_images[idx * self._crops_per_image + c] = pair
+                    loaded += 1
+            # Pool fully cleaned up here — yield to heartbeat
+            if loaded % 500 == 0 or batch_end == n:
+                elapsed = time.time() - t0
+                rate = loaded / elapsed if elapsed > 0 else 0
+                try:
+                    import psutil
+                    mb = psutil.Process().memory_info().rss / 1024**2
+                    print(f"    {loaded}/{n} ({rate:.0f} img/s), RAM: {mb:.0f}MB",
+                          flush=True)
+                except ImportError:
+                    print(f"    {loaded}/{n} ({rate:.0f} img/s)", flush=True)
 
         elapsed = time.time() - t0
         rate = n / elapsed if elapsed > 0 else 0
