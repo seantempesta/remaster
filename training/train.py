@@ -390,11 +390,19 @@ def validate(model, data_dir, device, pixel_criterion=None,
         inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
         h, w, _ = inp.shape
-        # Center crop for validation (deterministic)
-        cs = min(crop_size, h, w)
-        top = (h - cs) // 2
-        left = (w - cs) // 2
-        inp = inp[top:top + cs, left:left + cs]
+
+        if crop_size > 0:
+            # Center crop for validation (deterministic)
+            cs = min(crop_size, h, w)
+            top = (h - cs) // 2
+            left = (w - cs) // 2
+            inp = inp[top:top + cs, left:left + cs]
+        else:
+            # Full frame: pad to divisible by 8
+            pad_h = (8 - h % 8) % 8
+            pad_w = (8 - w % 8) % 8
+            if pad_h > 0 or pad_w > 0:
+                inp = np.pad(inp, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
 
         inp_t = torch.from_numpy(inp.transpose(2, 0, 1)).unsqueeze(0).to(device)
 
@@ -414,7 +422,11 @@ def validate(model, data_dir, device, pixel_criterion=None,
                 continue
             tgt = cv2.imread(tgt_path, cv2.IMREAD_COLOR)
             tgt = cv2.cvtColor(tgt, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            tgt = tgt[top:top + cs, left:left + cs]
+            if crop_size > 0:
+                tgt = tgt[top:top + cs, left:left + cs]
+            else:
+                if pad_h > 0 or pad_w > 0:
+                    tgt = np.pad(tgt, ((0, pad_h), (0, pad_w), (0, 0)), mode='reflect')
             tgt_t = torch.from_numpy(tgt.transpose(2, 0, 1)).unsqueeze(0).to(device)
 
         out_t = model(inp_t)

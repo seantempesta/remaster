@@ -99,16 +99,56 @@ def build_encoder_cmd(ffmpeg, w, h, fps, output_path, encoder, crf):
     """Build the ffmpeg write command for the chosen encoder."""
     fps_str = f"{fps:.6f}"
 
+    # Color space handling for RGB->YUV conversion.
+    # The input is raw RGB24 from our model. FFmpeg must convert to YUV for encoding.
+    # Without explicit flags, ffmpeg uses BT.601 coefficients for RGB->YUV,
+    # but HD content (>576p) requires BT.709. This mismatch causes visible
+    # color shifts (reds pushed down, blues pushed up).
+    #
+    # Fix: use -vf colorspace to force the correct matrix for the conversion,
+    # AND set output metadata so players decode with the right matrix.
+    is_hd = h > 576
+    matrix = "bt709" if is_hd else "smpte170m"
+
+    # Tell the sws scaler which matrix to use for RGB->YUV
+    # -sws_flags sets the conversion matrix, colorspace/primaries/trc tag the output
+    color_in_flags = [
+        "-color_primaries", matrix,
+        "-color_trc", matrix,
+        "-colorspace", matrix,
+    ]
+    color_out_flags = [
+        "-colorspace", matrix,
+        "-color_primaries", matrix,
+        "-color_trc", matrix,
+    ]
+
     if encoder == "hevc_nvenc":
         return [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-r", fps_str,
+            *color_in_flags,
             "-i", "pipe:0",
             "-c:v", "hevc_nvenc",
             "-preset", "p4", "-tune", "hq",
             "-rc", "vbr", "-cq", str(crf),
             "-pix_fmt", "p010le",  # 10-bit output
+            *color_out_flags,
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    elif encoder == "libx264":
+        return [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", fps_str,
+            *color_in_flags,
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-crf", str(crf), "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            *color_out_flags,
             "-movflags", "+faststart",
             output_path,
         ]
@@ -117,10 +157,12 @@ def build_encoder_cmd(ffmpeg, w, h, fps, output_path, encoder, crf):
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-r", fps_str,
+            *color_in_flags,
             "-i", "pipe:0",
             "-c:v", "libx265",
             "-crf", str(crf), "-preset", "medium",
             "-pix_fmt", "yuv420p10le",
+            *color_out_flags,
             "-x265-params",
             "aq-mode=3:aq-strength=0.8:deblock=-1,-1:no-sao=1:rc-lookahead=40:pools=4",
             "-movflags", "+faststart",

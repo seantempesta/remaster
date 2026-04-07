@@ -48,6 +48,25 @@ reference-code/*/data/
 reference-code/*/model_zoo/*.pth
 reference-code/*/experiments/
 tools/ffmpeg-release-full.7z
+tools/_downloads/
 bin/*.7z
 bin/*.exe
+bin/NVEncC/
 test_dirlink/
+output/
+
+# VapourSynth portable (large binaries)
+tools/vs/
+!tools/vs/Install-Portable-VapourSynth-R73.ps1
+
+# TRT engines and calibration (GPU-specific, rebuild locally)
+*.engine
+*_calib.cache
+calibration_data.bin
+
+# ONNX models (exported from checkpoints)
+*.onnx
+
+# C++ build artifacts
+pipeline_cpp/build/
+pipeline_cpp/*.bat

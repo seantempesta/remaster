@@ -297,7 +297,7 @@ def main(
     sparse: bool = False,
     cache_in_ram: bool = True,
     cache_on_gpu: bool = False,
-    skip_upload: bool = False,
+    skip_upload: bool = True,
     gpu: str = "T4",
     # Teacher distillation
     teacher: str = "",

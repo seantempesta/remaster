@@ -76,11 +76,14 @@ class PairedFrameDataset(Dataset):
             raise FileNotFoundError(
                 f"No matching pairs found in {data_dir}")
 
-        if cache_in_ram:
+        if cache_in_ram and crop_size > 0:
             self._load_all_into_ram()
+        elif cache_in_ram and crop_size == 0:
+            print("  NOTE: RAM caching disabled for full-frame mode (too large)")
+            self.cache_in_ram = False
 
         print(f"Dataset: {len(self.pairs)} pairs, crop={crop_size}, "
-              f"augment={augment}, cached={cache_in_ram}")
+              f"augment={augment}, cached={self.cache_in_ram}")
 
     def _load_all_into_ram(self):
         """Pre-load random crops into RAM instead of full images.
@@ -151,7 +154,7 @@ class PairedFrameDataset(Dataset):
             inp = inp.astype(np.float32) / 255.0
             tgt = tgt.astype(np.float32) / 255.0
         else:
-            # Uncached: load from disk and random crop
+            # Uncached: load from disk
             pair_idx = idx % len(self.pairs)
             inp_path, tgt_path = self.pairs[pair_idx]
             inp = cv2.imread(inp_path, cv2.IMREAD_COLOR)
@@ -163,10 +166,27 @@ class PairedFrameDataset(Dataset):
 
             h, w, _ = inp.shape
             cs = self.crop_size
-            top = random.randint(0, h - cs)
-            left = random.randint(0, w - cs)
-            inp = inp[top:top + cs, left:left + cs]
-            tgt = tgt[top:top + cs, left:left + cs]
+
+            if cs > 0:
+                # Random crop
+                top = random.randint(0, h - cs)
+                left = random.randint(0, w - cs)
+                inp = inp[top:top + cs, left:left + cs]
+                tgt = tgt[top:top + cs, left:left + cs]
+            else:
+                # Full frame: pad to common size so batching works with
+                # mixed-resolution sources (1080, 960, 802, 800 heights).
+                # Use reflect-pad on input (model sees natural edges),
+                # zero-pad on target (don't penalize padded region via loss mask).
+                target_h = ((1080 + 7) // 8) * 8  # 1080, already div by 8
+                target_w = ((1920 + 7) // 8) * 8  # 1920, already div by 8
+                pad_h = target_h - h
+                pad_w = target_w - w
+                if pad_h > 0 or pad_w > 0:
+                    inp = np.pad(inp, ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
+                                 mode='reflect')
+                    tgt = np.pad(tgt, ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
+                                 mode='constant', constant_values=0)
 
         # Augmentation: random flip and rotation
         if self.augment:
@@ -176,10 +196,12 @@ class PairedFrameDataset(Dataset):
             if random.random() < 0.5:
                 inp = inp[::-1, :, :].copy()
                 tgt = tgt[::-1, :, :].copy()
-            k = random.randint(0, 3)
-            if k > 0:
-                inp = np.rot90(inp, k).copy()
-                tgt = np.rot90(tgt, k).copy()
+            # Skip rotation for full-frame mode (changes aspect ratio)
+            if self.crop_size > 0:
+                k = random.randint(0, 3)
+                if k > 0:
+                    inp = np.rot90(inp, k).copy()
+                    tgt = np.rot90(tgt, k).copy()
 
         inp = torch.from_numpy(inp.transpose(2, 0, 1))
         tgt = torch.from_numpy(tgt.transpose(2, 0, 1))
@@ -274,18 +296,30 @@ class InputOnlyDataset(Dataset):
         h, w, _ = inp.shape
         cs = self.crop_size
 
-        top = random.randint(0, h - cs)
-        left = random.randint(0, w - cs)
-        inp = inp[top:top + cs, left:left + cs]
+        if cs > 0:
+            top = random.randint(0, h - cs)
+            left = random.randint(0, w - cs)
+            inp = inp[top:top + cs, left:left + cs]
+        else:
+            # Full frame: pad to common size for batching
+            target_h = ((1080 + 7) // 8) * 8
+            target_w = ((1920 + 7) // 8) * 8
+            pad_h = target_h - h
+            pad_w = target_w - w
+            if pad_h > 0 or pad_w > 0:
+                inp = np.pad(inp, ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
+                             mode='reflect')
 
         if self.augment:
             if random.random() < 0.5:
                 inp = inp[:, ::-1, :].copy()
             if random.random() < 0.5:
                 inp = inp[::-1, :, :].copy()
-            k = random.randint(0, 3)
-            if k > 0:
-                inp = np.rot90(inp, k).copy()
+            # Skip rotation for full-frame mode (changes aspect ratio)
+            if cs > 0:
+                k = random.randint(0, 3)
+                if k > 0:
+                    inp = np.rot90(inp, k).copy()
 
         inp = torch.from_numpy(inp.transpose(2, 0, 1))
         # Return inp twice — caller overrides second with teacher output

@@ -76,25 +76,28 @@ the quality of the original Bluray source material.
 - `tools/stop_training.py` — graceful stop via Modal Dict
 
 ### Deployment
-- `remaster/encode.vpy` — VapourSynth batch encoding (BestSource + vs-mlrt TRT + y4m)
-- `remaster/encode.py` — CLI wrapper: vspipe + ffmpeg NVENC with audio passthrough
-- `remaster/play.vpy` — VapourSynth real-time playback for mpv
-- `playback/enhance.vpy` — mpv + vs-mlrt TensorRT real-time playback
-- `remaster/encode.vpy` — VapourSynth batch encoding script (BestSource → vs-mlrt TRT → y4m)
-- `remaster/encode.py` — CLI wrapper: vspipe + ffmpeg NVENC encoding with audio passthrough
-- `remaster/play.vpy` — VapourSynth real-time playback script for mpv
-- `remaster/bench_pipeline.py` — Pipeline throughput benchmark: NVENC, pipe bandwidth, VapourSynth
+- `remaster/encode_nvencc.py` — **Fastest encoder**: NVEncC + VapourSynth in-process (~36 fps)
+- `remaster/encode_nvencc.vpy` — VapourSynth script for NVEncC (TRT inference, no pipe)
+- `remaster/encode.py` — VapourSynth + ffmpeg pipe encoder (~20 fps, audio passthrough)
+- `remaster/encode.vpy` — VapourSynth batch encoding (BestSource + TRT engine + y4m)
+- `remaster/play.vpy` — VapourSynth real-time playback for mpv (TRT engine)
+- `remaster/bench_trt.vpy` — Component benchmark: decode, colorspace, inference, full pipeline
+- `pipelines/remaster.py` — Python streaming pipeline (PyAV + torch.compile, ~24 fps)
+- `tools/export_onnx.py` — Export DRUNet to ONNX (dynamic shapes)
+- `tools/build_int8_engine.py` — INT8 TRT engine with proper calibration from real frames
+- `tools/build_int8_calibration.py` — Generate calibration data from originals
+- `pipeline_cpp/` — C++ NVDEC->TRT->NVENC zero-copy pipeline (not yet compiled)
 - `bench/compare.py` — PSNR/SSIM metrics and side-by-side comparison
-- `bench/bench_nafnet.py` — NAFNet vs SCUNet benchmark
-- `bench/sweep_architectures.py` — Sweep NAFNet width/depth configs at 1080p
-- `bench/sweep_plainnet.py` — Sweep PlainDenoise/UNetDenoise configs at 1080p
 
 ## Reference Code Submodules (`reference-code/`)
 - `SCUNet/` — Swin-Conv-UNet denoiser (current best approach, patched: thop try/except)
 - `RAFT/` — optical flow estimation
 - `NAFNet/` — NAFNet architecture reference (pretrained weights)
 - `DISTS/` — Deep Image Structure and Texture Similarity (perceptual loss, patched: modern torchvision API)
-- `Video-Depth-Anything/` — temporally consistent depth maps (patched: xformers→SDPA)
+- `Video-Depth-Anything/` — temporally consistent depth maps (patched: xformers->SDPA)
+- `sam3/` — SAM 3 (Segment Anything with Concepts) - semantic segmentation (explored, not used for denoising)
+- `dinov3/` — DINOv3 self-supervised vision features (ConvNeXt + ViT, explored for feature matching)
+- `NVEnc/` — NVEncC NVENC encoder with VapourSynth --vpy support (source for reference)
 - `FlashVSR/`, `FlashVSR-Pro/`, `BasicVSR_PlusPlus/` — video SR references
 - `ECBSR/` — Edge-oriented Conv Block SR (reparameterizable training, mobile-first)
 - `SPAN/` — NTIRE 2024 efficient SR winner (reparameterizable Conv3XC, EMA training)
@@ -168,18 +171,69 @@ modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
     --checkpoint-dir checkpoints/drunet_student \
     --feature-matching-weight 0.1 --optimizer prodigy --batch-size 192 \
     --ema --wandb --resume --fresh-optimizer
+
+# Fine-tune student on full frames (fixes dark area artifacts)
+modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
+    --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \
+    --checkpoint-dir checkpoints/drunet_student \
+    --feature-matching-weight 0.1 --perceptual-weight 0.05 --optimizer prodigy \
+    --batch-size 8 --crop-size 0 --max-iters 5000 \
+    --ema --wandb --resume --fresh-optimizer
+```
+
+**Data upload:** `--skip-upload` is now the default. Training data persists on the Modal volume between runs. Pass `--no-skip-upload` only if you changed the training data (rebuilt pairs, added new sources, etc.).
+
+### Deployment Pipeline (Production)
+```bash
+# Export ONNX (one-time)
+python tools/export_onnx.py
+
+# Build TRT FP16 engine (one-time per GPU)
+tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
+    --onnx=checkpoints/drunet_student/drunet_student.onnx \
+    --shapes=input:1x3x1080x1920 --fp16 --useCudaGraph \
+    --saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine
+
+# Encode video (fastest path: NVEncC + VapourSynth in-process, ~36 fps)
+python remaster/encode_nvencc.py input.mkv output.mkv
+
+# Alternative: VapourSynth + ffmpeg pipe (~20 fps)
+python remaster/encode.py input.mkv output.mkv
+
+# Alternative: Python streaming pipeline with torch.compile (~24 fps)
+python pipelines/remaster.py -i input.mkv -c checkpoints/drunet_student/final.pth \
+    --nc-list 16,32,64,128 --nb 2 --encoder hevc_nvenc --mux-audio --compile
+
+# Real-time playback: configure mpv with remaster/play.vpy
+```
+
+### INT8 Calibration
+```bash
+# Build properly calibrated INT8 engine (uses 200 random original frames)
+python tools/build_int8_engine.py
+
+# Or use the calibration cache with trtexec
+tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
+    --onnx=checkpoints/drunet_student/drunet_student.onnx \
+    --shapes=input:1x3x1080x1920 --fp16 --int8 \
+    --calib=checkpoints/drunet_student/drunet_student_1080p_int8_calib.cache \
+    --useCudaGraph --saveEngine=checkpoints/drunet_student/drunet_student_1080p_int8.engine
 ```
 
 ### Next Steps
-1. **Explore RAFT alignment data** — raw full-1080p RAFT-Things/Sintel data at `data/archive/raft_modal_extract/`. Determine if temporal alignment can produce sharper/cleaner targets than SCUNet GAN.
-2. **Student training running** — val 4000 PSNR 47.32 dB with DISTS (0.05 weight). Monitor and evaluate.
-3. **Temporal consistency** — explore cross-frame FFT attention at U-Net bottleneck (novel architecture, see `docs/temporal-consistency-research.md`)
-4. Deploy: ONNX export, TensorRT INT8, vs-mlrt integration
+1. **Full-frame fine-tune** running on Modal -- fixes dark area artifacts by training with full 1080p context
+2. **C++ pipeline** (`pipeline_cpp/`) -- NVDEC->TRT->NVENC zero-copy GPU pipeline for 60+ fps. Code written, needs compilation (VS Build Tools + CUDA Toolkit installed locally)
+3. **INT8 optimization** -- switch display to Radeon to free VRAM for full INT8 tactic profiling (currently 40 fps, could reach 55 fps)
+4. **NVEncC audio** -- `--audio-source` flag needs testing for direct audio passthrough
 
-### Current Training Status (2026-04-07)
-- **Teacher**: 13K iters, PSNR 46.06 dB, perceptual weight 0.15, color-corrected targets (GAN Y + original CrCb + USM)
-- **Student**: training with DISTS (0.05), feature matching (0.1), batch 128, PSNR 47.32 dB at val 4000 (still running)
-- **RAFT research**: full 1080p flow data extracted for 30 frames with RAFT-Things and RAFT-Sintel. Local FFT/Wiener attempts didn't improve quality — likely alignment accuracy issue at 3/4 res. Full-res data needs interactive exploration.
+### Current Status (2026-04-07)
+- **Teacher**: 13K iters, PSNR 53.27 dB, 107% sharpness, near-perfect color (Cr/Cb error 0.44)
+- **Student**: 10.4K iters, PSNR 49.19 dB, 1.06M params. Full-frame fine-tuning in progress (5K iters, crop_size=0)
+- **Deployment**: ONNX exported, TRT FP16 engine (37 fps), INT8 calibrated engine (40 fps), NVEncC 36.5 fps end-to-end
+- **Full episode**: Firefly S01E03 encoded in 35 min (29.5 fps, faster than real-time)
+- **RAFT research**: Temporal alignment explored. DINO feature matching (1.33x SNR) beats RAFT median (1.2x) but neither beats the DRUNet teacher (2.14x SNR)
+- **DINOv3**: Features extracted (15 fps locally, 133MB VRAM). Useful for semantic matching but not for denoising targets. Not viable as a loss function (color-blind by design)
+- **Color**: Student has Cr/Cb shift (~12 points) but VLC display bug was the primary visual issue. BT.709 metadata now correctly tagged in all encode paths.
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`, `docs/training-data-plan.md`, `docs/pruning-plan.md`.
 
