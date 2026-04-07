@@ -103,12 +103,38 @@ clip = core.ttsmooth.TTempSmooth(clip, maxr=3, thresh=[4,5,5])
 - **Cons:** Loses some detail in motion areas, doesn't fix root cause
 - **Speed impact:** ~5-10% slower
 
+### Option E: Multi-Scale FFT Temporal Fusion (Preferred Architecture v2)
+
+Hybrid approach: spatial convolutions for local features, frequency-domain attention for temporal fusion at EVERY U-Net scale (not just bottleneck). Inspired by LaMa's FFC but applied temporally.
+
+```
+Encoder level 1 (1920x1080, 16ch):
+  spatial conv -> rfft2 -> temporal freq attention -> irfft2 -> downsample
+
+Encoder level 2 (960x540, 32ch):
+  spatial conv -> rfft2 -> temporal freq attention -> irfft2 -> downsample
+
+Encoder level 3 (480x270, 64ch):
+  spatial conv -> rfft2 -> temporal freq attention -> irfft2 -> downsample
+
+Bottleneck (240x135, 128ch):
+  spatial conv -> rfft2 -> temporal freq attention -> irfft2
+
+Decoder mirrors with skip connections
+```
+
+- **Pros:** Multi-scale temporal fusion — fine detail at high res, global consistency at low res. Existing encoder/decoder weights transfer. ~3ms total FFT overhead.
+- **Cons:** More complex than bottleneck-only. Needs sequential training data.
+- **Speed:** 80fps -> ~55fps (still 2x real-time)
+- **Key advantage over Option B:** captures temporal correlations at every frequency scale, not just the most compressed representation
+
 ## Recommended Implementation Order
 
 1. **Now:** Option D (VapourSynth temporal filter) — instant improvement, no training
 2. **Next training run:** Option C (temporal loss) — requires sequential frame pairs, but zero inference cost
-3. **Architecture v2:** Option B (cross-attention at bottleneck) — the proper solution, needs design and training from scratch
-4. **Research:** Study FastDVDNet and TAP codebases for implementation patterns
+3. **Architecture v2:** Option E (multi-scale FFT temporal fusion) — the proper solution
+4. **Fallback:** Option B (spatial cross-attention at bottleneck) if FFT approach doesn't pan out
+5. **Research:** Study FastDVDNet, TAP, and LaMa/FFC codebases for implementation patterns
 
 ## Training Data Changes Needed
 
