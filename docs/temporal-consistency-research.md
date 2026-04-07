@@ -130,6 +130,70 @@ For temporal approaches (B and C), we need **sequential frame pairs** instead of
 | DRUNet + cross-attn | ~1.5M | ~25ms | 40 | 8-frame batch, bottleneck attn |
 | DRUNet + temporal loss | 1.06M | ~12ms | 80+ | Same model, trained differently |
 
+## Novel Idea: Cross-Frame FFT Attention at Bottleneck
+
+**Status: Confirmed novel** — no prior work combines (1) cross-frame attention (2) in frequency domain (3) at a U-Net bottleneck. This is a learned, differentiable version of VBM4D's core insight.
+
+### Why FFT for Temporal Denoising
+
+- Noise is flat-spectrum (white/weakly colored) — equal energy at all frequencies
+- Signal has structured spectrum — concentrated, consistent patterns
+- Across N frames: signal frequency bins are consistent, noise bins are random
+- Attention in frequency domain naturally weights consistent bins (signal) and suppresses varying bins (noise)
+- This is effectively **learned temporal Wiener filtering**
+
+### Architecture
+
+```
+Frame 1 -> Encoder -> Bottleneck_1 -> rfft2 --┐
+Frame 2 -> Encoder -> Bottleneck_2 -> rfft2 --┤
+Frame 3 -> Encoder -> Bottleneck_3 -> rfft2 --┼-> Freq Attention -> ifft2 -> Decoder -> Output
+Frame 4 -> Encoder -> Bottleneck_4 -> rfft2 --┤
+Frame 5 -> Encoder -> Bottleneck_5 -> rfft2 --┘
+```
+
+### Implementation Details
+
+At 1080p bottleneck (240x135, 128ch student):
+- rfft2 produces 240x68 complex tensors per frame (~microseconds on GPU)
+- 5 frames x 128ch x 240x68 x 2 (complex) x 2 bytes = ~16MB (trivial)
+- Cross-frame attention: O(T^2 * F) where T=5, F=frequency bins — negligible
+- torch.fft supports autograd natively, no custom CUDA needed
+- Pad to 256x128 for power-of-2 FFT performance
+
+### Prototype Strategy
+
+Start simple, add complexity:
+1. **Baseline:** magnitude-weighted cross-frame averaging (no learnable params)
+   - Average magnitudes across frames, keep reference phase
+   - Compare to spatial-domain frame averaging
+2. **Learned gating:** element-wise learnable weights per frequency bin
+   - Similar to SPECTRE's adaptive spectral gating
+3. **Full attention:** complex-valued QKV attention across frames
+   - Compute attention weights from magnitudes, apply to complex values
+
+### Estimated Speed Impact
+
+- FFT at bottleneck: ~0.1ms (240x135 is tiny)
+- Cross-frame attention: ~0.5ms for 5 frames
+- Total overhead: ~1-2ms per frame group
+- Student at 80fps -> ~60fps with FFT attention (still 2x real-time)
+
+### Key Insight for Training
+
+The cross-attention doesn't need to produce better detail than the teacher — it just needs to produce the SAME detail consistently across frames. Having multi-frame input reduces prediction variance (noise averages out in feature space), even if the loss target is single-frame quality.
+
+### Prior Art (Related but Distinct)
+
+- **FNet (Google 2021):** FFT replaces attention within single frame, 80% faster training
+- **GFNet:** Learnable frequency filters for token mixing
+- **FFTformer (CVPR 2023):** Frequency-domain element-wise products, O(N) attention
+- **SPECTRE (Feb 2025):** Adaptive spectral gating, 7x faster than FlashAttention-2
+- **FADNet:** Inter-channel frequency attention for single-frame denoising
+- **VBM4D:** Classical non-learned transform-domain temporal denoising (closest analog)
+
+All of these operate within single frames. None combine cross-frame temporal attention with frequency-domain processing.
+
 ## References
 
 - FastDVDNet: https://github.com/m-tassano/fastdvdnet
@@ -138,3 +202,8 @@ For temporal approaches (B and C), we need **sequential frame pairs** instead of
 - PocketDVDNet: https://arxiv.org/abs/2601.16780
 - GRTN: https://arxiv.org/abs/2409.06603
 - RAFT (optical flow): reference-code/RAFT/
+- FNet: https://arxiv.org/abs/2105.03824
+- GFNet: https://openreview.net/pdf?id=K_Mnsw5VoOW
+- FFTformer: https://arxiv.org/abs/2211.12250
+- SPECTRE: https://arxiv.org/abs/2502.18394
+- FADNet: https://ieeexplore.ieee.org/document/10541898/
