@@ -64,3 +64,9 @@
 [submodule "reference-code/prodigy"]
 	path = reference-code/prodigy
 	url = https://github.com/konstmish/prodigy.git
+[submodule "reference-code/sam3"]
+	path = reference-code/sam3
+	url = https://github.com/facebookresearch/sam3
+[submodule "reference-code/dinov3"]
+	path = reference-code/dinov3
+	url = https://github.com/facebookresearch/dinov3
