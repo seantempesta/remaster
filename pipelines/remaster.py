@@ -96,8 +96,9 @@ def load_model(checkpoint_path, nc_list, nb, device="cuda", fp16=True, use_compi
 
     if use_compile:
         try:
-            model = torch.compile(model, mode="max-autotune", fullgraph=True)
-            print("  torch.compile enabled (max-autotune, fullgraph, freezing)")
+            # reduce-overhead uses CUDA graphs for minimal CPU dispatch overhead
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+            print("  torch.compile enabled (reduce-overhead, fullgraph, freezing)")
         except Exception as e:
             print(f"  torch.compile failed: {e}")
 
@@ -108,7 +109,7 @@ def remaster_video(
     model, input_path, output_path, *,
     batch_size=1, crf=18, encoder="hevc_nvenc",
     max_frames=-1, fp16=True, use_compile=False,
-    hwdec=False, mux_audio=False, preserve_color=False,
+    hwdec=False, mux_audio=False,
 ):
     """Stream video through DRUNet with threaded IO and double-buffered inference."""
     import av
@@ -157,9 +158,9 @@ def remaster_video(
     write_cmd = build_encoder_cmd(ffmpeg_bin, w, h, fps, video_output, encoder, crf)
     frame_bytes = w * h * 3
 
-    # Threading setup
-    frame_queue = Queue(maxsize=batch_size * 8)
-    result_queue = Queue(maxsize=batch_size * 8)
+    # Threading setup — larger queues to decouple stages
+    frame_queue = Queue(maxsize=batch_size * 16)
+    result_queue = Queue(maxsize=batch_size * 16)
     SENTINEL = object()
     WRITER_DONE = object()
 
@@ -201,7 +202,7 @@ def remaster_video(
         proc.stdout.close()
         proc.wait()
 
-    writer_proc = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=frame_bytes * 8)
+    writer_proc = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, bufsize=frame_bytes * 16)
 
     def writer_thread():
         while True:
@@ -293,18 +294,8 @@ def remaster_video(
         out_cropped = out_t[:, :, :h, :w]
         out_np = (out_cropped.clamp(0, 1) * 255).byte().cpu().numpy().transpose(0, 2, 3, 1)
 
-        # Color preservation (disabled by default — only needed if model has color shift)
-        # if preserve_color:
-        #     for fi in range(len(cur_frames)):
-        #         inp_f = cur_frames[fi].astype(np.float32)
-        #         out_f = out_np[fi].astype(np.float32)
-        #         for c in range(3):
-        #             inp_mean = inp_f[:, :, c].mean()
-        #             inp_std = inp_f[:, :, c].std() + 1e-6
-        #             out_mean = out_f[:, :, c].mean()
-        #             out_std = out_f[:, :, c].std() + 1e-6
-        #             out_f[:, :, c] = (out_f[:, :, c] - out_mean) * (inp_std / out_std) + inp_mean
-        #         out_np[fi] = np.clip(out_f, 0, 255).astype(np.uint8)
+        # Color is correct — VLC had a display bug, not a model bug.
+        # BT.709 metadata is set in build_encoder_cmd (lib/ffmpeg_utils.py).
 
         t4 = time.perf_counter()
 
@@ -419,8 +410,7 @@ def main():
                         help="Use NVDEC hardware decode (HEVC only)")
     parser.add_argument("--mux-audio", action="store_true",
                         help="Copy audio from input to output")
-    parser.add_argument("--preserve-color", action="store_true",
-                        help="Keep original colors (YCrCb: model Y + input CrCb)")
+    # --preserve-color removed: VLC display bug was the cause, not the model
 
     args = parser.parse_args()
 
@@ -442,7 +432,6 @@ def main():
         batch_size=args.batch_size, crf=args.crf, encoder=args.encoder,
         max_frames=args.max_frames, fp16=fp16, use_compile=args.compile,
         hwdec=args.hwdec, mux_audio=args.mux_audio,
-        preserve_color=args.preserve_color,
     )
 
 
