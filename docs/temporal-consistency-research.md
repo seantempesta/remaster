@@ -128,12 +128,29 @@ Decoder mirrors with skip connections
 - **Speed:** 80fps -> ~55fps (still 2x real-time)
 - **Key advantage over Option B:** captures temporal correlations at every frequency scale, not just the most compressed representation
 
+## Current Status (2026-04-07)
+
+**Raw RAFT data extracted** at full 1080p with RAFT-Things and RAFT-Sintel on Modal L40S.
+Data at `data/archive/raft_modal_extract/{things,sintel}/` — 30 frames, 8 neighbors each.
+Includes: flow fields (.npy float16), warped frames (.png), occlusion masks (.npy bool).
+
+**Local FFT experiments inconclusive** — tried median, FFT confidence, Wiener filter+sharpen
+at 3/4 res with RAFT-Small. Results still noisy, not sharper. Likely due to:
+1. RAFT-Small at 3/4 res produces inaccurate flow on noisy Firefly content
+2. HEVC block artifacts are spatially correlated (not random Gaussian) — FFT assumptions violated
+3. Need to verify alignment quality with full-res data before investing in post-processing
+
+**Next: Interactive exploration** of full-res RAFT data to determine:
+- Is alignment actually good at full 1080p with larger models?
+- What combination strategy works best?
+- Can we use this for training target generation?
+
 ## Recommended Implementation Order
 
-1. **Now:** Option D (VapourSynth temporal filter) — instant improvement, no training
-2. **Next training run:** Option C (temporal loss) — requires sequential frame pairs, but zero inference cost
-3. **Architecture v2:** Option E (multi-scale FFT temporal fusion) — the proper solution
-4. **Fallback:** Option B (spatial cross-attention at bottleneck) if FFT approach doesn't pan out
+1. **Now:** Explore full-res RAFT alignment data interactively
+2. **If alignment is good:** Use RAFT temporal averaging for target generation (replace SCUNet GAN)
+3. **If alignment is bad:** Fall back to Option D (VapourSynth temporal filter) for inference
+4. **Architecture v2:** Option E (multi-scale FFT temporal fusion) — the proper solution
 5. **Research:** Study FastDVDNet, TAP, and LaMa/FFC codebases for implementation patterns
 
 ## Training Data Changes Needed

@@ -171,10 +171,15 @@ modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
 ```
 
 ### Next Steps
-1. Build inputs (--build-inputs) for the new training data
-2. Resume teacher training with --fresh-optimizer on expanded dataset (6,266 train + 692 val)
-3. Retrain student with improved teacher
+1. **Explore RAFT alignment data** — raw full-1080p RAFT-Things/Sintel data at `data/archive/raft_modal_extract/`. Determine if temporal alignment can produce sharper/cleaner targets than SCUNet GAN.
+2. **Student training running** — val 4000 PSNR 47.32 dB with DISTS (0.05 weight). Monitor and evaluate.
+3. **Temporal consistency** — explore cross-frame FFT attention at U-Net bottleneck (novel architecture, see `docs/temporal-consistency-research.md`)
 4. Deploy: ONNX export, TensorRT INT8, vs-mlrt integration
+
+### Current Training Status (2026-04-07)
+- **Teacher**: 13K iters, PSNR 46.06 dB, perceptual weight 0.15, color-corrected targets (GAN Y + original CrCb + USM)
+- **Student**: training with DISTS (0.05), feature matching (0.1), batch 128, PSNR 47.32 dB at val 4000 (still running)
+- **RAFT research**: full 1080p flow data extracted for 30 frames with RAFT-Things and RAFT-Sintel. Local FFT/Wiener attempts didn't improve quality — likely alignment accuracy issue at 3/4 res. Full-res data needs interactive exploration.
 
 **Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`, `docs/training-data-plan.md`, `docs/pruning-plan.md`.
 
