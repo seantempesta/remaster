@@ -160,7 +160,8 @@ int main(int argc, char** argv) {
     std::cerr << "GPU: " << deviceName << std::endl;
 
     CUcontext cuContext = nullptr;
-    ck(cuCtxCreate(&cuContext, 0, cuDevice));
+    CUctxCreateParams ctxParams = {};  // CUDA 13.x v4 API (NULL params = regular context)
+    ck(cuCtxCreate(&cuContext, &ctxParams, 0, cuDevice));
 
     // Set persistent L2 cache to 50% for TRT inference benefit
     {
