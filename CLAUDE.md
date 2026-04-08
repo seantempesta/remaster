@@ -253,7 +253,7 @@ Current approach: exclude Add ops from INT8 via `op_types_to_exclude=["Add"]`. T
 - **TRT INT8 mixed (legacy)**: 43.3 fps trtexec (19.2ms GPU), 67.2 dB vs PyTorch FP32
 - **TRT INT8 pure (ModelOpt Q/DQ)**: 39 fps trtexec (17.9ms GPU), 26.1 dB (Add ops need FP16)
 - **NVEncC pipeline**: 39 fps with audio, VapourSynth in-process
-- **Bottleneck**: TRT inference (20ms/frame); NVDEC/NVENC fully overlapped via async I/O
+- **Bottleneck**: TRT inference (~20ms/frame = 50 fps theoretical). NVDEC (500+ fps) and NVENC (200+ fps) are fully hidden via async I/O on separate CUDA streams. The profiler shows 22ms "decode time" but this includes waiting for the previous frame's GPU work — it is NOT an NVDEC bottleneck. Pipeline achieves 42 fps due to ~3ms sync/CPU overhead per frame.
 - **Full episodes**: Firefly S01E05 (~42 min @ ~42 fps = ~24 min encode)
 - **Environment**: Python 3.12, PyTorch 2.11+cu130, CUDA 13.2, TRT 10.16.0, VS R73
 - **Build tools**: VS Build Tools 2022, CUDA 13.2, CMake 3.31, TRT 10.16 headers
