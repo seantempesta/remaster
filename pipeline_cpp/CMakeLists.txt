@@ -110,10 +110,12 @@ message(STATUS "FFmpeg libs:    ${AVFORMAT_LIB} ${AVCODEC_LIB} ${AVUTIL_LIB}")
 # ---------------------------------------------------------------------------
 # Video SDK sources (NvDecoder, NvEncoder are not header-only)
 # ---------------------------------------------------------------------------
+# NvEncoder sources are local copies with updated SDK 13.0 nvEncodeAPI.h
+# (the submodule has SDK 8.1 headers which are rejected by modern drivers)
 set(VIDEO_SDK_SOURCES
     ${VIDEO_SDK_NVCODEC}/NvDecoder/NvDecoder.cpp
-    ${VIDEO_SDK_NVCODEC}/NvEncoder/NvEncoder.cpp
-    ${VIDEO_SDK_NVCODEC}/NvEncoder/NvEncoderCuda.cpp
+    ${CMAKE_SOURCE_DIR}/nvenc/NvEncoder.cpp
+    ${CMAKE_SOURCE_DIR}/nvenc/NvEncoderCuda.cpp
 )
 
 # ColorSpace.cu from Utils provides conversion helpers (we include for completeness
@@ -131,13 +133,12 @@ add_executable(remaster_pipeline
 
 target_include_directories(remaster_pipeline PRIVATE
     ${CMAKE_SOURCE_DIR}
-    # Video SDK includes -- the SDK sources use includes like:
-    #   "NvDecoder/NvDecoder.h"  (from NvCodec/)
-    #   "NvEncoder/NvEncoderCuda.h"  (from NvCodec/)
-    #   "../Utils/NvCodecUtils.h"  (from NvCodec/NvDecoder/)
-    ${VIDEO_SDK_NVCODEC}             # resolves "NvDecoder/NvDecoder.h", "NvEncoder/NvEncoder.h"
+    # Local NvEncoder with updated SDK 13.0 headers
+    ${CMAKE_SOURCE_DIR}/nvenc                # resolves "NvEncoder.h", "NvEncoderCuda.h"
+    ${CMAKE_SOURCE_DIR}/include              # resolves "nvEncodeAPI.h" (SDK 13.0)
+    # Video SDK includes -- NvDecoder still uses the submodule
+    ${VIDEO_SDK_NVCODEC}             # resolves "NvDecoder/NvDecoder.h"
     ${VIDEO_SDK_NVCODEC}/NvDecoder   # resolves "nvcuvid.h", "cuviddec.h"
-    ${VIDEO_SDK_NVCODEC}/NvEncoder   # resolves "nvEncodeAPI.h"
     ${VIDEO_SDK_UTILS}               # resolves "NvCodecUtils.h", "FFmpegDemuxer.h", "Logger.h"
     # TensorRT
     ${TRT_INCLUDE_DIR}

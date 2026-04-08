@@ -72,16 +72,21 @@ public:
         pkt_ = av_packet_alloc();
         pktFiltered_ = av_packet_alloc();
 
-        // Set up bitstream filter for H.264 in MP4/MKV/FLV containers
+        // Set up bitstream filter for H.264/HEVC in MP4/MKV/FLV containers
         // (converts from length-prefixed NALUs to Annex B start codes for NVDEC)
-        bool needBsf = (codecId_ == AV_CODEC_ID_H264) && fmtCtx_->iformat && (
+        bool isContainer = fmtCtx_->iformat && (
             !strcmp(fmtCtx_->iformat->name, "mov,mp4,m4a,3gp,3g2,mj2") ||
             !strcmp(fmtCtx_->iformat->name, "flv") ||
             !strcmp(fmtCtx_->iformat->name, "matroska,webm")
         );
+        const char* bsfName = nullptr;
+        if (isContainer && codecId_ == AV_CODEC_ID_H264)
+            bsfName = "h264_mp4toannexb";
+        else if (isContainer && codecId_ == AV_CODEC_ID_HEVC)
+            bsfName = "hevc_mp4toannexb";
 
-        if (needBsf) {
-            const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
+        if (bsfName) {
+            const AVBitStreamFilter* bsf = av_bsf_get_by_name(bsfName);
             if (bsf) {
                 ret = av_bsf_alloc(bsf, &bsfCtx_);
                 if (ret >= 0) {
