@@ -1,4 +1,5 @@
 // trt_inference.h -- TensorRT engine loader and inference wrapper
+// Updated for TensorRT 10.6+ API (tensor-name-based, enqueueV3)
 #pragma once
 
 #include <string>
@@ -39,7 +40,7 @@ public:
     int getOutputWidth() const { return outputW_; }
 
 private:
-    // TRT objects (opaque pointers, cleaned up in destructor)
+    // TRT objects (opaque pointers, cleaned up in destructor via delete)
     nvinfer1::IRuntime*          runtime_ = nullptr;
     nvinfer1::ICudaEngine*       engine_  = nullptr;
     nvinfer1::IExecutionContext* context_ = nullptr;
@@ -48,7 +49,7 @@ private:
     int inputH_  = 0, inputW_  = 0;
     int outputH_ = 0, outputW_ = 0;
 
-    // Binding indices
-    int inputIndex_  = -1;
-    int outputIndex_ = -1;
+    // Tensor names (TRT 10.x uses names instead of binding indices)
+    std::string inputName_;
+    std::string outputName_;
 };

@@ -54,9 +54,9 @@ foreach(DLL_NAME nvinfer_10 nvonnxparser_10)
                 set(FOUND_EXPORTS TRUE)
             endif()
         endforeach()
-        # Generate .lib
+        # Generate .lib (no quotes around /def: and /out: args - CMake handles it)
         execute_process(
-            COMMAND lib /def:"${DEF_FILE}" /out:"${LIB_FILE}" /machine:x64
+            COMMAND lib /def:${DEF_FILE} /out:${LIB_FILE} /machine:x64
             RESULT_VARIABLE LIB_RESULT
         )
         if(NOT LIB_RESULT EQUAL 0)
@@ -72,25 +72,29 @@ message(STATUS "TensorRT include: ${TRT_INCLUDE_DIR}")
 message(STATUS "TensorRT lib:     ${TRT_NVINFER_LIB}")
 
 # FFmpeg (avcodec, avformat, avutil)
-# On Windows, typically from a shared build (e.g., gyan.dev or BtbN builds)
+# Shared build from gyan.dev (downloaded to tools/_downloads/)
+set(FFMPEG_SEARCH_PATHS
+    "${CMAKE_SOURCE_DIR}/../tools/_downloads/ffmpeg-n7.1-latest-win64-gpl-shared-7.1"
+    "$ENV{FFMPEG_ROOT}"
+    "C:/ffmpeg"
+    "C:/Program Files/ffmpeg"
+)
+
 find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h
-    PATHS
-        "$ENV{FFMPEG_ROOT}"
-        "C:/ffmpeg"
-        "C:/Program Files/ffmpeg"
+    PATHS ${FFMPEG_SEARCH_PATHS}
     PATH_SUFFIXES include
 )
 
 find_library(AVFORMAT_LIB avformat
-    PATHS "$ENV{FFMPEG_ROOT}" "C:/ffmpeg" "C:/Program Files/ffmpeg"
+    PATHS ${FFMPEG_SEARCH_PATHS}
     PATH_SUFFIXES lib lib64 lib/x64
 )
 find_library(AVCODEC_LIB avcodec
-    PATHS "$ENV{FFMPEG_ROOT}" "C:/ffmpeg" "C:/Program Files/ffmpeg"
+    PATHS ${FFMPEG_SEARCH_PATHS}
     PATH_SUFFIXES lib lib64 lib/x64
 )
 find_library(AVUTIL_LIB avutil
-    PATHS "$ENV{FFMPEG_ROOT}" "C:/ffmpeg" "C:/Program Files/ffmpeg"
+    PATHS ${FFMPEG_SEARCH_PATHS}
     PATH_SUFFIXES lib lib64 lib/x64
 )
 
@@ -175,10 +179,8 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/W3 /MP>
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>
     )
-    # FFmpegDemuxer.h uses deprecated APIs, suppress warnings
     target_compile_definitions(remaster_pipeline PRIVATE
         _CRT_SECURE_NO_WARNINGS
-        FF_API_INIT_PACKET  # Suppress av_init_packet deprecation
     )
 endif()
 

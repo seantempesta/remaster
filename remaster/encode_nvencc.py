@@ -44,8 +44,7 @@ def encode_file(input_path, output_path, cq=18, preset="p4"):
         "--output-depth", "10",
         "--preset", preset,
         "--vbr-quality", str(cq),
-        "--audio-source", input_path,  # copy audio from original
-        "--audio-copy",
+        "--audio-source", f"{input_path}:copy",  # copy audio from original
         "--colormatrix", "bt709",
         "--colorprim", "bt709",
         "--transfer", "bt709",

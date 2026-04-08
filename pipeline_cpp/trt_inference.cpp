@@ -1,4 +1,5 @@
 // trt_inference.cpp -- TensorRT engine loader and inference wrapper
+// Updated for TensorRT 10.6+ API (no .destroy(), tensor-name-based API, enqueueV3)
 
 #include "trt_inference.h"
 #include <NvInfer.h>
@@ -31,9 +32,13 @@ public:
 // ---------------------------------------------------------------------------
 
 TrtInference::~TrtInference() {
-    if (context_) { context_->destroy(); context_ = nullptr; }
-    if (engine_)  { engine_->destroy();  engine_  = nullptr; }
-    if (runtime_) { runtime_->destroy(); runtime_ = nullptr; }
+    // TRT 10.x uses normal C++ destructors, not .destroy()
+    delete context_;
+    context_ = nullptr;
+    delete engine_;
+    engine_ = nullptr;
+    delete runtime_;
+    runtime_ = nullptr;
     delete logger_;
     logger_ = nullptr;
 }
@@ -78,36 +83,37 @@ bool TrtInference::loadEngine(const std::string& enginePath) {
         return false;
     }
 
-    // Find input/output bindings
-    int nbBindings = engine_->getNbBindings();
-    for (int i = 0; i < nbBindings; i++) {
-        const char* name = engine_->getBindingName(i);
-        nvinfer1::Dims dims = engine_->getBindingDimensions(i);
+    // Find input/output tensors using TRT 10.x tensor-name API
+    int nbIO = engine_->getNbIOTensors();
+    for (int i = 0; i < nbIO; i++) {
+        const char* name = engine_->getIOTensorName(i);
+        nvinfer1::Dims dims = engine_->getTensorShape(name);
+        nvinfer1::TensorIOMode mode = engine_->getTensorIOMode(name);
 
-        if (engine_->bindingIsInput(i)) {
-            inputIndex_ = i;
+        if (mode == nvinfer1::TensorIOMode::kINPUT) {
+            inputName_ = name;
             // Expect NCHW: [1, 3, H, W]
             if (dims.nbDims >= 4) {
                 inputH_ = dims.d[2];
                 inputW_ = dims.d[3];
             }
-            std::cerr << "Input binding '" << name << "': "
+            std::cerr << "Input tensor '" << name << "': "
                       << dims.d[0] << "x" << dims.d[1] << "x"
                       << dims.d[2] << "x" << dims.d[3] << std::endl;
-        } else {
-            outputIndex_ = i;
+        } else if (mode == nvinfer1::TensorIOMode::kOUTPUT) {
+            outputName_ = name;
             if (dims.nbDims >= 4) {
                 outputH_ = dims.d[2];
                 outputW_ = dims.d[3];
             }
-            std::cerr << "Output binding '" << name << "': "
+            std::cerr << "Output tensor '" << name << "': "
                       << dims.d[0] << "x" << dims.d[1] << "x"
                       << dims.d[2] << "x" << dims.d[3] << std::endl;
         }
     }
 
-    if (inputIndex_ < 0 || outputIndex_ < 0) {
-        std::cerr << "Could not find input/output bindings" << std::endl;
+    if (inputName_.empty() || outputName_.empty()) {
+        std::cerr << "Could not find input/output tensors" << std::endl;
         return false;
     }
 
@@ -117,13 +123,19 @@ bool TrtInference::loadEngine(const std::string& enginePath) {
 }
 
 bool TrtInference::infer(__half* input, __half* output, cudaStream_t stream) {
-    void* bindings[2];
-    bindings[inputIndex_]  = input;
-    bindings[outputIndex_] = output;
+    // TRT 10.x: set tensor addresses by name, then enqueueV3
+    if (!context_->setTensorAddress(inputName_.c_str(), input)) {
+        std::cerr << "Failed to set input tensor address" << std::endl;
+        return false;
+    }
+    if (!context_->setTensorAddress(outputName_.c_str(), output)) {
+        std::cerr << "Failed to set output tensor address" << std::endl;
+        return false;
+    }
 
-    bool ok = context_->enqueueV2(bindings, stream, nullptr);
+    bool ok = context_->enqueueV3(stream);
     if (!ok) {
-        std::cerr << "TensorRT enqueueV2 failed" << std::endl;
+        std::cerr << "TensorRT enqueueV3 failed" << std::endl;
     }
     return ok;
 }

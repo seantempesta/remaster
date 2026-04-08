@@ -20,9 +20,9 @@
 #include "NvEncoder/NvEncoderCuda.h"
 #include "NvDecoder/NvDecoder.h"
 #include "NvCodecUtils.h"
-#include "FFmpegDemuxer.h"
 
 // Our modules
+#include "simple_demuxer.h"
 #include "trt_inference.h"
 #include "color_kernels.h"
 
@@ -37,7 +37,7 @@ struct PipelineConfig {
     std::string enginePath;
     int gpu          = 0;
     int cq           = 24;     // constant quality (lower = higher quality)
-    std::string preset = "p4"; // NVENC preset
+    std::string preset = "hq"; // NVENC preset (old-style: default, hq, hp, ll, llhq, llhp)
     bool tenBit      = false;  // output 10-bit HEVC
 };
 
@@ -50,7 +50,7 @@ static void printUsage() {
         << "  --engine  / -e   TensorRT engine file (required)\n"
         << "  --gpu            GPU ordinal (default: 0)\n"
         << "  --cq             Constant quality value, lower=better (default: 24)\n"
-        << "  --preset         NVENC preset: p1..p7 (default: p4)\n"
+        << "  --preset         NVENC preset: default, hq, hp, ll, llhq, llhp (default: hq)\n"
         << "  --10bit          Output 10-bit HEVC\n"
         << "  --help   / -h    Show this message\n"
         << std::endl;
@@ -86,18 +86,19 @@ static bool parseArgs(int argc, char** argv, PipelineConfig& cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// NVENC preset string -> GUID
+// NVENC preset string -> GUID (old-style SDK 9.x presets)
 // ---------------------------------------------------------------------------
 static GUID presetGuidFromString(const std::string& preset) {
-    if (preset == "p1") return NV_ENC_PRESET_P1_GUID;
-    if (preset == "p2") return NV_ENC_PRESET_P2_GUID;
-    if (preset == "p3") return NV_ENC_PRESET_P3_GUID;
-    if (preset == "p4") return NV_ENC_PRESET_P4_GUID;
-    if (preset == "p5") return NV_ENC_PRESET_P5_GUID;
-    if (preset == "p6") return NV_ENC_PRESET_P6_GUID;
-    if (preset == "p7") return NV_ENC_PRESET_P7_GUID;
-    std::cerr << "Unknown preset '" << preset << "', using p4" << std::endl;
-    return NV_ENC_PRESET_P4_GUID;
+    if (preset == "default") return NV_ENC_PRESET_DEFAULT_GUID;
+    if (preset == "hp")      return NV_ENC_PRESET_HP_GUID;
+    if (preset == "hq")      return NV_ENC_PRESET_HQ_GUID;
+    if (preset == "bd")      return NV_ENC_PRESET_BD_GUID;
+    if (preset == "ll")      return NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID;
+    if (preset == "llhq")    return NV_ENC_PRESET_LOW_LATENCY_HQ_GUID;
+    if (preset == "llhp")    return NV_ENC_PRESET_LOW_LATENCY_HP_GUID;
+    if (preset == "lossless") return NV_ENC_PRESET_LOSSLESS_DEFAULT_GUID;
+    std::cerr << "Unknown preset '" << preset << "', using hq" << std::endl;
+    return NV_ENC_PRESET_HQ_GUID;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +152,14 @@ int main(int argc, char** argv) {
     ck(cuCtxCreate(&cuContext, 0, cuDevice));
 
     // -----------------------------------------------------------------------
-    // 2. Open input with FFmpeg demuxer + NVDEC decoder
+    // 2. Open input with SimpleDemuxer + NVDEC decoder
     // -----------------------------------------------------------------------
-    FFmpegDemuxer demuxer(cfg.inputPath.c_str());
+    SimpleDemuxer demuxer(cfg.inputPath.c_str());
+    if (!demuxer.IsValid()) {
+        std::cerr << "Failed to open input: " << cfg.inputPath << std::endl;
+        return 1;
+    }
+
     int srcWidth  = demuxer.GetWidth();
     int srcHeight = demuxer.GetHeight();
     int bitDepth  = demuxer.GetBitDepth();
@@ -216,18 +222,13 @@ int main(int argc, char** argv) {
 
         pEnc->CreateDefaultEncoderParams(&initParams, codecGuid, presetGuid);
 
-        // Apply tuning
-        initParams.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
-
-        // VBR with constant quality
+        // VBR with constant QP (old-style SDK -- no tuningInfo or multiPass)
         encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
         encodeConfig.rcParams.constQP = { (uint32_t)cfg.cq, (uint32_t)cfg.cq, (uint32_t)cfg.cq };
-        encodeConfig.rcParams.multiPass = NV_ENC_TWO_PASS_FULL_RESOLUTION;
 
-        // HEVC-specific
+        // HEVC-specific: set pixel bit depth for 10-bit output
         if (outIs10bit) {
             encodeConfig.encodeCodecConfig.hevcConfig.pixelBitDepthMinus8 = 2;
-            encodeConfig.encodeCodecConfig.hevcConfig.inputBitDepthMinus8 = 2;
         }
 
         // B-frames for quality

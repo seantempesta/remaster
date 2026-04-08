@@ -1,194 +1,220 @@
 # remaster
 
-You know that feeling when you want to rewatch an old favorite and the only copy you can find looks like it was compressed through a potato? Blocky gradients, smeared faces, fine detail replaced with MPEG sludge. Some people will tell you that's "charming" or "authentic." Those people are wrong. The director didn't spend months on lighting and color grading so you could watch a copy that looks like it was faxed. Don't settle for it.
+You know that feeling when you want to rewatch an old favorite and the only copy you can find looks like it was compressed through a potato? Blocky gradients, smeared faces, fine detail replaced with MPEG sludge. Some people will tell you that's "charming" or "authentic." Those people are wrong. The director didn't spend months on lighting and color grading so you could watch a copy that looks like it was faxed.
 
-This project uses ML to fix it — removing compression artifacts from video at native resolution, fast enough to actually use on your library.
+This project uses a tiny neural network to fix it — removing compression artifacts AND recovering detail from video at native resolution, faster than real-time on a laptop GPU.
 
-> **Status: Active development.** The student model now runs at **78 fps** (1080p, RTX 3060) — **78x faster** than the teacher — using only 2.3 GB VRAM. Currently building a zero-copy GPU pipeline and training with DISTS perceptual loss.
+> **Status:** Production pipeline running. 1.06M parameter student model processes 1080p at **39 fps** on an RTX 3060 — encoding a 44-minute episode in under 30 minutes with audio passthrough. Full Firefly (2002) remaster in progress.
 
-![Full frame comparison](assets/comparison_full.png)
+![Face detail comparison](assets/comparison_face.png)
 
-![Detail comparison](assets/comparison_detail.png)
-*Morena Baccarin deserves better than MPEG artifacts. Look at the skin banding and smeared hair in the original.*
+![Texture comparison](assets/comparison_texture.png)
 
-![Confrontation scene](assets/comparison_e08_00028.png)
-*Skin detail and lighting — the compressed original is a mess of banding and smearing.*
+![Dark scene comparison](assets/comparison_dark.png)
 
-![Dark scene](assets/comparison_e08_00077.png)
-*Dark scenes are the hardest. Compression destroys shadow detail — both models recover it without introducing noise.*
-
-*All samples from Firefly (2002, Fox). Left: compressed source. Middle: quality model (1.9 fps). Right: speed model (78 fps).*
+*All samples from Firefly (2002, Fox) and One Piece (2023, Netflix). Left: compressed HEVC source. Right: remastered output.*
 
 ## The Problem
 
-Compressed video (H.264/H.265) destroys detail in ways that are obvious to the eye but hard to undo. Blocking, ringing, banding, mosquito noise — the usual suspects. Traditional denoising filters either nuke the detail along with the artifacts, or barely touch them. Neural networks can learn the difference, but the good ones are *way* too slow for a whole TV series.
+Compressed video (H.264/H.265) destroys detail in ways that are obvious to the eye but hard to undo. Blocking, ringing, banding, mosquito noise — the usual suspects. Traditional denoising filters either nuke the detail along with the artifacts, or barely touch them. Neural networks can learn the difference, but the good ones are too slow for a whole TV series.
 
 ## How It Works
 
-### 1. Generate Training Targets
+### Teacher-Student Distillation
 
-The best neural denoiser we found is [SCUNet](https://github.com/cszn/SCUNet) — a transformer-based model that produces excellent results but crawls at 0.5 fps. Way too slow for a whole series, but perfect as a teacher.
+A large **teacher** model (32.6M params) learns to enhance video using perceptual and pixel-level losses against high-quality targets. A tiny **student** model (1.06M params) then learns to replicate the teacher's output at 30x the speed through knowledge distillation with feature matching.
 
-We run SCUNet's GAN variant over thousands of frames to generate clean targets, then blend back high-frequency detail from the originals:
+Both models are DRUNet (UNetRes) — pure Conv+ReLU residual U-Nets. No attention, no normalization layers, no dynamic operations. This makes them 100% compatible with TensorRT INT8 quantization and CUDA graph capture.
 
-```python
-target = SCUNet_GAN(frame) + 0.15 * high_pass(frame)
+### Training Targets
+
+[SCUNet GAN](https://github.com/cszn/SCUNet) (a transformer-based perceptual denoiser) processes thousands of source frames to generate clean targets, with Unsharp Mask applied to recover sharpness:
+
+```
+target = SCUNet_GAN(frame) + USM(1.0)
 ```
 
-This **detail transfer** is the secret sauce. The GAN cleans up compression artifacts beautifully but can lose fine texture in the process — hair, fabric weave, film grain. By extracting the high-frequency component of the original (a Gaussian high-pass filter) and blending just 15% of it back, we get targets that are both clean *and* detailed. Zero hallucination — every bit of recovered detail comes from the original source.
+Early experiments used a mix of degraded inputs (raw originals, +noise, +blur) which helped the model generalize. The current best results come from training directly on the original compressed frames as input — the model learns the specific artifact patterns of real HEVC compression rather than synthetic degradations. This is still an active area of experimentation; the optimal input strategy may depend on the source material.
 
-### 2. Distill Into a Fast Model
+### Loss Functions
 
-[NAFNet](https://github.com/megvii-research/NAFNet) is a pure CNN — no attention, no transformers, just convolutions. That makes it `torch.compile` friendly and stupidly fast. We eviscerated the middle section (12 blocks down to 4) and halved the channel width (64 to 32), producing a model that's 4.7x smaller and runs at **78 fps on a laptop GPU**.
+- **Charbonnier** — smooth L1 pixel loss for overall fidelity
+- **[DISTS](https://github.com/dingkeyan93/DISTS)** — perceptual loss calibrated to human perception of compression artifacts. This is what prevents the softness that pure pixel losses produce.
+- **Feature Matching** — L1 distance between student and teacher encoder features at each U-Net level, using learned 1x1 adapter convolutions
 
-The student learns to match the teacher's output using three complementary loss signals:
+### Full-Frame Fine-Tuning
 
-- **Charbonnier** (pixel loss) — smooth L1 for overall fidelity
-- **[DISTS](https://github.com/dingkeyan93/DISTS)** (perceptual loss) — Deep Image Structure and Texture Similarity, specifically designed for assessing compression artifacts. Better calibrated to human perception than VGG feature matching, and faster too (VGG16 vs VGG19 backbone)
-- **Focal Frequency Loss** — operates in the frequency domain to preserve the high-frequency detail that pixel and perceptual losses tend to smooth away
-
-### 3. Run It
-
-The compiled model processes 1080p video at 78 fps with `torch.compile` on a consumer RTX 3060. A 42-minute episode that took 32 hours with the teacher now takes about 14 minutes.
+Initial training uses 256x256 random crops for efficiency. A final fine-tuning pass uses full 1920x1080 frames so the model learns how dark edges, letterboxing, and brightness transitions behave across the full frame — fixing artifacts that crop-based training misses.
 
 ## Results
 
-| Metric | NAFNet w64 | NAFNet w32-mid4 | SCUNet (teacher) |
-|--------|-----------|----------------|-----------------|
-| Parameters | 67M | **14.3M** | 15.2M (transformer) |
-| Model inference | 1.94 fps | **78 fps** | 0.52 fps |
-| End-to-end pipeline | 1.94 fps | **5.2 fps** | 0.52 fps |
-| VRAM (fp16 + compile) | 3.3 GB | **2.3 GB** | 4.8 GB |
-| Checkpoint size | 464 MB | **55 MB** | 60 MB |
-| Quality (PSNR vs teacher) | 56.82 dB | 49.50 dB | reference |
-| Speedup vs teacher | 3.7x | **78x** (raw), **10x** (pipeline) | 1x |
-| Cloud speed (H100) | 27.9 fps | est. 200+ fps | ~5 fps |
-| Training cost | ~$15 | **~$13** | — |
+| | DRUNet Teacher | DRUNet Student | SCUNet GAN |
+|--|---------------|---------------|------------|
+| **Parameters** | 32.6M | **1.06M** | 15.2M |
+| **Quality (PSNR)** | 53.27 dB | 49.98 dB | reference |
+| **Sharpness** | 107% of original | ~100% | ~95% |
+| **Speed (RTX 3060)** | ~5 fps | **39 fps** | 0.5 fps |
+| **VRAM** | ~2 GB | **~500 MB** | 4.8 GB |
+| **Checkpoint** | 125 MB | **4 MB** | 60 MB |
+| **TRT FP16** | — | 52 fps (raw) | — |
+| **TRT INT8** | — | 55+ fps (raw) | — |
+| **Episode (44 min)** | ~2.5 hours | **28 minutes** | ~24 hours |
 
-The w32-mid4 model (width=32, 4 middle blocks instead of 12) is 4.7x smaller and 40x faster than the original student while maintaining strong visual quality. The raw model throughput of 78 fps is bottlenecked by video decode/encode in the current pipeline — a [zero-copy GPU pipeline](#zero-copy-gpu-pipeline) using NVDEC/NVENC is in progress to close this gap.
+## Deployment
 
-> **Why is end-to-end slower than raw inference?** The model finishes a frame in 13ms, but HEVC decoding + encoding add ~170ms overhead per frame. Pipelining decode/infer/encode concurrently on separate hardware (NVDEC/CUDA/NVENC) should approach the raw 78 fps.
+Three encoding paths, fastest to most portable:
 
-## Architecture
+### NVEncC + VapourSynth (39 fps, recommended)
 
-```
-Local (Windows, RTX 3060 6GB)     Cloud (Modal, H100 80GB)
-├── Inference pipelines            ├── Training (distillation)
-├── TensorRT export/run            ├── Pair generation (SCUNet teacher)
-├── Benchmarking                   └── Cloud inference pipeline
-└── Quality evaluation
+VapourSynth runs in-process with the encoder — no pipe bottleneck.
+
+```bash
+python remaster/encode_nvencc.py input.mkv output.mkv
 ```
 
-- **Local inference** — PyTorch with torch.compile, or TensorRT FP16. Zero-copy GPU pipeline via [PyNvVideoCodec](https://github.com/NVIDIA/VideoProcessingFramework) (NVDEC → inference → NVENC, WIP)
-- **Cloud training** — [Modal](https://modal.com) for on-demand H100 GPU time (~$4/hr). RAM-cached datasets, CUDA event profiling, graceful shutdown via Modal Dict signals
-- **Streaming pipeline** — reads video, processes frames, writes video (no intermediate files). Supports HEVC NVENC encoding with ffmpeg 7.1
+### VapourSynth + ffmpeg (20 fps)
 
-## Project Structure
+Standard pipe-based encoding. Wider compatibility.
 
-```
-lib/           Shared code: NAFNet architecture, paths, ffmpeg utils, metrics
-training/      Distillation training: losses, dataset, visualization, training loop
-cloud/         Modal scripts for remote GPU training and inference
-pipelines/     Production streaming denoisers (SCUNet, NAFNet, episode)
-bench/         Benchmarking, quality comparison, checkpoint evaluation
-tools/         Utilities: clip extraction, probing, training control
-docs/          Research notes, setup guide, approach comparison
-reference-code/ Git submodules: SCUNet, NAFNet, DISTS, RAFT, etc.
+```bash
+python remaster/encode.py input.mkv output.mkv
 ```
 
-### Key Scripts
+### Python Streaming (24 fps)
 
-| Script | Purpose |
-|--------|---------|
-| `training/train_nafnet.py` | Distillation training with configurable architecture, profiling, graceful stop |
-| `training/losses.py` | All loss functions: Charbonnier, DISTS, Focal Frequency |
-| `cloud/modal_train.py` | Modal wrapper — upload data, train on H100, download checkpoints |
-| `pipelines/denoise_nafnet.py` | NAFNet inference pipeline (configurable arch, torch.compile, NVENC) |
-| `pipelines/denoise_gpu.py` | Zero-copy GPU pipeline (PyNvVideoCodec NVDEC/NVENC) |
-| `tools/stop_training.py` | Graceful stop for Modal training runs |
-| `bench/compare.py` | PSNR/SSIM metrics and side-by-side comparison |
+Pure Python with torch.compile. No VapourSynth needed.
 
-## Quick Start
+```bash
+python pipelines/remaster.py -i input.mkv \
+    -c checkpoints/drunet_student/final.pth \
+    --nc-list 16,32,64,128 --nb 2 \
+    --encoder hevc_nvenc --mux-audio --compile
+```
+
+### Real-Time Playback
+
+Configure mpv with VapourSynth for live enhancement:
+
+```
+# mpv.conf
+hwdec=auto-copy
+vf=vapoursynth="C:/path/to/remaster/play.vpy"
+```
+
+### C++ Zero-Copy Pipeline (60+ fps, WIP)
+
+NVDEC → TensorRT → NVENC entirely on GPU. No CPU round-trips, no Python.
+
+```
+pipeline_cpp/build/remaster_pipeline.exe --input video.mkv --output enhanced.mkv \
+    --engine checkpoints/drunet_student/drunet_student_1080p_fp16.engine
+```
+
+## Setup
 
 ### Prerequisites
 
-- Python 3.10, PyTorch 2.11+ with CUDA
-- NVIDIA GPU (6GB+ VRAM for inference, training runs on cloud)
+- Python 3.10+, PyTorch 2.11+ with CUDA 12.6
+- NVIDIA GPU (6GB+ VRAM for inference)
 - [Modal](https://modal.com) account for cloud training (optional)
 
-### Setup
+### Install
 
 ```bash
-# Create conda environment
 conda create -n upscale python=3.10
 conda activate upscale
-
-# Install PyTorch with CUDA
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-
-# Install other dependencies
-pip install opencv-python-headless numpy matplotlib
-
-# Initialize submodules
+pip install opencv-python-headless numpy matplotlib av timm
 git submodule update --init --recursive
 ```
 
-### Run Inference (Local)
+### First Run
 
 ```bash
-# Denoise a video with NAFNet
-python pipelines/denoise_nafnet.py --input video.mp4 --checkpoint checkpoints/nafnet_best.pth
+# Export student model to ONNX
+python tools/export_onnx.py
+
+# Build TensorRT engine (one-time, ~2 min)
+tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
+    --onnx=checkpoints/drunet_student/drunet_student.onnx \
+    --shapes=input:1x3x1080x1920 --fp16 --useCudaGraph \
+    --saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine
+
+# Encode a video
+python remaster/encode_nvencc.py input.mkv output.mkv
 ```
 
 ### Train (Cloud)
 
 ```bash
-# Generate training pairs (SCUNet teacher output)
-modal run cloud/modal_generate_pairs.py --input-dir data/clips
+# Teacher (quality model)
+modal run cloud/modal_train.py --arch drunet --nc-list 64,128,256,512 --nb 4 \
+    --checkpoint-dir checkpoints/drunet_teacher \
+    --optimizer prodigy --perceptual-weight 0.05 --batch-size 64 \
+    --ema --wandb --resume
 
-# Train NAFNet student with DISTS + FFT loss
-modal run cloud/modal_train.py \
-    --width 32 --middle-blk-num 4 \
-    --perceptual-weight 0.1 --fft-weight 500 \
-    --max-iters 25000
+# Student (distillation from teacher)
+modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
+    --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \
+    --checkpoint-dir checkpoints/drunet_student \
+    --feature-matching-weight 0.1 --optimizer prodigy --batch-size 192 \
+    --ema --wandb --resume
+
+# Full-frame fine-tune (fixes edge artifacts)
+modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
+    --teacher checkpoints/drunet_teacher/final.pth --teacher-model drunet \
+    --checkpoint-dir checkpoints/drunet_student \
+    --feature-matching-weight 0.1 --perceptual-weight 0.05 --optimizer prodigy \
+    --batch-size 4 --crop-size 0 --max-iters 5000 \
+    --ema --wandb --resume --fresh-optimizer
 ```
 
-## Training Visualization
-
-The training loop generates at each validation step:
-- **Sample comparison images** (input | teacher target | model prediction)
-- **Loss curve charts** (pixel, perceptual, FFT, total loss + validation PSNR)
-- **JSON training log** for custom analysis
-
-## Zero-Copy GPU Pipeline
-
-The current pipeline bounces frames through CPU memory. A zero-copy path keeps everything on the GPU:
+## Project Structure
 
 ```
-NVDEC (hw decode) ──> CUDA tensor ──> NAFNet (inference) ──> CUDA tensor ──> NVENC (hw encode)
-                  zero-copy                              zero-copy
+remaster/        Production encoding pipeline (VapourSynth + TRT + NVEncC)
+pipelines/       Python streaming pipeline (PyAV + torch.compile + NVENC)
+pipeline_cpp/    C++ zero-copy pipeline (NVDEC + TRT + NVENC, WIP)
+training/        Unified training: distillation, losses, dataset, visualization
+cloud/           Modal cloud training wrapper
+tools/           ONNX export, INT8 calibration, data extraction, analysis
+lib/             Shared code: model architectures, paths, ffmpeg utils
+checkpoints/     Model weights (teacher + student)
+reference-code/  Git submodules (SCUNet, KAIR, DISTS, DINOv3, NVEnc, vs-mlrt, etc.)
+docs/            Research notes, plans, architecture docs
 ```
 
-Using [PyNvVideoCodec](https://github.com/NVIDIA/VideoProcessingFramework) (NVIDIA's official Python bindings for Video Codec SDK), `torch.from_dlpack()` provides zero-copy interop between the decoder and PyTorch. The encoder accepts GPU buffers directly. All three stages (NVDEC, CUDA cores, NVENC) are separate hardware on the GPU and can run concurrently.
+## Research & Exploration
 
-**Current status:** Working end-to-end but not yet pipelined — decode/infer/encode run sequentially. Pipelining should approach the raw 78 fps throughput.
+### What we tried
 
-## What's Next
+- **RAFT optical flow temporal alignment** — Warping neighboring frames and averaging. Best result: 1.33x SNR improvement (vs teacher's 2.14x). Alignment fails at object boundaries where detail matters most.
+- **DINOv3 feature matching** — Self-supervised features are noise-invariant and remarkably stable across frames (0.989 cosine similarity). Semantic patch matching outperformed RAFT for cross-frame averaging, but still couldn't beat a learned single-frame denoiser.
+- **SAM 3 segmentation** — Explored for content-aware processing but segmentation models understand objects, not noise. More promising as a conditioning signal than a direct tool.
+- **FFT temporal fusion** — Averaging frequency magnitudes across aligned frames. Competitive with spatial median but still below learned approaches.
 
-- **Pipeline the GPU path** — concurrent decode/infer/encode to approach 78 fps
-- **Real-time playback** — mpv + VapourSynth + vs-mlrt for live enhancement during playback
-- **TensorRT engine** — export w32-mid4 for ~1.5 GB VRAM, potentially faster than torch.compile
-- **Batch processing** — overnight processing of entire TV libraries at 78 fps
-- **Training experiments** — DISTS perceptual loss, lower detail transfer alpha, temporal consistency
+So far, **learned single-frame denoisers beat multi-frame temporal approaches** for this content. But the temporal approaches were naive averaging — there's likely more to be found here.
 
-## Reference Code
+### What we want to explore next
 
-This project builds on several excellent open-source implementations:
+- **Multi-frame input with semantic embeddings** — The student model has only 1.06M parameters and sees one frame at a time. If we feed it the current frame plus cached DINOv3 or SAM embeddings from neighboring frames (say +/- 4 frames), the model could leverage temporal information without the cost of running multiple frames through the full network. The embeddings are compact (384-dim per 16x16 patch) and stable across frames, so caching them adds minimal overhead. This could dramatically improve quality, especially for noise reduction where multiple observations of the same content are mathematically optimal.
 
-- [SCUNet](https://github.com/cszn/SCUNet) — Swin-Conv-UNet denoiser (teacher model)
-- [NAFNet](https://github.com/megvii-research/NAFNet) — Nonlinear Activation Free Network (student architecture)
-- [DISTS](https://github.com/dingkeyan93/DISTS) — Deep Image Structure and Texture Similarity (perceptual loss)
-- [RAFT](https://github.com/princeton-vl/RAFT) — Optical flow estimation
+- **Content-adaptive processing via embeddings** — SAM3/DINOv3 features encode *what's in the scene* (face, fabric, background, text). If these embeddings are fed as additional input channels, the network could learn content-specific enhancement strategies — gentler on faces to preserve skin texture, more aggressive on flat walls where everything is noise, careful at object boundaries. The key insight is that the network learns the mapping, not us — we just give it the semantic context and let it figure out what to do.
+
+- **Larger student with attention** — The 1.06M param Conv+ReLU student is impressively good but fundamentally limited. A model with even lightweight attention at the bottleneck could capture longer-range dependencies. The constraint is TensorRT INT8 compatibility and real-time speed — but with the C++ zero-copy pipeline, there's headroom for a 5-10M param model that still hits 30+ fps.
+
+- **Temporal consistency** — Current frame-by-frame processing can produce subtle flickering. Cross-frame FFT attention or temporal loss functions during training could enforce consistency without slowing inference.
+
+## Acknowledgments
+
+Built on excellent open-source work:
+
+- [KAIR](https://github.com/cszn/KAIR) — DRUNet/UNetRes architecture (MIT license)
+- [SCUNet](https://github.com/cszn/SCUNet) — Training target generation
+- [DISTS](https://github.com/dingkeyan93/DISTS) — Perceptual loss function
+- [vs-mlrt](https://github.com/AmusementClub/vs-mlrt) — VapourSynth TensorRT inference
+- [NVEnc](https://github.com/rigaya/NVEnc) — NVEncC hardware encoder with VapourSynth support
+- [NVIDIA Video Codec SDK](https://developer.nvidia.com/video-codec-sdk) — NVDEC/NVENC APIs
 
 ## License
 
