@@ -1,24 +1,6 @@
 [submodule "reference-code/SCUNet"]
 	path = reference-code/SCUNet
 	url = https://github.com/cszn/SCUNet.git
-[submodule "reference-code/NAFNet"]
-	path = reference-code/NAFNet
-	url = https://github.com/megvii-research/NAFNet.git
-[submodule "reference-code/RAFT"]
-	path = reference-code/RAFT
-	url = https://github.com/princeton-vl/RAFT.git
-[submodule "reference-code/Video-Depth-Anything"]
-	path = reference-code/Video-Depth-Anything
-	url = https://github.com/DepthAnything/Video-Depth-Anything.git
-[submodule "reference-code/FlashVSR"]
-	path = reference-code/FlashVSR
-	url = https://github.com/OpenImagingLab/FlashVSR.git
-[submodule "reference-code/FlashVSR-Pro"]
-	path = reference-code/FlashVSR-Pro
-	url = https://github.com/LujiaJin/FlashVSR-Pro.git
-[submodule "reference-code/BasicVSR_PlusPlus"]
-	path = reference-code/BasicVSR_PlusPlus
-	url = https://github.com/ckkelvinchan/BasicVSR_PlusPlus.git
 [submodule "reference-code/KAIR"]
 	path = reference-code/KAIR
 	url = https://github.com/cszn/KAIR.git
@@ -37,39 +19,12 @@
 [submodule "reference-code/bestsource"]
 	path = reference-code/bestsource
 	url = https://github.com/vapoursynth/bestsource.git
-[submodule "reference-code/torch-tensorrt"]
-	path = reference-code/torch-tensorrt
-	url = https://github.com/pytorch/TensorRT.git
 [submodule "reference-code/TensorRT"]
 	path = reference-code/TensorRT
 	url = https://github.com/NVIDIA/TensorRT.git
-[submodule "reference-code/TensorRT-Model-Optimizer"]
-	path = reference-code/TensorRT-Model-Optimizer
-	url = https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
-[submodule "reference-code/ECBSR"]
-	path = reference-code/ECBSR
-	url = https://github.com/xindongzhang/ECBSR.git
-[submodule "reference-code/SPAN"]
-	path = reference-code/SPAN
-	url = https://github.com/hongyuanyu/SPAN.git
-[submodule "reference-code/XLSR"]
-	path = reference-code/XLSR
-	url = https://github.com/cxzhou95/XLSR.git
-[submodule "reference-code/Real-ESRGAN"]
-	path = reference-code/Real-ESRGAN
-	url = https://github.com/xinntao/Real-ESRGAN
-[submodule "reference-code/DRUNet-baseline"]
-	path = reference-code/DRUNet-baseline
-	url = https://github.com/FizzzFizzz/New-baseline-for-DRUNet-under-different-assumptions.git
 [submodule "reference-code/prodigy"]
 	path = reference-code/prodigy
 	url = https://github.com/konstmish/prodigy.git
-[submodule "reference-code/sam3"]
-	path = reference-code/sam3
-	url = https://github.com/facebookresearch/sam3
-[submodule "reference-code/dinov3"]
-	path = reference-code/dinov3
-	url = https://github.com/facebookresearch/dinov3
 [submodule "reference-code/NVEnc"]
 	path = reference-code/NVEnc
 	url = https://github.com/rigaya/NVEnc
