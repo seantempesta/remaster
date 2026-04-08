@@ -1,207 +1,253 @@
 """
-Portable TensorRT engine builder. Auto-detects GPU and builds optimal engines.
+Build TensorRT engines using modern strongly-typed API + ModelOpt.
+
+Replaces deprecated IInt8Calibrator / BuilderFlag.FP16 / layer.precision
+with ModelOpt AutoCast (FP16) and Q/DQ quantization (INT8). TRT 11-ready.
 
 Usage:
-  python tools/build_engine.py                    # FP16, auto-detect everything
-  python tools/build_engine.py --int8             # INT8 with auto-found calib cache
-  python tools/build_engine.py --shape 720x1280   # Different resolution
-  python tools/build_engine.py --trtexec /path/to/trtexec
+  python tools/build_engine.py fp16          # FP16 engine from FP16 ONNX
+  python tools/build_engine.py int8          # INT8 Q/DQ engine (ModelOpt quantization)
+  python tools/build_engine.py int8 --pure   # Full INT8 (no FP16 fallback layers)
+
+Outputs go to checkpoints/drunet_student/ by default.
 """
 import argparse
-import json
 import os
-import re
-import shutil
-import subprocess
 import sys
+import random
+import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+import numpy as np
+import cv2
 
-
-def detect_gpu():
-    """Return (name, free_mb, compute_cap) via nvidia-smi."""
+# ModelOpt checks PATH for cuDNN DLLs on Windows. PyTorch bundles them in
+# torch/lib/ but that dir isn't on PATH by default, so ModelOpt fails to
+# find them and falls back to CPU-only calibration (extremely slow at 1080p).
+# Fix: add torch's lib dir to PATH before importing modelopt.
+if sys.platform == "win32":
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.free,compute_cap",
-             "--format=csv,noheader,nounits"],
-            text=True, stderr=subprocess.DEVNULL
-        ).strip().splitlines()[0]
-        parts = [p.strip() for p in out.split(",")]
-        name = parts[0]
-        free_mb = int(float(parts[1]))
-        cc = parts[2]
-        return name, free_mb, cc
-    except Exception as e:
-        print(f"WARNING: Could not detect GPU via nvidia-smi: {e}")
-        return "Unknown GPU", 4096, "8.6"
+        import torch as _torch
+        _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+        if _torch_lib not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _torch_lib + os.pathsep + os.environ.get("PATH", "")
+    except ImportError:
+        pass
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "drunet_student"
+ORIGINALS_DIR = PROJECT_ROOT / "data" / "originals"
 
 
-def find_trtexec(override=None):
-    """Find trtexec binary. Check project path, then PATH."""
-    if override:
-        p = Path(override)
-        if p.is_file():
-            return str(p)
-        print(f"ERROR: --trtexec path not found: {override}")
-        sys.exit(1)
+def collect_calibration_data(num_frames=200, target_h=1080, target_w=1920):
+    """Load calibration frames as numpy array [N, 3, H, W] float32."""
+    all_frames = sorted(ORIGINALS_DIR.glob("*.png"))
+    print(f"Found {len(all_frames)} original frames")
 
-    # Project-local trtexec
-    project_path = PROJECT_ROOT / "tools" / "vs" / "vs-plugins" / "vsmlrt-cuda" / "trtexec.exe"
-    if project_path.is_file():
-        return str(project_path)
+    random.seed(42)
+    selected = random.sample(all_frames, min(num_frames, len(all_frames)))
+    print(f"Selected {len(selected)} for calibration")
 
-    # System PATH
-    found = shutil.which("trtexec")
-    if found:
-        return found
+    data = np.zeros((len(selected), 3, target_h, target_w), dtype=np.float32)
+    for i, path in enumerate(selected):
+        img = cv2.imread(str(path))
+        if img is None:
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+        crop = img[:min(h, target_h), :min(w, target_w)]
+        if crop.shape[0] < target_h or crop.shape[1] < target_w:
+            crop = cv2.copyMakeBorder(
+                crop,
+                0, max(0, target_h - crop.shape[0]),
+                0, max(0, target_w - crop.shape[1]),
+                cv2.BORDER_REPLICATE,
+            )
+        data[i] = crop.astype(np.float32).transpose(2, 0, 1) / 255.0
+        if (i + 1) % 50 == 0:
+            print(f"  Loaded {i + 1}/{len(selected)} frames")
 
-    print("ERROR: trtexec not found. Locations checked:")
-    print(f"  - {project_path}")
-    print("  - System PATH")
-    print("Use --trtexec PATH to specify location.")
-    sys.exit(1)
+    print(f"Calibration data: {data.shape}")
+    return data
 
 
-def build_engine(args):
-    gpu_name, free_mb, cc = detect_gpu()
-    print(f"GPU: {gpu_name} (compute {cc}, {free_mb} MB free)")
+def build_fp16_engine(onnx_path, output_path):
+    """Build FP16 engine using ModelOpt AutoCast + strongly typed API."""
+    import tensorrt as trt
+    import onnx
+    from modelopt.onnx.autocast import convert_to_mixed_precision
 
-    trtexec = find_trtexec(args.trtexec)
-    print(f"trtexec: {trtexec}")
+    print(f"=== Building FP16 engine (strongly typed) ===")
+    print(f"Input ONNX: {onnx_path}")
 
-    # Resolve ONNX path
-    onnx_path = Path(args.onnx)
-    if not onnx_path.is_absolute():
-        onnx_path = PROJECT_ROOT / onnx_path
-    if not onnx_path.is_file():
-        print(f"ERROR: ONNX file not found: {onnx_path}")
-        sys.exit(1)
+    # Step 1: AutoCast to mixed FP32/FP16
+    # Save a sample frame as NPZ so AutoCast knows dynamic shape dims
+    print("Running ModelOpt AutoCast (FP32 -> mixed FP16)...")
+    mixed_onnx_path = str(onnx_path).replace(".onnx", "_autocast_fp16.onnx")
+    import tempfile
+    calib_npz = os.path.join(tempfile.gettempdir(), "autocast_calib.npz")
+    sample = np.random.randn(1, 3, 1080, 1920).astype(np.float16)
+    np.savez(calib_npz, input=sample)
+    model = convert_to_mixed_precision(
+        str(onnx_path),
+        low_precision_type="fp16",
+        calibration_data=calib_npz,
+    )
+    os.remove(calib_npz)
+    onnx.save(model, mixed_onnx_path)
+    size_mb = os.path.getsize(mixed_onnx_path) / 1024**2
+    print(f"  AutoCast ONNX: {mixed_onnx_path} ({size_mb:.1f}MB)")
 
-    # Parse shape
-    m = re.match(r"(\d+)x(\d+)", args.shape)
-    if not m:
-        print(f"ERROR: Invalid --shape format '{args.shape}', expected HxW (e.g. 1080x1920)")
-        sys.exit(1)
-    h, w = int(m.group(1)), int(m.group(2))
-    shape_str = f"input:1x3x{h}x{w}"
+    # Step 2: Build engine with strongly typed API
+    logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(logger)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+    )
+    parser = trt.OnnxParser(network, logger)
 
-    # Determine precision and output name
-    precision = "int8" if args.int8 else "fp16"
-    onnx_dir = onnx_path.parent
-    stem = onnx_path.stem  # e.g. drunet_student
+    print(f"Parsing AutoCast ONNX...")
+    with open(mixed_onnx_path, "rb") as f:
+        if not parser.parse(f.read()):
+            for i in range(parser.num_errors):
+                print(f"  ERROR: {parser.get_error(i)}")
+            raise RuntimeError("ONNX parse failed")
 
-    if args.output:
-        engine_path = Path(args.output)
-    else:
-        res_tag = f"{h}p" if w == 1920 else f"{h}x{w}"
-        engine_path = onnx_dir / f"{stem}_{res_tag}_{precision}.engine"
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
+    # No BuilderFlag.FP16 -- strongly typed mode reads precision from ONNX
 
-    timing_cache = onnx_dir / f"{stem}_timing.cache"
+    profile = builder.create_optimization_profile()
+    profile.set_shape("input", (1, 3, 1080, 1920), (1, 3, 1080, 1920), (1, 3, 1080, 1920))
+    config.add_optimization_profile(profile)
 
-    # Workspace: min(60% free VRAM, 4096 MB)
-    workspace_mb = min(int(free_mb * 0.6), 4096)
+    print("Building engine...")
+    t0 = time.time()
+    engine = builder.build_serialized_network(network, config)
+    dt = time.time() - t0
 
-    # Build command
-    cmd = [
-        trtexec,
-        f"--onnx={onnx_path}",
-        f"--shapes={shape_str}",
-        f"--saveEngine={engine_path}",
-        f"--timingCacheFile={timing_cache}",
-        f"--memPoolSize=workspace:{workspace_mb}M",
-        "--builderOptimizationLevel=5",
-        "--tilingOptimizationLevel=3",
-        "--tacticSources=+CUBLAS,+CUBLAS_LT,+CUDNN,+EDGE_MASK_CONVOLUTIONS,+JIT_CONVOLUTIONS",
-        "--persistentCacheRatio=0.5",
-        "--avgTiming=16",
-        "--useCudaGraph",
-    ]
+    if engine is None:
+        raise RuntimeError("Engine build failed")
 
-    # Precision flags
-    if args.int8:
-        # INT8 mode: also enable FP16 as fallback for layers that don't quantize well
-        cmd.extend(["--fp16", "--int8"])
+    with open(output_path, "wb") as f:
+        f.write(engine)
 
-        # Find calibration cache
-        calib_path = None
-        if args.calib:
-            calib_path = Path(args.calib)
-        else:
-            # Auto-find next to ONNX
-            for pattern in [f"{stem}*int8*calib*.cache", "*int8*calib*.cache", "*calibration*.cache"]:
-                candidates = sorted(onnx_dir.glob(pattern))
-                if candidates:
-                    calib_path = candidates[0]
-                    break
+    size_mb = os.path.getsize(output_path) / 1024**2
+    print(f"Engine built in {dt:.0f}s: {output_path} ({size_mb:.1f}MB)")
 
-        if not calib_path or not calib_path.is_file():
-            print("ERROR: INT8 requires calibration cache. Not found.")
-            print(f"  Searched in: {onnx_dir}")
-            print("  Use --calib PATH or run: python tools/build_int8_engine.py")
-            sys.exit(1)
+    # Clean up intermediate
+    os.remove(mixed_onnx_path)
+    return output_path
 
-        cmd.append(f"--calib={calib_path}")
-        print(f"INT8 calibration: {calib_path}")
-    else:
-        cmd.append("--fp16")
 
-    print(f"\nBuilding {precision.upper()} engine:")
-    print(f"  ONNX:      {onnx_path}")
-    print(f"  Shape:     {shape_str}")
-    print(f"  Output:    {engine_path}")
-    print(f"  Workspace: {workspace_mb} MB")
-    print(f"  Cache:     {timing_cache}")
-    print()
+def build_int8_engine(onnx_path, output_path, num_frames=20, pure=False):
+    """Build INT8 engine using ModelOpt Q/DQ quantization + strongly typed API.
 
-    # Run trtexec
-    result = subprocess.run(cmd, text=True)
-    if result.returncode != 0:
-        print(f"\nERROR: trtexec failed with exit code {result.returncode}")
-        sys.exit(result.returncode)
+    By default, excludes Add ops from INT8 (verified: pure INT8 = 26 dB, excluding
+    Adds = 67 dB). Use --pure to quantize everything including Adds.
+    """
+    import tensorrt as trt
+    import onnx
+    import modelopt.onnx.quantization as moq
 
-    # Summary
-    engine_size_mb = engine_path.stat().st_size / (1024 * 1024) if engine_path.is_file() else 0
-    print("\n" + "=" * 60)
-    print("BUILD COMPLETE")
-    print("=" * 60)
-    print(f"  GPU:        {gpu_name}")
-    print(f"  Precision:  {precision.upper()}")
-    print(f"  Engine:     {engine_path}")
-    print(f"  Size:       {engine_size_mb:.1f} MB")
-    print(f"  Timing:     {timing_cache}")
+    print(f"=== Building INT8 engine (strongly typed, ModelOpt Q/DQ) ===")
+    print(f"Input ONNX: {onnx_path}")
+    print(f"Calibration frames: {num_frames}")
 
-    # Rough speed estimates for DRUNet student on common GPUs
-    speed_estimates = {
-        "fp16": {"3060": "50-55", "3070": "60-70", "3080": "75-85", "4060": "60-70",
-                 "4070": "80-90", "4080": "100-120", "4090": "140-160"},
-        "int8": {"3060": "55-65", "3070": "70-85", "3080": "90-105", "4060": "70-85",
-                 "4070": "95-110", "4080": "120-145", "4090": "170-200"},
-    }
-    gpu_short = gpu_name.lower()
-    for key, speed in speed_estimates.get(precision, {}).items():
-        if key in gpu_short:
-            print(f"  Est speed:  ~{speed} fps raw inference (1080p)")
-            break
-    print("=" * 60)
+    # Step 1: Collect calibration data
+    calib_data = collect_calibration_data(num_frames)
+
+    # Step 2: Quantize with ModelOpt
+    print("Running ModelOpt INT8 quantization...")
+    qdq_onnx_path = str(onnx_path).replace(".onnx", "_int8_qdq.onnx")
+
+    # Skip-connection Add ops crush fine detail when quantized to INT8.
+    # Verified: pure INT8 = 26 dB, excluding Adds = 67 dB. This is architectural,
+    # not a calibration issue — the encoder/decoder paths have mismatched distributions
+    # at the addition points.
+    op_types_to_exclude = None if pure else ["Add"]
+
+    moq.quantize(
+        onnx_path=str(onnx_path),
+        calibration_data={"input": calib_data},
+        output_path=qdq_onnx_path,
+        quantize_mode="int8",
+        calibration_method="entropy",
+        calibration_eps=["cuda:0"],  # Don't try CPU + TRT EPs
+        op_types_to_exclude=op_types_to_exclude,
+    )
+
+    size_mb = os.path.getsize(qdq_onnx_path) / 1024**2
+    print(f"  Q/DQ ONNX: {qdq_onnx_path} ({size_mb:.1f}MB)")
+
+    # Step 3: Build engine with strongly typed API
+    logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(logger)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+    )
+    parser = trt.OnnxParser(network, logger)
+
+    print(f"Parsing Q/DQ ONNX...")
+    with open(qdq_onnx_path, "rb") as f:
+        if not parser.parse(f.read()):
+            for i in range(parser.num_errors):
+                print(f"  ERROR: {parser.get_error(i)}")
+            raise RuntimeError("ONNX parse failed")
+
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
+    # No BuilderFlag.INT8, no calibrator -- Q/DQ nodes handle everything
+
+    profile = builder.create_optimization_profile()
+    profile.set_shape("input", (1, 3, 1080, 1920), (1, 3, 1080, 1920), (1, 3, 1080, 1920))
+    config.add_optimization_profile(profile)
+
+    print("Building engine...")
+    t0 = time.time()
+    engine = builder.build_serialized_network(network, config)
+    dt = time.time() - t0
+
+    if engine is None:
+        raise RuntimeError("Engine build failed")
+
+    with open(output_path, "wb") as f:
+        f.write(engine)
+
+    size_mb = os.path.getsize(output_path) / 1024**2
+    print(f"Engine built in {dt:.0f}s: {output_path} ({size_mb:.1f}MB)")
+
+    # Keep the Q/DQ ONNX for inspection
+    print(f"Q/DQ ONNX saved: {qdq_onnx_path}")
+    return output_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build TensorRT engine with optimal settings for current GPU"
+        description="Build TensorRT engines (modern strongly-typed API)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--onnx", default="checkpoints/drunet_student/drunet_student.onnx",
-                        help="Path to ONNX model (default: student checkpoint)")
-    parser.add_argument("--output", "-o", help="Output engine path (auto-named if omitted)")
-    parser.add_argument("--shape", default="1080x1920",
-                        help="Input resolution as HxW (default: 1080x1920)")
-    parser.add_argument("--int8", action="store_true",
-                        help="Build INT8 engine (default: FP16)")
-    parser.add_argument("--calib", help="INT8 calibration cache path (auto-found if omitted)")
-    parser.add_argument("--trtexec", help="Path to trtexec binary (auto-found if omitted)")
-
+    parser.add_argument("mode", choices=["fp16", "int8"],
+                        help="Engine precision mode")
+    parser.add_argument("--onnx", default=None,
+                        help="Input ONNX path (default: auto-detect from checkpoints)")
+    parser.add_argument("--output", default=None,
+                        help="Output engine path (default: auto from mode)")
+    parser.add_argument("--num-frames", type=int, default=20,
+                        help="Number of calibration frames for INT8 (default: 20)")
+    parser.add_argument("--pure", action="store_true",
+                        help="INT8: quantize ALL layers including Adds (lower quality, faster)")
     args = parser.parse_args()
-    build_engine(args)
+
+    if args.mode == "fp16":
+        onnx_path = args.onnx or str(CHECKPOINT_DIR / "drunet_student.onnx")
+        output = args.output or str(CHECKPOINT_DIR / "drunet_student_1080p_fp16.engine")
+        build_fp16_engine(onnx_path, output)
+
+    elif args.mode == "int8":
+        onnx_path = args.onnx or str(CHECKPOINT_DIR / "drunet_student_fp32.onnx")
+        output = args.output or str(CHECKPOINT_DIR / "drunet_student_1080p_int8.engine")
+        build_int8_engine(onnx_path, output, args.num_frames, args.pure)
 
 
 if __name__ == "__main__":
