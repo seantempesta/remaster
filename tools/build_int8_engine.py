@@ -104,8 +104,13 @@ class FrameCalibrator(trt.IInt8EntropyCalibrator2):
             f.write(cache)
 
 
-def build_int8_engine(onnx_path, output_engine, calibrator):
-    """Build INT8 TRT engine with proper calibration."""
+def build_int8_engine(onnx_path, output_engine, calibrator, mixed_precision=True):
+    """Build INT8 TRT engine with proper calibration.
+
+    With mixed_precision=True (default), sensitive layers (skip-connection adds,
+    head/tail convolutions, transposed convolutions) are forced to FP16 to avoid
+    INT8 quality degradation in the residual paths.
+    """
     builder = trt.Builder(TRT_LOGGER)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, TRT_LOGGER)
@@ -126,6 +131,44 @@ def build_int8_engine(onnx_path, output_engine, calibrator):
     config.set_flag(trt.BuilderFlag.FP16)
     config.set_flag(trt.BuilderFlag.INT8)
     config.int8_calibrator = calibrator
+
+    # Mixed precision: force sensitive layers to FP16
+    if mixed_precision:
+        config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
+        sensitive_count = 0
+        for i in range(network.num_layers):
+            layer = network.get_layer(i)
+            name = layer.name
+
+            is_sensitive = False
+
+            # Skip connection additions — these are the primary INT8 failure point.
+            # Encoder and decoder paths have different value distributions; INT8
+            # requantization at the add crushes fine detail.
+            if layer.type == trt.LayerType.ELEMENTWISE:
+                is_sensitive = True
+
+            # First conv (m_head) and last conv (m_tail) interface with [0,1] pixel
+            # space where quantization error maps directly to output pixel error.
+            if "m_head" in name or "m_tail" in name:
+                is_sensitive = True
+
+            # Transposed convolutions (upsampling) amplify quantization error
+            if layer.type == trt.LayerType.DECONVOLUTION:
+                is_sensitive = True
+
+            if is_sensitive:
+                layer.precision = trt.float16
+                for j in range(layer.num_outputs):
+                    layer.set_output_type(j, trt.float16)
+                sensitive_count += 1
+
+        print(f"Mixed precision: {sensitive_count}/{network.num_layers} layers forced to FP16")
+
+    # Force FP16 I/O so the engine matches the C++ pipeline's __half* buffers,
+    # even when built from FP32 ONNX (used for correct INT8 calibration).
+    network.get_input(0).dtype = trt.float16
+    network.get_output(0).dtype = trt.float16
 
     # Set optimization profile for static shape
     profile = builder.create_optimization_profile()
@@ -155,7 +198,10 @@ def build_int8_engine(onnx_path, output_engine, calibrator):
 def main():
     parser = argparse.ArgumentParser(description="Build properly calibrated INT8 TRT engine")
     parser.add_argument("--num-frames", type=int, default=200)
-    parser.add_argument("--onnx", default=str(PROJECT_ROOT / "checkpoints" / "drunet_student" / "drunet_student.onnx"))
+    parser.add_argument("--onnx", default=str(PROJECT_ROOT / "checkpoints" / "drunet_student" / "drunet_student_fp32.onnx"),
+                        help="ONNX model path (use FP32 ONNX for correct INT8 calibration ranges)")
+    parser.add_argument("--no-mixed-precision", action="store_true",
+                        help="Disable per-layer FP16 fallback for sensitive layers")
     parser.add_argument("--output", default=str(PROJECT_ROOT / "checkpoints" / "drunet_student" / "drunet_student_1080p_int8.engine"))
     args = parser.parse_args()
 
@@ -171,7 +217,8 @@ def main():
     print(f"Selected {len(selected)} for calibration")
 
     calibrator = FrameCalibrator(selected, cache_file=cache_file)
-    build_int8_engine(args.onnx, args.output, calibrator)
+    build_int8_engine(args.onnx, args.output, calibrator,
+                      mixed_precision=not args.no_mixed_precision)
 
     print(f"\nCalibration cache saved: {cache_file}")
     print("This cache can be reused by trtexec or the C++ pipeline.")

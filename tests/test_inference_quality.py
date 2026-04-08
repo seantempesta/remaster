@@ -165,18 +165,25 @@ class TestTRTEngines:
         _, _, orig_h, orig_w = input_tensor.shape
         eng_h, eng_w = engine_shape[2], engine_shape[3]
 
+        # Match engine's expected input dtype
+        in_dtype = engine.get_tensor_dtype(in_name)
+        torch_dtype = torch.float16 if in_dtype == trt.DataType.HALF else torch.float32
+        cast_input = input_tensor.to(torch_dtype)
+
         if orig_h != eng_h or orig_w != eng_w:
             # Edge-replicate pad to match engine dims (not zero-pad, which
             # creates black borders that bleed through conv kernels)
             pad_w = eng_w - orig_w
             pad_h = eng_h - orig_h
             padded = torch.nn.functional.pad(
-                input_tensor, (0, pad_w, 0, pad_h), mode="replicate")
+                cast_input, (0, pad_w, 0, pad_h), mode="replicate")
             run_input = padded
         else:
-            run_input = input_tensor.contiguous()
+            run_input = cast_input.contiguous()
 
-        output = torch.zeros(engine_shape, dtype=torch.float16, device="cuda")
+        out_dtype = engine.get_tensor_dtype(out_name)
+        torch_out_dtype = torch.float16 if out_dtype == trt.DataType.HALF else torch.float32
+        output = torch.zeros(engine_shape, dtype=torch_out_dtype, device="cuda")
         ctx.set_tensor_address(in_name, run_input.data_ptr())
         ctx.set_tensor_address(out_name, output.data_ptr())
 
@@ -250,7 +257,8 @@ class TestTRTEngines:
         with torch.no_grad():
             ref = model_fp32(test_frame)
 
-        trt_out = self._load_and_run_engine(TRT_INT8_ENGINE, test_frame_fp16)
+        # Pass FP32 frame — _load_and_run_engine auto-casts to engine's I/O dtype
+        trt_out = self._load_and_run_engine(TRT_INT8_ENGINE, test_frame)
         if trt_out is None:
             pytest.skip(f"Engine incompatible with installed TRT version")
         psnr = _psnr(ref, trt_out)
