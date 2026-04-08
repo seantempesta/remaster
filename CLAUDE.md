@@ -194,13 +194,18 @@ tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
     --shapes=input:1x3x1080x1920 --fp16 --useCudaGraph \
     --saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine
 
-# Encode video (fastest path: NVEncC + VapourSynth in-process, ~36 fps)
+# FASTEST: C++ pipeline (44 fps, 10-bit HEVC, audio passthrough)
+pipeline_cpp/build/remaster_pipeline.exe \
+    -i input.mkv -o output.mkv \
+    -e checkpoints/drunet_student/drunet_student_1080p_fp16.engine --cq 20
+
+# NVEncC + VapourSynth (39 fps, audio passthrough)
 python remaster/encode_nvencc.py input.mkv output.mkv
 
-# Alternative: VapourSynth + ffmpeg pipe (~20 fps)
+# VapourSynth + ffmpeg pipe (20 fps)
 python remaster/encode.py input.mkv output.mkv
 
-# Alternative: Python streaming pipeline with torch.compile (~24 fps)
+# Python streaming with torch.compile (24 fps)
 python pipelines/remaster.py -i input.mkv -c checkpoints/drunet_student/final.pth \
     --nc-list 16,32,64,128 --nb 2 --encoder hevc_nvenc --mux-audio --compile
 
@@ -221,19 +226,20 @@ tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
 ```
 
 ### Next Steps
-1. **Full-frame fine-tune** running on Modal -- fixes dark area artifacts by training with full 1080p context
-2. **C++ pipeline** (`pipeline_cpp/`) -- NVDEC->TRT->NVENC zero-copy GPU pipeline for 60+ fps. Code written, needs compilation (VS Build Tools + CUDA Toolkit installed locally)
-3. **INT8 optimization** -- switch display to Radeon to free VRAM for full INT8 tactic profiling (currently 40 fps, could reach 55 fps)
-4. **NVEncC audio** -- `--audio-source` flag needs testing for direct audio passthrough
+1. **INT8 with freed VRAM** -- switch display to Radeon, rebuild INT8 engine with full tactic profiling. Expected: 55+ fps C++ pipeline
+2. **Recurrent temporal context** -- 9-channel input (prev_cleaned + current + next_noisy). PRD at `docs/research/temporal-context/prd.md`. Expected: +0.3-0.8 dB PSNR + temporal consistency
+3. **Semantic embeddings** -- ConvNeXt-Tiny (MIT, 28.6M) features at bottleneck for content-adaptive processing. See `docs/research/temporal-context/vision-backbone-candidates.md`
 
-### Current Status (2026-04-07)
-- **Teacher**: 13K iters, PSNR 53.27 dB, 107% sharpness, near-perfect color (Cr/Cb error 0.44)
-- **Student**: 10.4K iters, PSNR 49.19 dB, 1.06M params. Full-frame fine-tuning in progress (5K iters, crop_size=0)
-- **Deployment**: ONNX exported, TRT FP16 engine (37 fps), INT8 calibrated engine (40 fps), NVEncC 36.5 fps end-to-end
-- **Full episode**: Firefly S01E03 encoded in 35 min (29.5 fps, faster than real-time)
-- **RAFT research**: Temporal alignment explored. DINO feature matching (1.33x SNR) beats RAFT median (1.2x) but neither beats the DRUNet teacher (2.14x SNR)
-- **DINOv3**: Features extracted (15 fps locally, 133MB VRAM). Useful for semantic matching but not for denoising targets. Not viable as a loss function (color-blind by design)
-- **Color**: Student has Cr/Cb shift (~12 points) but VLC display bug was the primary visual issue. BT.709 metadata now correctly tagged in all encode paths.
+### Current Status (2026-04-08)
+- **Teacher**: 13K iters, PSNR 53.27 dB, 107% sharpness, near-perfect color
+- **Student**: Fine-tuned with full-frame (5K iters, crop_size=0), PSNR 49.98 dB, 1.06M params
+- **C++ pipeline**: 44.4 fps end-to-end, 10-bit HEVC MKV output with audio passthrough, async I/O
+- **NVEncC pipeline**: 39 fps with audio, VapourSynth in-process
+- **TRT FP16**: 52 fps raw inference, 19ms/frame GPU compute
+- **TRT INT8**: 40 fps (limited by 6GB VRAM tactic skipping, expect 55+ with freed VRAM)
+- **Full episodes**: Firefly S01E03 (35 min @ 29.5 fps), S01E04 (31 min @ 33.5 fps)
+- **Build tools installed**: VS Build Tools 2022, CUDA 12.6, CMake 3.31, NVEncC 9.14
+- **Research**: RAFT temporal (abandoned), DINOv3/SAM3 (explored), recurrent temporal (PRD ready)
 
 **Research docs:** `docs/research/` (temporal-context, raft-alignment, cpp-pipeline, training-data). **Guides:** `docs/guides/` (gpu-profiling, modal-graceful-shutdown). **Archive:** `docs/archive/` (old NAFNet-era docs). See `docs/README.md` for full index.
 

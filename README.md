@@ -53,7 +53,7 @@ Initial training uses 256x256 random crops for efficiency. A final fine-tuning p
 | **Parameters** | 32.6M | **1.06M** | 15.2M |
 | **Quality (PSNR)** | 53.27 dB | 49.98 dB | reference |
 | **Sharpness** | 107% of original | ~100% | ~95% |
-| **Speed (RTX 3060)** | ~5 fps | **39 fps** | 0.5 fps |
+| **Speed (RTX 3060)** | ~5 fps | **44 fps** | 0.5 fps |
 | **VRAM** | ~2 GB | **~500 MB** | 4.8 GB |
 | **Checkpoint** | 125 MB | **4 MB** | 60 MB |
 | **TRT FP16** | — | 52 fps (raw) | — |
@@ -62,9 +62,19 @@ Initial training uses 256x256 random crops for efficiency. A final fine-tuning p
 
 ## Deployment
 
-Three encoding paths, fastest to most portable:
+Four encoding paths, fastest to most portable:
 
-### NVEncC + VapourSynth (39 fps, recommended)
+### C++ Zero-Copy Pipeline (44 fps, fastest)
+
+NVDEC → TensorRT → NVENC entirely on GPU. No Python, no pipes. 10-bit HEVC MKV output with audio passthrough.
+
+```bash
+pipeline_cpp/build/remaster_pipeline.exe \
+    -i input.mkv -o output.mkv \
+    -e checkpoints/drunet_student/drunet_student_1080p_fp16.engine --cq 20
+```
+
+### NVEncC + VapourSynth (39 fps)
 
 VapourSynth runs in-process with the encoder — no pipe bottleneck.
 

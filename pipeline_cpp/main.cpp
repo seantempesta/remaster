@@ -40,7 +40,7 @@ struct PipelineConfig {
     int gpu          = 0;
     int cq           = 24;     // constant quality (lower = higher quality)
     std::string preset = "p4"; // NVENC preset (SDK 10+: p1-p7, p1=fastest, p7=best quality)
-    bool tenBit      = false;  // output 10-bit HEVC
+    bool tenBit      = true;   // 10-bit HEVC output (matches source quality)
     bool noAudio     = false;  // skip audio/subtitle passthrough
 };
 
