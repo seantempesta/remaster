@@ -1,25 +1,37 @@
-# Core - MUST install from cu121 index:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-# Then install the rest from this file:
+# Core - install PyTorch from cu130 index first:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+# Then install the rest:
 #   pip install -r requirements.txt
 
 # Pin torch to prevent CPU-only overwrite
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
-torchaudio==2.5.1+cu121
+torch==2.11.0+cu130
+torchvision==0.26.0+cu130
+torchaudio==2.11.0+cu130
 
-# Real-ESRGAN + basicsr
-realesrgan
-basicsr
+# TensorRT (cu13 to match CUDA 13.x toolkit)
+tensorrt==10.16.0.72
+tensorrt-cu13==10.16.0.72
+tensorrt-cu13-bindings==10.16.0.72
+tensorrt-cu13-libs==10.16.0.72
 
-# Video Depth Anything deps
-huggingface_hub
+# ONNX
+onnx
+onnxruntime-gpu
+onnxscript
 
-# RAFT deps
+# Training
+prodigyopt
+wandb
+modal
+
+# Analysis
 scipy
-opencv-python
+scikit-learn
+matplotlib
 
 # Utilities
-imageio-ffmpeg
+opencv-python
 numpy
 pillow
+psutil
+pytest

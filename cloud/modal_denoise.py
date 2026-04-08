@@ -28,12 +28,12 @@ VOL_MOUNT = "/mnt/data"
 # Simple image: apt ffmpeg (has libx264/libx265), no source builds needed.
 # H100/A100 have no NVENC, so we use libx264 which is fast enough on CPU.
 image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "libgl1", "libglib2.0-0", "ffmpeg")
     .pip_install(
         "torch==2.11.0",
         "torchvision",
-        extra_index_url="https://download.pytorch.org/whl/cu126",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
     )
     .pip_install(
         "opencv-python-headless",

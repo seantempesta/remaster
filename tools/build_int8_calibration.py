@@ -108,13 +108,13 @@ def extract_random_frames(videos, num_frames=200, target_h=1080, target_w=1920):
                     img = frame.to_ndarray(format="rgb24")
                     h, w = img.shape[:2]
 
-                    # Pad to target size
+                    # Edge-replicate pad to target size (not zero-pad)
                     pad_h = target_h - h
                     pad_w = target_w - w
                     if pad_h > 0 or pad_w > 0:
-                        padded = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                        padded[:h, :w] = img
-                        img = padded
+                        img = cv2.copyMakeBorder(
+                            img, 0, max(0, pad_h), 0, max(0, pad_w),
+                            cv2.BORDER_REPLICATE)
                     elif h > target_h or w > target_w:
                         img = img[:target_h, :target_w]
 

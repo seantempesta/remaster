@@ -1,5 +1,5 @@
 // trt_inference.h -- TensorRT engine loader and inference wrapper
-// Updated for TensorRT 10.6+ API (tensor-name-based, enqueueV3)
+// Updated for TensorRT 10.16 API (tensor-name-based, enqueueV3)
 #pragma once
 
 #include <string>

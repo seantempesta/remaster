@@ -21,13 +21,13 @@ find_package(CUDAToolkit REQUIRED)
 # TensorRT -- headers from GitHub, DLLs from vs-mlrt bundle
 # We generate .lib import libraries from DLLs at configure time.
 set(TRT_DLL_DIR "${CMAKE_SOURCE_DIR}/../tools/vs/vs-plugins/vsmlrt-cuda")
-set(TRT_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../tools/_downloads/TensorRT-10.6.0/include")
+set(TRT_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../tools/_downloads/TensorRT-10.16.0/include")
 
 if(NOT EXISTS "${TRT_INCLUDE_DIR}/NvInfer.h")
     message(FATAL_ERROR
         "TensorRT headers not found at ${TRT_INCLUDE_DIR}.\n"
-        "Download from: https://github.com/NVIDIA/TensorRT/archive/refs/tags/v10.6.0.zip\n"
-        "Extract include/ to tools/_downloads/TensorRT-10.6.0/include/")
+        "Download from: https://github.com/NVIDIA/TensorRT/archive/refs/tags/v10.16.zip\n"
+        "Extract include/ to tools/_downloads/TensorRT-10.16.0/include/")
 endif()
 
 # Generate .lib from nvinfer_10.dll using MSVC tools

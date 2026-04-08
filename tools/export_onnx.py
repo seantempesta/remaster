@@ -92,6 +92,7 @@ def export(
             "output": {2: "height", 3: "width"},
         },
         do_constant_folding=True,
+        dynamo=False,  # Force TorchScript exporter; dynamo (default) emits opset 18 IR that TRT miscompiles
     )
 
     # Merge external data if PyTorch saved weights separately

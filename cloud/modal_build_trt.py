@@ -17,14 +17,13 @@ app = modal.App("remaster-build-trt")
 
 # Image with PyTorch + torch_tensorrt + our model code
 image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "torch==2.11.0",
         "torchvision",
-        "torch_tensorrt",
         "onnx",
         "onnxscript",
-        extra_index_url="https://download.pytorch.org/whl/cu126",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
     )
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
     .add_local_file("lib/__init__.py", remote_path="/root/project/lib/__init__.py")

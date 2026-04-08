@@ -15,8 +15,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "drunet_student"
 CHECKPOINT = CHECKPOINT_DIR / "final.pth"
-TRT_FP16_ENGINES = [CHECKPOINT_DIR / "drunet_student_1080p_fp16.engine",
-                     CHECKPOINT_DIR / "drunet_student_1080p_fp16_from_fp32.engine"]
+TRT_FP16_ENGINES = [CHECKPOINT_DIR / "drunet_student_1080p_fp16.engine"]
 TRT_INT8_ENGINE = CHECKPOINT_DIR / "drunet_student_1080p_int8.engine"
 ONNX_FP16 = CHECKPOINT_DIR / "drunet_student.onnx"
 ONNX_FP32 = CHECKPOINT_DIR / "drunet_student_fp32.onnx"
@@ -167,9 +166,12 @@ class TestTRTEngines:
         eng_h, eng_w = engine_shape[2], engine_shape[3]
 
         if orig_h != eng_h or orig_w != eng_w:
-            padded = torch.zeros(1, 3, eng_h, eng_w,
-                                 dtype=input_tensor.dtype, device=input_tensor.device)
-            padded[:, :, :orig_h, :orig_w] = input_tensor
+            # Edge-replicate pad to match engine dims (not zero-pad, which
+            # creates black borders that bleed through conv kernels)
+            pad_w = eng_w - orig_w
+            pad_h = eng_h - orig_h
+            padded = torch.nn.functional.pad(
+                input_tensor, (0, pad_w, 0, pad_h), mode="replicate")
             run_input = padded
         else:
             run_input = input_tensor.contiguous()
@@ -191,23 +193,48 @@ class TestTRTEngines:
         """TRT FP16 engine output should closely match PyTorch FP32."""
         import torch
         try:
-            import tensorrt  # noqa: F401
+            import tensorrt as trt
         except ImportError:
             pytest.skip("tensorrt not installed")
 
         if not engine_path.exists():
             pytest.skip(f"Engine not found: {engine_path.name}")
 
+        # Pad PyTorch input to engine dims with replicate so both see identical data
+        runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+        with open(str(engine_path), "rb") as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            pytest.skip("Engine incompatible with installed TRT version")
+        in_name = None
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                in_name = name
+                break
+        eng_shape = list(engine.get_tensor_shape(in_name))
+        eng_h, eng_w = eng_shape[2], eng_shape[3]
+        _, _, orig_h, orig_w = test_frame.shape
+        del engine, runtime
+
+        # Replicate-pad both inputs to engine dims
+        pad_w = eng_w - orig_w
+        pad_h = eng_h - orig_h
+        if pad_w > 0 or pad_h > 0:
+            pt_input = torch.nn.functional.pad(test_frame, (0, pad_w, 0, pad_h), mode="replicate")
+        else:
+            pt_input = test_frame
+
         with torch.no_grad():
-            ref = model_fp32(test_frame)
+            ref = model_fp32(pt_input)[:, :, :orig_h, :orig_w]
 
         trt_out = self._load_and_run_engine(engine_path, test_frame_fp16)
         if trt_out is None:
-            pytest.skip(f"Engine incompatible with installed TRT version")
+            pytest.skip("Engine incompatible with installed TRT version")
         psnr = _psnr(ref, trt_out)
 
         print(f"  {engine_path.stem} vs PyTorch FP32: PSNR={psnr:.1f} dB")
-        assert psnr > 35.0, f"PSNR too low for FP16 engine: {psnr:.1f} dB"
+        assert psnr > 60.0, f"PSNR too low for FP16 engine: {psnr:.1f} dB"
 
     def test_trt_int8_vs_pytorch(self, model_fp32, test_frame, test_frame_fp16):
         """TRT INT8 engine output should be within acceptable range of PyTorch FP32."""

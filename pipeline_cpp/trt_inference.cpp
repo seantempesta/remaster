@@ -1,5 +1,5 @@
 // trt_inference.cpp -- TensorRT engine loader and inference wrapper
-// Updated for TensorRT 10.6+ API (no .destroy(), tensor-name-based API, enqueueV3)
+// Updated for TensorRT 10.16 API (no .destroy(), tensor-name-based API, enqueueV3)
 
 #include "trt_inference.h"
 #include <NvInfer.h>

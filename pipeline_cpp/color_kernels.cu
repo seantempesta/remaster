@@ -46,7 +46,7 @@ __device__ __constant__ float kRgbToYuv[9] = {
 // The decoder may use a pitch (stride) larger than width.
 //
 // Output: 3 contiguous planes of __half, each (padH * padW), in R,G,B order.
-// We write zeros in padding regions.
+// Padding regions use edge-replication (clamped coordinates) to avoid black borders.
 
 __global__ void kernel_nv12_to_rgb_fp16(
     const uint8_t* __restrict__ nv12,   // NVDEC frame (device ptr, pitched)
@@ -62,20 +62,17 @@ __global__ void kernel_nv12_to_rgb_fp16(
     int planeSize = dstWidth * dstHeight;
     int dstIdx = y * dstWidth + x;
 
-    if (x >= srcWidth || y >= srcHeight) {
-        // Padding region: write zero
-        rgb[dstIdx]                = __float2half(0.0f);
-        rgb[dstIdx + planeSize]    = __float2half(0.0f);
-        rgb[dstIdx + planeSize*2]  = __float2half(0.0f);
-        return;
-    }
+    // Edge-replicate padding: clamp to valid region instead of writing zeros.
+    // This avoids black-border artifacts when source is smaller than engine dims.
+    int sx = min(x, srcWidth - 1);
+    int sy = min(y, srcHeight - 1);
 
     // Read Y
-    float yVal = (float)nv12[y * srcPitch + x];
+    float yVal = (float)nv12[sy * srcPitch + sx];
 
     // Read UV (subsampled 2x2)
-    int uvRow = srcHeight + (y >> 1);
-    int uvCol = (x & ~1); // align to even
+    int uvRow = srcHeight + (sy >> 1);
+    int uvCol = (sx & ~1); // align to even
     float uVal = (float)nv12[uvRow * srcPitch + uvCol];
     float vVal = (float)nv12[uvRow * srcPitch + uvCol + 1];
 
@@ -118,20 +115,17 @@ __global__ void kernel_p010_to_rgb_fp16(
     int planeSize = dstWidth * dstHeight;
     int dstIdx = y * dstWidth + x;
 
-    if (x >= srcWidth || y >= srcHeight) {
-        rgb[dstIdx]                = __float2half(0.0f);
-        rgb[dstIdx + planeSize]    = __float2half(0.0f);
-        rgb[dstIdx + planeSize*2]  = __float2half(0.0f);
-        return;
-    }
+    // Edge-replicate padding: clamp to valid region instead of writing zeros.
+    int sx = min(x, srcWidth - 1);
+    int sy = min(y, srcHeight - 1);
 
-    // P010: each sample is uint16, value in upper 10 bits. Divide by 65535 later.
-    const uint16_t* yPlane = (const uint16_t*)(p010 + y * srcPitch);
-    float yVal = (float)(yPlane[x] >> 6); // shift to 10-bit range [0,1023]
+    // P010: each sample is uint16, value in upper 10 bits.
+    const uint16_t* yPlane = (const uint16_t*)(p010 + sy * srcPitch);
+    float yVal = (float)(yPlane[sx] >> 6); // shift to 10-bit range [0,1023]
 
-    int uvRow = srcHeight + (y >> 1);
+    int uvRow = srcHeight + (sy >> 1);
     const uint16_t* uvPlane = (const uint16_t*)(p010 + uvRow * srcPitch);
-    int uvCol = (x & ~1);
+    int uvCol = (sx & ~1);
     float uVal = (float)(uvPlane[uvCol] >> 6);
     float vVal = (float)(uvPlane[uvCol + 1] >> 6);
 

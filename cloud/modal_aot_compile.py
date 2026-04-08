@@ -15,11 +15,11 @@ import time
 app = modal.App("remaster-aot-compile")
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.6.3-devel-ubuntu22.04", add_python="3.10")
+    modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.12")
     .pip_install(
         "torch==2.11.0",
         "torchvision",
-        extra_index_url="https://download.pytorch.org/whl/cu126",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
     )
     .add_local_file("lib/nafnet_arch.py", remote_path="/root/project/lib/nafnet_arch.py")
     .add_local_file("lib/__init__.py", remote_path="/root/project/lib/__init__.py")

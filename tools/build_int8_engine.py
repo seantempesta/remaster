@@ -71,10 +71,17 @@ class FrameCalibrator(trt.IInt8EntropyCalibrator2):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             h, w = img.shape[:2]
 
-            padded = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
-            padded[:min(h, self.target_h), :min(w, self.target_w)] = \
-                img[:self.target_h, :self.target_w]
-            host_data[i] = padded.astype(np.float32).transpose(2, 0, 1) / 255.0
+            # Edge-replicate pad to target dims (not zero-pad, which skews
+            # calibration statistics with black borders)
+            crop = img[:min(h, self.target_h), :min(w, self.target_w)]
+            if crop.shape[0] < self.target_h or crop.shape[1] < self.target_w:
+                crop = cv2.copyMakeBorder(
+                    crop,
+                    0, max(0, self.target_h - crop.shape[0]),
+                    0, max(0, self.target_w - crop.shape[1]),
+                    cv2.BORDER_REPLICATE,
+                )
+            host_data[i] = crop.astype(np.float32).transpose(2, 0, 1) / 255.0
 
         self.current_idx += self.batch_size
 

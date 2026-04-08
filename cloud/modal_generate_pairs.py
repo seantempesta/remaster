@@ -19,12 +19,12 @@ vol = modal.Volume.from_name("upscale-data", create_if_missing=True)
 VOL_MOUNT = "/mnt/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("libgl1", "libglib2.0-0")
     .pip_install(
         "torch==2.11.0",
         "torchvision",
-        extra_index_url="https://download.pytorch.org/whl/cu126",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
     )
     .pip_install("opencv-python-headless", "numpy", "einops", "timm")
     .add_local_dir(

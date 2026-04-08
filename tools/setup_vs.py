@@ -28,22 +28,22 @@ import zipfile
 # Configuration — pin specific versions for reproducibility
 # ---------------------------------------------------------------------------
 
-# VapourSynth R70 portable (Python 3.12 embedded)
+# VapourSynth R74 portable (Python 3.12 embedded)
 # https://github.com/vapoursynth/vapoursynth/releases
-VS_VERSION = "R70"
+VS_VERSION = "R74"
 VS_URL = (
     "https://github.com/vapoursynth/vapoursynth/releases/download/{version}/"
     "VapourSynth64-Portable-{version}.zip"
 ).format(version=VS_VERSION)
 VS_SHA256 = None  # TODO: fill in after first successful download
 
-# vs-mlrt v16.2 (TensorRT 10.x backend for VapourSynth)
+# vs-mlrt v15.16 (TensorRT 10.16.0 backend for VapourSynth)
 # https://github.com/AmusementClub/vs-mlrt/releases
 # The release zip contains:
 #   vstrt.dll           - VapourSynth plugin
 #   vsmlrt.py           - Python helper (goes on sys.path)
 #   TensorRT runtime DLLs (nvinfer.dll, etc.)
-VSMLRT_VERSION = "v16.2"
+VSMLRT_VERSION = "v15.16"
 VSMLRT_URL = (
     "https://github.com/AmusementClub/vs-mlrt/releases/download/{version}/"
     "vsmlrt-windows-x64-cuda.zip"
