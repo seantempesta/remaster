@@ -3,7 +3,7 @@
 // NVDEC decode -> CUDA color convert -> TensorRT inference -> CUDA color convert -> NVENC encode
 //
 // All frames stay on the GPU. No Python, no VapourSynth, no stdio pipes.
-// Uses triple-buffered pipelining with CUDA streams for maximum throughput.
+// Output is a proper MKV container with audio/subtitle passthrough.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -25,6 +25,8 @@
 #include "simple_demuxer.h"
 #include "trt_inference.h"
 #include "color_kernels.h"
+#include "mkv_muxer.h"
+#include "async_writer.h"
 
 simplelogger::Logger *logger = simplelogger::LoggerFactory::CreateConsoleLogger();
 
@@ -39,6 +41,7 @@ struct PipelineConfig {
     int cq           = 24;     // constant quality (lower = higher quality)
     std::string preset = "p4"; // NVENC preset (SDK 10+: p1-p7, p1=fastest, p7=best quality)
     bool tenBit      = false;  // output 10-bit HEVC
+    bool noAudio     = false;  // skip audio/subtitle passthrough
 };
 
 static void printUsage() {
@@ -46,12 +49,13 @@ static void printUsage() {
         << "Usage: remaster_pipeline [options]\n"
         << "\n"
         << "  --input   / -i   Input video file (required)\n"
-        << "  --output  / -o   Output HEVC bitstream file (required)\n"
+        << "  --output  / -o   Output MKV file (required)\n"
         << "  --engine  / -e   TensorRT engine file (required)\n"
         << "  --gpu            GPU ordinal (default: 0)\n"
         << "  --cq             Constant quality value, lower=better (default: 24)\n"
         << "  --preset         NVENC preset: p1-p7 (p1=fastest, p7=best quality, default: p4)\n"
         << "  --10bit          Output 10-bit HEVC\n"
+        << "  --no-audio       Skip audio/subtitle passthrough\n"
         << "  --help   / -h    Show this message\n"
         << std::endl;
 }
@@ -70,6 +74,7 @@ static bool parseArgs(int argc, char** argv, PipelineConfig& cfg) {
         else if (arg == "--cq" && i+1 < argc)                       cfg.cq  = std::stoi(argv[++i]);
         else if (arg == "--preset" && i+1 < argc)                   cfg.preset = argv[++i];
         else if (arg == "--10bit")                                   cfg.tenBit = true;
+        else if (arg == "--no-audio")                                cfg.noAudio = true;
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage();
@@ -103,9 +108,7 @@ static GUID presetGuidFromString(const std::string& preset) {
 // ---------------------------------------------------------------------------
 // NVENC tuning info from preset string
 // ---------------------------------------------------------------------------
-static NV_ENC_TUNING_INFO tuningFromPreset(const std::string& preset) {
-    // Default to high quality tuning for all presets
-    // Could be extended with --tune cli arg if needed
+static NV_ENC_TUNING_INFO tuningFromPreset(const std::string& /*preset*/) {
     return NV_ENC_TUNING_INFO_HIGH_QUALITY;
 }
 
@@ -172,11 +175,31 @@ int main(int argc, char** argv) {
     int srcHeight = demuxer.GetHeight();
     int bitDepth  = demuxer.GetBitDepth();
     bool is10bit  = bitDepth > 8;
+    double fps    = demuxer.GetFrameRate();
+    bool passAudio = !cfg.noAudio;
+
+    if (fps <= 0.0) {
+        std::cerr << "Warning: could not determine frame rate, assuming 23.976" << std::endl;
+        fps = 24000.0 / 1001.0;
+    }
 
     std::cerr << "Input: " << srcWidth << "x" << srcHeight
               << " " << bitDepth << "-bit "
               << (demuxer.GetVideoCodec() == AV_CODEC_ID_HEVC ? "HEVC" : "H264")
+              << " @ " << fps << " fps"
               << std::endl;
+
+    // Count audio/subtitle streams for info
+    int nAudioStreams = 0, nSubStreams = 0;
+    for (int i = 0; i < demuxer.GetNumStreams(); i++) {
+        AVStream* s = demuxer.GetStream(i);
+        if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) nAudioStreams++;
+        else if (s->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) nSubStreams++;
+    }
+    if (passAudio) {
+        std::cerr << "Passthrough: " << nAudioStreams << " audio, "
+                  << nSubStreams << " subtitle stream(s)" << std::endl;
+    }
 
     NvDecoder dec(cuContext, srcWidth, srcHeight, true,
                   FFmpeg2NvCodecId(demuxer.GetVideoCodec()),
@@ -200,7 +223,6 @@ int main(int argc, char** argv) {
         std::cerr << "Warning: Engine expects " << trt.getInputWidth() << "x" << trt.getInputHeight()
                   << " but video is " << srcWidth << "x" << srcHeight
                   << " (padded: " << padW << "x" << padH << ")" << std::endl;
-        // Use engine dimensions if they differ -- the engine is authoritative
         padW = trt.getInputWidth();
         padH = trt.getInputHeight();
     }
@@ -251,9 +273,26 @@ int main(int argc, char** argv) {
               << (outIs10bit ? " 10-bit" : " 8-bit") << std::endl;
 
     // -----------------------------------------------------------------------
-    // 5. Allocate pipeline buffers and CUDA streams
+    // 5. Initialize MKV muxer + async writer
     // -----------------------------------------------------------------------
-    // Triple-buffer for decode/infer/encode overlap
+    MkvMuxer muxer;
+    if (!muxer.open(demuxer.GetFormatContext(), demuxer.GetVideoStreamIndex(),
+                    cfg.outputPath.c_str(),
+                    srcWidth, srcHeight, fps,
+                    outIs10bit, passAudio))
+    {
+        std::cerr << "Failed to initialize MKV muxer" << std::endl;
+        return 1;
+    }
+
+    AsyncWriter writer(muxer);
+    writer.start();
+
+    std::cerr << "Output: " << cfg.outputPath << " (MKV)" << std::endl;
+
+    // -----------------------------------------------------------------------
+    // 6. Allocate pipeline buffers and CUDA streams
+    // -----------------------------------------------------------------------
     constexpr int NUM_BUFFERS = 3;
     FrameBuffer buffers[NUM_BUFFERS];
     cudaStream_t streams[NUM_BUFFERS];
@@ -265,27 +304,18 @@ int main(int argc, char** argv) {
         cudaEventCreate(&events[i]);
     }
 
-    // Open output file
-    std::ofstream fpOut(cfg.outputPath, std::ios::out | std::ios::binary);
-    if (!fpOut) {
-        std::cerr << "Failed to open output file: " << cfg.outputPath << std::endl;
-        return 1;
-    }
-
     // -----------------------------------------------------------------------
-    // 6. Pipeline loop
+    // 7. Pipeline loop
     // -----------------------------------------------------------------------
     auto startTime = std::chrono::high_resolution_clock::now();
     int nFrameDecoded = 0;
     int nFrameEncoded = 0;
-    int nVideoBytes = 0;
     uint8_t* pVideo = nullptr;
     uint8_t** ppFrame = nullptr;
     int nFrameReturned = 0;
+    int nVideoBytes = 0;
+    int nAudioPackets = 0;
 
-    // Simple sequential pipeline for correctness first.
-    // Each frame: demux -> decode -> color convert -> infer -> color convert -> encode -> write
-    // We still use async CUDA operations within each frame for GPU pipelining.
     cudaStream_t inferStream = streams[0];
 
     // ---- Profiling: CUDA events for per-stage GPU timing ----
@@ -308,9 +338,9 @@ int main(int argc, char** argv) {
     auto reportProgress = [&]() {
         auto now = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(now - startTime).count();
-        double fps = (elapsed > 0) ? nFrameEncoded / elapsed : 0.0;
+        double fpsNow = (elapsed > 0) ? nFrameEncoded / elapsed : 0.0;
         fprintf(stderr, "\rFrame %d | %.1f fps | %.1fs elapsed",
-                nFrameEncoded, fps, elapsed);
+                nFrameEncoded, fpsNow, elapsed);
     };
 
     // Lambda: process decoded frames through inference and encoding
@@ -386,9 +416,10 @@ int main(int argc, char** argv) {
             auto encEnd = std::chrono::high_resolution_clock::now();
             totalEncodeMs += std::chrono::duration<double, std::milli>(encEnd - encStart).count();
 
+            // -- Write encoded packets to muxer via async writer --
             auto writeStart = std::chrono::high_resolution_clock::now();
             for (auto& packet : vPacket) {
-                fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
+                writer.pushVideoPacket(packet.data(), (int)packet.size(), nFrameEncoded);
                 nFrameEncoded++;
             }
             auto writeEnd = std::chrono::high_resolution_clock::now();
@@ -401,21 +432,35 @@ int main(int argc, char** argv) {
         }
     };
 
-    // Demux and decode loop
+    // ---- Main demux loop: route video to decoder, audio/subs to muxer ----
+    int streamIdx = 0;
     while (true) {
         auto demuxStart = std::chrono::high_resolution_clock::now();
-        bool gotPacket = demuxer.Demux(&pVideo, &nVideoBytes);
+        bool gotPacket = demuxer.DemuxAny(&pVideo, &nVideoBytes, &streamIdx);
         auto demuxEnd = std::chrono::high_resolution_clock::now();
         totalDemuxMs += std::chrono::duration<double, std::milli>(demuxEnd - demuxStart).count();
 
         if (!gotPacket) break;
 
-        auto decodeStart = std::chrono::high_resolution_clock::now();
-        dec.Decode(pVideo, nVideoBytes, &ppFrame, &nFrameReturned);
-        auto decodeEnd = std::chrono::high_resolution_clock::now();
-        totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
+        if (streamIdx == demuxer.GetVideoStreamIndex()) {
+            // Video packet -> NVDEC decoder
+            auto decodeStart = std::chrono::high_resolution_clock::now();
+            dec.Decode(pVideo, nVideoBytes, &ppFrame, &nFrameReturned);
+            auto decodeEnd = std::chrono::high_resolution_clock::now();
+            totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
 
-        processDecodedFrames(ppFrame, nFrameReturned);
+            processDecodedFrames(ppFrame, nFrameReturned);
+        } else if (passAudio) {
+            // Audio/subtitle packet -> passthrough to muxer via async writer
+            AVPacket* pkt = demuxer.GetCurrentPacket();
+            AVStream* s = demuxer.GetStream(streamIdx);
+            if (s && (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO ||
+                      s->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE))
+            {
+                writer.pushPassthroughPacket(pkt);
+                nAudioPackets++;
+            }
+        }
     }
 
     // Flush decoder: send empty packet to get buffered frames
@@ -428,7 +473,7 @@ int main(int argc, char** argv) {
     processDecodedFrames(ppFrame, nFrameReturned);
 
     // -----------------------------------------------------------------------
-    // 7. Flush encoder
+    // 8. Flush encoder
     // -----------------------------------------------------------------------
     {
         auto encStart = std::chrono::high_resolution_clock::now();
@@ -437,16 +482,20 @@ int main(int argc, char** argv) {
         auto encEnd = std::chrono::high_resolution_clock::now();
         totalEncodeMs += std::chrono::duration<double, std::milli>(encEnd - encStart).count();
         for (auto& packet : vPacket) {
-            fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
+            writer.pushVideoPacket(packet.data(), (int)packet.size(), nFrameEncoded);
             nFrameEncoded++;
         }
     }
 
     // -----------------------------------------------------------------------
-    // 8. Report results and clean up
+    // 9. Flush writer and close muxer
     // -----------------------------------------------------------------------
-    fpOut.close();
+    writer.stop();   // waits for all queued packets to be written
+    muxer.close();   // writes MKV trailer
 
+    // -----------------------------------------------------------------------
+    // 10. Report results and clean up
+    // -----------------------------------------------------------------------
     auto endTime = std::chrono::high_resolution_clock::now();
     double totalTime = std::chrono::duration<double>(endTime - startTime).count();
     double avgFps = nFrameEncoded / totalTime;
@@ -454,43 +503,48 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\n\nDone: %d frames in %.2f seconds (%.1f fps avg)\n",
             nFrameEncoded, totalTime, avgFps);
     fprintf(stderr, "Output: %s\n", cfg.outputPath.c_str());
+    if (passAudio) {
+        fprintf(stderr, "Passthrough: %d audio/subtitle packets\n", nAudioPackets);
+    }
 
     // ---- Per-stage profiling breakdown ----
-    double totalAccountedMs = totalDemuxMs + totalDecodeMs + totalCsc1Ms
-                            + totalInferMs + totalCsc2Ms + totalSyncMs
-                            + totalEncodeMs + totalWriteMs;
-    double wallMs = totalTime * 1000.0;
-    double overheadMs = wallMs - totalAccountedMs;
+    if (nFrameDecoded > 0) {
+        double totalAccountedMs = totalDemuxMs + totalDecodeMs + totalCsc1Ms
+                                + totalInferMs + totalCsc2Ms + totalSyncMs
+                                + totalEncodeMs + totalWriteMs;
+        double wallMs = totalTime * 1000.0;
+        double overheadMs = wallMs - totalAccountedMs;
 
-    fprintf(stderr, "\n--- Per-stage timing breakdown (%d frames) ---\n", nFrameDecoded);
-    fprintf(stderr, "  Demux (CPU):          %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalDemuxMs,  totalDemuxMs / nFrameDecoded,  100.0*totalDemuxMs/wallMs);
-    fprintf(stderr, "  Decode (NVDEC+CPU):   %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalDecodeMs, totalDecodeMs / nFrameDecoded, 100.0*totalDecodeMs/wallMs);
-    fprintf(stderr, "  CSC NV12->RGB (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalCsc1Ms,   totalCsc1Ms / nFrameDecoded,   100.0*totalCsc1Ms/wallMs);
-    fprintf(stderr, "  TRT Infer (GPU):      %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalInferMs,  totalInferMs / nFrameDecoded,  100.0*totalInferMs/wallMs);
-    fprintf(stderr, "  CSC RGB->NV12 (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalCsc2Ms,   totalCsc2Ms / nFrameDecoded,   100.0*totalCsc2Ms/wallMs);
-    fprintf(stderr, "  Stream sync (CPU):    %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalSyncMs,   totalSyncMs / nFrameDecoded,   100.0*totalSyncMs/wallMs);
-    fprintf(stderr, "  Encode (NVENC):       %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalEncodeMs, totalEncodeMs / nFrameDecoded, 100.0*totalEncodeMs/wallMs);
-    fprintf(stderr, "  File write:           %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            totalWriteMs,  totalWriteMs / nFrameDecoded,  100.0*totalWriteMs/wallMs);
-    fprintf(stderr, "  Overhead/unaccounted: %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
-            overheadMs,    overheadMs / nFrameDecoded,    100.0*overheadMs/wallMs);
-    fprintf(stderr, "  ---\n");
-    fprintf(stderr, "  Wall time:            %8.1f ms total  %6.3f ms/frame\n",
-            wallMs, wallMs / nFrameDecoded);
-    fprintf(stderr, "  GPU work (CSC+TRT):   %8.1f ms total  %6.3f ms/frame (theoretical max: %.1f fps)\n",
-            totalCsc1Ms + totalInferMs + totalCsc2Ms,
-            (totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded,
-            1000.0 / ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded));
-    fprintf(stderr, "  Sequential overhead:  %6.3f ms/frame (%.1f fps lost vs GPU-only)\n",
-            (wallMs / nFrameDecoded) - ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded),
-            avgFps > 0 ? (1000.0 / ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded) - avgFps) : 0.0);
+        fprintf(stderr, "\n--- Per-stage timing breakdown (%d frames) ---\n", nFrameDecoded);
+        fprintf(stderr, "  Demux (CPU):          %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalDemuxMs,  totalDemuxMs / nFrameDecoded,  100.0*totalDemuxMs/wallMs);
+        fprintf(stderr, "  Decode (NVDEC+CPU):   %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalDecodeMs, totalDecodeMs / nFrameDecoded, 100.0*totalDecodeMs/wallMs);
+        fprintf(stderr, "  CSC NV12->RGB (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalCsc1Ms,   totalCsc1Ms / nFrameDecoded,   100.0*totalCsc1Ms/wallMs);
+        fprintf(stderr, "  TRT Infer (GPU):      %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalInferMs,  totalInferMs / nFrameDecoded,  100.0*totalInferMs/wallMs);
+        fprintf(stderr, "  CSC RGB->NV12 (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalCsc2Ms,   totalCsc2Ms / nFrameDecoded,   100.0*totalCsc2Ms/wallMs);
+        fprintf(stderr, "  Stream sync (CPU):    %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalSyncMs,   totalSyncMs / nFrameDecoded,   100.0*totalSyncMs/wallMs);
+        fprintf(stderr, "  Encode (NVENC):       %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalEncodeMs, totalEncodeMs / nFrameDecoded, 100.0*totalEncodeMs/wallMs);
+        fprintf(stderr, "  Queue push (async):   %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                totalWriteMs,  totalWriteMs / nFrameDecoded,  100.0*totalWriteMs/wallMs);
+        fprintf(stderr, "  Overhead/unaccounted: %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                overheadMs,    overheadMs / nFrameDecoded,    100.0*overheadMs/wallMs);
+        fprintf(stderr, "  ---\n");
+        fprintf(stderr, "  Wall time:            %8.1f ms total  %6.3f ms/frame\n",
+                wallMs, wallMs / nFrameDecoded);
+        fprintf(stderr, "  GPU work (CSC+TRT):   %8.1f ms total  %6.3f ms/frame (theoretical max: %.1f fps)\n",
+                totalCsc1Ms + totalInferMs + totalCsc2Ms,
+                (totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded,
+                1000.0 / ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded));
+        fprintf(stderr, "  Sequential overhead:  %6.3f ms/frame (%.1f fps lost vs GPU-only)\n",
+                (wallMs / nFrameDecoded) - ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded),
+                avgFps > 0 ? (1000.0 / ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded) - avgFps) : 0.0);
+    }
 
     // Cleanup profiling events
     cudaEventDestroy(evStart);
@@ -504,9 +558,6 @@ int main(int argc, char** argv) {
         cudaStreamDestroy(streams[i]);
         cudaEventDestroy(events[i]);
     }
-
-    // Encoder is cleaned up by unique_ptr
-    // Decoder destructor handles cleanup
 
     return 0;
 

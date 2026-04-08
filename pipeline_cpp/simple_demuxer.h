@@ -3,6 +3,10 @@
 // Replaces the Video SDK's FFmpegDemuxer.h which uses removed FFmpeg APIs
 // (av_register_all, stack-allocated AVPacket, ck() overload for int).
 // This implementation uses only modern FFmpeg 7.x API.
+//
+// Supports two modes:
+// - Demux(): returns only video packets (original behavior)
+// - DemuxAny(): returns ALL packets (video + audio + subtitle) for muxing
 #pragma once
 
 extern "C" {
@@ -35,7 +39,6 @@ inline cudaVideoCodec FFmpeg2NvCodecId(AVCodecID id) {
 class SimpleDemuxer {
 public:
     SimpleDemuxer(const char* filePath) {
-        // avformat_network_init is still available in FFmpeg 7.x
         avformat_network_init();
 
         int ret = avformat_open_input(&fmtCtx_, filePath, nullptr, nullptr);
@@ -68,7 +71,7 @@ public:
         if (par->format == AV_PIX_FMT_YUV420P12LE || par->format == AV_PIX_FMT_YUV420P12BE)
             bitDepth_ = 12;
 
-        // Allocate packet
+        // Allocate packets
         pkt_ = av_packet_alloc();
         pktFiltered_ = av_packet_alloc();
 
@@ -96,7 +99,7 @@ public:
                     if (ret < 0) {
                         av_bsf_free(&bsfCtx_);
                         bsfCtx_ = nullptr;
-                        std::cerr << "Warning: BSF init failed, H.264 Annex B conversion disabled" << std::endl;
+                        std::cerr << "Warning: BSF init failed, Annex B conversion disabled" << std::endl;
                     }
                 }
             }
@@ -116,12 +119,38 @@ public:
     SimpleDemuxer(const SimpleDemuxer&) = delete;
     SimpleDemuxer& operator=(const SimpleDemuxer&) = delete;
 
+    // ---- Basic info ----
     bool IsValid() const { return valid_; }
     AVCodecID GetVideoCodec() const { return codecId_; }
     int GetWidth() const { return width_; }
     int GetHeight() const { return height_; }
     int GetBitDepth() const { return bitDepth_; }
 
+    // ---- Stream info (for muxer setup) ----
+    int GetVideoStreamIndex() const { return videoStreamIdx_; }
+    int GetNumStreams() const { return fmtCtx_ ? (int)fmtCtx_->nb_streams : 0; }
+    AVStream* GetStream(int idx) const {
+        if (!fmtCtx_ || idx < 0 || idx >= (int)fmtCtx_->nb_streams) return nullptr;
+        return fmtCtx_->streams[idx];
+    }
+    AVFormatContext* GetFormatContext() const { return fmtCtx_; }
+
+    AVRational GetVideoTimeBase() const {
+        if (!fmtCtx_ || videoStreamIdx_ < 0) return {1, 1};
+        return fmtCtx_->streams[videoStreamIdx_]->time_base;
+    }
+
+    double GetFrameRate() const {
+        if (!fmtCtx_ || videoStreamIdx_ < 0) return 0.0;
+        AVRational fr = fmtCtx_->streams[videoStreamIdx_]->avg_frame_rate;
+        if (fr.num == 0 || fr.den == 0) {
+            fr = fmtCtx_->streams[videoStreamIdx_]->r_frame_rate;
+        }
+        if (fr.num == 0 || fr.den == 0) return 0.0;
+        return av_q2d(fr);
+    }
+
+    // ---- Original video-only demux ----
     // Read the next video packet. Returns false at EOF.
     // Sets *ppVideo to the compressed data and *pnVideoBytes to its size.
     // The returned pointer is valid until the next Demux() call.
@@ -139,11 +168,49 @@ public:
 
             if (pkt_->stream_index == videoStreamIdx_)
                 break;
-
-            // Not video, keep reading
         }
 
-        // Apply bitstream filter if needed (H.264 in MP4/MKV)
+        return filterVideoPacket(ppVideo, pnVideoBytes);
+    }
+
+    // ---- Multi-stream demux (for muxing with audio passthrough) ----
+    // Read the next packet from any stream. Returns false at EOF.
+    //
+    // For video packets: *ppData and *pnBytes contain the (BSF-filtered) data
+    //   for feeding NVDEC, and *pStreamIndex == GetVideoStreamIndex().
+    //
+    // For audio/subtitle packets: the raw AVPacket is accessible via
+    //   GetCurrentPacket() for passing to the muxer.
+    bool DemuxAny(uint8_t** ppData, int* pnBytes, int* pStreamIndex) {
+        if (!valid_ || !fmtCtx_) return false;
+
+        *ppData = nullptr;
+        *pnBytes = 0;
+
+        av_packet_unref(pkt_);
+        int ret = av_read_frame(fmtCtx_, pkt_);
+        if (ret < 0) return false;  // EOF or error
+
+        *pStreamIndex = pkt_->stream_index;
+
+        if (pkt_->stream_index == videoStreamIdx_) {
+            return filterVideoPacket(ppData, pnBytes);
+        } else {
+            // Non-video: data accessible via GetCurrentPacket()
+            *ppData = pkt_->data;
+            *pnBytes = pkt_->size;
+            return true;
+        }
+    }
+
+    // Get the current raw AVPacket (for audio/subtitle passthrough to muxer).
+    // Valid until the next Demux/DemuxAny call.
+    AVPacket* GetCurrentPacket() const { return pkt_; }
+
+private:
+    // Apply bitstream filter to the current video packet (pkt_).
+    // Returns the filtered data via ppVideo/pnVideoBytes.
+    bool filterVideoPacket(uint8_t** ppVideo, int* pnVideoBytes) {
         if (bsfCtx_) {
             av_packet_unref(pktFiltered_);
             int ret = av_bsf_send_packet(bsfCtx_, pkt_);
@@ -156,11 +223,9 @@ public:
             *ppVideo = pkt_->data;
             *pnVideoBytes = pkt_->size;
         }
-
         return true;
     }
 
-private:
     AVFormatContext* fmtCtx_ = nullptr;
     AVBSFContext*    bsfCtx_ = nullptr;
     AVPacket*        pkt_ = nullptr;
