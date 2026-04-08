@@ -123,7 +123,7 @@ data/
   output/          Training artifacts synced from Modal
 ```
 
-**Staged data pipeline** (see `docs/training-data-plan.md`):
+**Staged data pipeline** (see `docs/research/training-data/plan.md`):
 1. Extract originals (1/500 frames, proportional to content length)
 2. Denoise with SCUNet GAN + light USM(1.0) -> **TARGET** (denoise + sharpen in one pass)
 3. Build degraded **INPUT**: 33% raw original, 33% +noise, 33% +edge-aware blur+noise
@@ -139,7 +139,7 @@ Training data sources (proportional sampling, 1 frame per 500 source frames):
 | `foundation_*` | Foundation S03 | ~426 | 1920x800 |
 | **Total** | | **~6,956** | |
 
-See `docs/training-data-plan.md` for details. Built by `tools/build_training_data.py`.
+See `docs/research/training-data/plan.md` for details. Built by `tools/build_training_data.py`.
 
 ## Current Status (2026-04-05)
 
@@ -155,7 +155,7 @@ See `docs/training-data-plan.md` for details. Built by `tools/build_training_dat
 - **Losses**: Charbonnier pixel + DISTS perceptual (teacher), Charbonnier + feature matching (student)
 - **Optimizer**: Prodigy (auto-tuned LR, safeguard_warmup, bias_correction)
 - **Cloud**: Modal L40S ($1.95/hr, 48GB VRAM), W&B logging, 64GB RAM cache
-- See `docs/training-data-plan.md` for data sources and sampling plan
+- See `docs/research/training-data/plan.md` for data sources and sampling plan
 
 ### Training Commands
 ```bash
@@ -235,7 +235,7 @@ tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
 - **DINOv3**: Features extracted (15 fps locally, 133MB VRAM). Useful for semantic matching but not for denoising targets. Not viable as a loss function (color-blind by design)
 - **Color**: Student has Cr/Cb shift (~12 points) but VLC display bug was the primary visual issue. BT.709 metadata now correctly tagged in all encode paths.
 
-**Research docs:** `docs/quantization-research.md`, `docs/tensorrt-implementation.md`, `docs/detail-recovery-research.md`, `docs/quantization-aware-training.md`, `docs/gpu-profiling-guide.md`, `docs/modal-graceful-shutdown.md`, `docs/realtime-playback-research.md`, `docs/zero-copy-gpu-pipeline.md`, `docs/training-data-plan.md`, `docs/pruning-plan.md`.
+**Research docs:** `docs/research/` (temporal-context, raft-alignment, cpp-pipeline, training-data). **Guides:** `docs/guides/` (gpu-profiling, modal-graceful-shutdown). **Archive:** `docs/archive/` (old NAFNet-era docs). See `docs/README.md` for full index.
 
 ## Weights & Biases (W&B)
 

@@ -288,6 +288,23 @@ int main(int argc, char** argv) {
     // We still use async CUDA operations within each frame for GPU pipelining.
     cudaStream_t inferStream = streams[0];
 
+    // ---- Profiling: CUDA events for per-stage GPU timing ----
+    cudaEvent_t evStart, evAfterCsc1, evAfterInfer, evAfterCsc2;
+    cudaEventCreate(&evStart);
+    cudaEventCreate(&evAfterCsc1);
+    cudaEventCreate(&evAfterInfer);
+    cudaEventCreate(&evAfterCsc2);
+
+    // Accumulators (milliseconds)
+    double totalDemuxMs   = 0.0;
+    double totalDecodeMs  = 0.0;
+    double totalCsc1Ms    = 0.0;  // NV12->RGB
+    double totalInferMs   = 0.0;
+    double totalCsc2Ms    = 0.0;  // RGB->NV12
+    double totalSyncMs    = 0.0;  // cudaStreamSynchronize
+    double totalEncodeMs  = 0.0;
+    double totalWriteMs   = 0.0;
+
     auto reportProgress = [&]() {
         auto now = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(now - startTime).count();
@@ -304,6 +321,7 @@ int main(int argc, char** argv) {
 
             // -- Color convert: NV12/P010 -> planar RGB FP16 --
             int decPitch = dec.GetDeviceFramePitch();
+            cudaEventRecord(evStart, inferStream);
             if (is10bit) {
                 launchP010ToRgbFp16(
                     ppFrame[i], buf.rgbIn,
@@ -317,12 +335,14 @@ int main(int argc, char** argv) {
                     padW, padH,
                     inferStream);
             }
+            cudaEventRecord(evAfterCsc1, inferStream);
 
             // -- TRT inference --
             if (!trt.infer(buf.rgbIn, buf.rgbOut, inferStream)) {
                 std::cerr << "\nInference failed at frame " << nFrameDecoded << std::endl;
                 return;
             }
+            cudaEventRecord(evAfterInfer, inferStream);
 
             // -- Color convert: planar RGB FP16 -> NV12/P010 for encoder --
             const NvEncInputFrame* encFrame = pEnc->GetNextInputFrame();
@@ -342,18 +362,37 @@ int main(int argc, char** argv) {
                     encFrame->pitch,
                     inferStream);
             }
+            cudaEventRecord(evAfterCsc2, inferStream);
 
             // Sync before encode (NVENC needs the data ready)
+            auto syncStart = std::chrono::high_resolution_clock::now();
             cudaStreamSynchronize(inferStream);
+            auto syncEnd = std::chrono::high_resolution_clock::now();
+            totalSyncMs += std::chrono::duration<double, std::milli>(syncEnd - syncStart).count();
+
+            // Read GPU stage timings
+            float csc1Ms = 0, inferMs = 0, csc2Ms = 0;
+            cudaEventElapsedTime(&csc1Ms, evStart, evAfterCsc1);
+            cudaEventElapsedTime(&inferMs, evAfterCsc1, evAfterInfer);
+            cudaEventElapsedTime(&csc2Ms, evAfterInfer, evAfterCsc2);
+            totalCsc1Ms  += csc1Ms;
+            totalInferMs += inferMs;
+            totalCsc2Ms  += csc2Ms;
 
             // -- Encode --
+            auto encStart = std::chrono::high_resolution_clock::now();
             std::vector<std::vector<uint8_t>> vPacket;
             pEnc->EncodeFrame(vPacket);
+            auto encEnd = std::chrono::high_resolution_clock::now();
+            totalEncodeMs += std::chrono::duration<double, std::milli>(encEnd - encStart).count();
 
+            auto writeStart = std::chrono::high_resolution_clock::now();
             for (auto& packet : vPacket) {
                 fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
                 nFrameEncoded++;
             }
+            auto writeEnd = std::chrono::high_resolution_clock::now();
+            totalWriteMs += std::chrono::duration<double, std::milli>(writeEnd - writeStart).count();
 
             // Progress
             if (nFrameDecoded % 30 == 0) {
@@ -363,21 +402,40 @@ int main(int argc, char** argv) {
     };
 
     // Demux and decode loop
-    while (demuxer.Demux(&pVideo, &nVideoBytes)) {
+    while (true) {
+        auto demuxStart = std::chrono::high_resolution_clock::now();
+        bool gotPacket = demuxer.Demux(&pVideo, &nVideoBytes);
+        auto demuxEnd = std::chrono::high_resolution_clock::now();
+        totalDemuxMs += std::chrono::duration<double, std::milli>(demuxEnd - demuxStart).count();
+
+        if (!gotPacket) break;
+
+        auto decodeStart = std::chrono::high_resolution_clock::now();
         dec.Decode(pVideo, nVideoBytes, &ppFrame, &nFrameReturned);
+        auto decodeEnd = std::chrono::high_resolution_clock::now();
+        totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
+
         processDecodedFrames(ppFrame, nFrameReturned);
     }
 
     // Flush decoder: send empty packet to get buffered frames
-    dec.Decode(nullptr, 0, &ppFrame, &nFrameReturned);
+    {
+        auto decodeStart = std::chrono::high_resolution_clock::now();
+        dec.Decode(nullptr, 0, &ppFrame, &nFrameReturned);
+        auto decodeEnd = std::chrono::high_resolution_clock::now();
+        totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
+    }
     processDecodedFrames(ppFrame, nFrameReturned);
 
     // -----------------------------------------------------------------------
     // 7. Flush encoder
     // -----------------------------------------------------------------------
     {
+        auto encStart = std::chrono::high_resolution_clock::now();
         std::vector<std::vector<uint8_t>> vPacket;
         pEnc->EndEncode(vPacket);
+        auto encEnd = std::chrono::high_resolution_clock::now();
+        totalEncodeMs += std::chrono::duration<double, std::milli>(encEnd - encStart).count();
         for (auto& packet : vPacket) {
             fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
             nFrameEncoded++;
@@ -396,6 +454,49 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\n\nDone: %d frames in %.2f seconds (%.1f fps avg)\n",
             nFrameEncoded, totalTime, avgFps);
     fprintf(stderr, "Output: %s\n", cfg.outputPath.c_str());
+
+    // ---- Per-stage profiling breakdown ----
+    double totalAccountedMs = totalDemuxMs + totalDecodeMs + totalCsc1Ms
+                            + totalInferMs + totalCsc2Ms + totalSyncMs
+                            + totalEncodeMs + totalWriteMs;
+    double wallMs = totalTime * 1000.0;
+    double overheadMs = wallMs - totalAccountedMs;
+
+    fprintf(stderr, "\n--- Per-stage timing breakdown (%d frames) ---\n", nFrameDecoded);
+    fprintf(stderr, "  Demux (CPU):          %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalDemuxMs,  totalDemuxMs / nFrameDecoded,  100.0*totalDemuxMs/wallMs);
+    fprintf(stderr, "  Decode (NVDEC+CPU):   %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalDecodeMs, totalDecodeMs / nFrameDecoded, 100.0*totalDecodeMs/wallMs);
+    fprintf(stderr, "  CSC NV12->RGB (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalCsc1Ms,   totalCsc1Ms / nFrameDecoded,   100.0*totalCsc1Ms/wallMs);
+    fprintf(stderr, "  TRT Infer (GPU):      %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalInferMs,  totalInferMs / nFrameDecoded,  100.0*totalInferMs/wallMs);
+    fprintf(stderr, "  CSC RGB->NV12 (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalCsc2Ms,   totalCsc2Ms / nFrameDecoded,   100.0*totalCsc2Ms/wallMs);
+    fprintf(stderr, "  Stream sync (CPU):    %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalSyncMs,   totalSyncMs / nFrameDecoded,   100.0*totalSyncMs/wallMs);
+    fprintf(stderr, "  Encode (NVENC):       %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalEncodeMs, totalEncodeMs / nFrameDecoded, 100.0*totalEncodeMs/wallMs);
+    fprintf(stderr, "  File write:           %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            totalWriteMs,  totalWriteMs / nFrameDecoded,  100.0*totalWriteMs/wallMs);
+    fprintf(stderr, "  Overhead/unaccounted: %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+            overheadMs,    overheadMs / nFrameDecoded,    100.0*overheadMs/wallMs);
+    fprintf(stderr, "  ---\n");
+    fprintf(stderr, "  Wall time:            %8.1f ms total  %6.3f ms/frame\n",
+            wallMs, wallMs / nFrameDecoded);
+    fprintf(stderr, "  GPU work (CSC+TRT):   %8.1f ms total  %6.3f ms/frame (theoretical max: %.1f fps)\n",
+            totalCsc1Ms + totalInferMs + totalCsc2Ms,
+            (totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded,
+            1000.0 / ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded));
+    fprintf(stderr, "  Sequential overhead:  %6.3f ms/frame (%.1f fps lost vs GPU-only)\n",
+            (wallMs / nFrameDecoded) - ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded),
+            avgFps > 0 ? (1000.0 / ((totalCsc1Ms + totalInferMs + totalCsc2Ms) / nFrameDecoded) - avgFps) : 0.0);
+
+    // Cleanup profiling events
+    cudaEventDestroy(evStart);
+    cudaEventDestroy(evAfterCsc1);
+    cudaEventDestroy(evAfterInfer);
+    cudaEventDestroy(evAfterCsc2);
 
     // Free pipeline buffers
     for (int i = 0; i < NUM_BUFFERS; i++) {
