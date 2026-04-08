@@ -28,6 +28,16 @@ build/
 .env
 .venv/
 
+# Claude Code local config
+.claude/
+
+# Modal CLI state
+.modal/
+
+# W&B auth
+_netrc
+.netrc
+
 # IDE
 .idea/
 .vscode/
