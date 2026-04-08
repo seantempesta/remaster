@@ -34,6 +34,7 @@ def export(
     output: str,
     test_h: int = 1080,
     test_w: int = 1920,
+    fp16: bool = True,
 ):
     """Export a DRUNet model to ONNX."""
     import torch
@@ -60,11 +61,20 @@ def export(
     gc.collect()
     model.eval()
 
+    # FP16 export: model and dummy in half precision so ONNX declares FP16 I/O.
+    # This ensures TRT engines built from this ONNX automatically have FP16 I/O,
+    # matching the C++ pipeline's __half* buffers without --inputIOFormats overrides.
+    if fp16:
+        model.half()
+        print("Exporting in FP16 (model.half())")
+
     # Pad test dimensions to factor of 8 (3 downsample levels)
     pad_factor = 8
     H = ((test_h + pad_factor - 1) // pad_factor) * pad_factor
     W = ((test_w + pad_factor - 1) // pad_factor) * pad_factor
     dummy = torch.randn(1, 3, H, W)
+    if fp16:
+        dummy = dummy.half()
 
     # Export to ONNX with dynamic spatial dimensions
     os.makedirs(os.path.dirname(output), exist_ok=True)
@@ -116,10 +126,11 @@ def export(
     try:
         import onnxruntime as ort
         sess = ort.InferenceSession(output, providers=["CPUExecutionProvider"])
-        test_input = np.random.randn(1, 3, H, W).astype(np.float32)
+        input_dtype = np.float16 if fp16 else np.float32
+        test_input = np.random.randn(1, 3, H, W).astype(input_dtype)
         outputs = sess.run(None, {"input": test_input})
         out_shape = outputs[0].shape
-        print(f"ORT sanity check: input {test_input.shape} -> output {out_shape}")
+        print(f"ORT sanity check: input {test_input.shape} ({input_dtype.__name__}) -> output {out_shape}")
         assert out_shape == (1, 3, H, W), f"Shape mismatch: {out_shape}"
         print("Sanity check passed")
     except ImportError:
@@ -157,6 +168,10 @@ def main():
         "--test-w", type=int, default=1920,
         help="Test width for export validation (default: 1920)",
     )
+    parser.add_argument(
+        "--fp32", action="store_true",
+        help="Export in FP32 instead of FP16 (default: FP16)",
+    )
 
     args = parser.parse_args()
 
@@ -177,6 +192,7 @@ def main():
         output=args.output,
         test_h=args.test_h,
         test_w=args.test_w,
+        fp16=not args.fp32,
     )
 
 

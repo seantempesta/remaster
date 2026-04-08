@@ -140,15 +140,18 @@ __global__ void kernel_p010_to_rgb_fp16(
     float u0 = uVal - 512.0f;
     float v0 = vVal - 512.0f;
 
-    // Scale factors for 10-bit: Y range is 876 (940-64), full range 1023
-    // Reuse the 8-bit matrix but scale: multiply by (255/219)*(1023/255) = 1023/219
-    // Actually simpler: apply the matrix with 10-bit aware scaling
+    // Scale factors for 10-bit: Y range is 876 (940-64), UV range is 896 (960-64)
+    // Use RAW BT.709 coefficients (not the 8-bit pre-scaled ones which have 255/224 baked in).
+    // Raw BT.709: Kr=0.2126, Kg=0.7152, Kb=0.0722
+    //   R = Y' + 1.5748*V'    where Y' = y0/876, U' = u0/896, V' = v0/896
+    //   G = Y' - 0.1873*U' - 0.4681*V'
+    //   B = Y' + 1.8556*U'
     float scale_y = 1.0f / 876.0f;  // (940-64)
     float scale_uv = 1.0f / 896.0f; // (960-64)
 
-    float r = y0 * scale_y + 1.792741f * v0 * scale_uv;
-    float g = y0 * scale_y - 0.213249f * u0 * scale_uv - 0.532909f * v0 * scale_uv;
-    float b = y0 * scale_y + 2.112402f * u0 * scale_uv;
+    float r = y0 * scale_y + 1.5748f * v0 * scale_uv;
+    float g = y0 * scale_y - 0.1873f * u0 * scale_uv - 0.4681f * v0 * scale_uv;
+    float b = y0 * scale_y + 1.8556f * u0 * scale_uv;
 
     r = fminf(fmaxf(r, 0.0f), 1.0f);
     g = fminf(fmaxf(g, 0.0f), 1.0f);

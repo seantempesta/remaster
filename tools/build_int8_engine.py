@@ -113,7 +113,7 @@ def build_int8_engine(onnx_path, output_engine, calibrator):
 
     # Configure builder
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1GB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4GB
 
     # Enable FP16 + INT8
     config.set_flag(trt.BuilderFlag.FP16)

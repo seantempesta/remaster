@@ -162,6 +162,16 @@ int main(int argc, char** argv) {
     CUcontext cuContext = nullptr;
     ck(cuCtxCreate(&cuContext, 0, cuDevice));
 
+    // Set persistent L2 cache to 50% for TRT inference benefit
+    {
+        int l2CacheSize = 0;
+        cudaDeviceGetAttribute(&l2CacheSize, cudaDevAttrL2CacheSize, cfg.gpu);
+        if (l2CacheSize > 0) {
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2CacheSize / 2);
+            std::cerr << "L2 persistent cache: " << (l2CacheSize / 2 / 1024) << " KB" << std::endl;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 2. Open input with SimpleDemuxer + NVDEC decoder
     // -----------------------------------------------------------------------
@@ -325,13 +335,20 @@ int main(int argc, char** argv) {
     cudaEventCreate(&evAfterInfer);
     cudaEventCreate(&evAfterCsc2);
 
+    // Previous frame's timing events (for deferred readout)
+    cudaEvent_t prevEvStart, prevEvAfterCsc1, prevEvAfterInfer, prevEvAfterCsc2;
+    cudaEventCreate(&prevEvStart);
+    cudaEventCreate(&prevEvAfterCsc1);
+    cudaEventCreate(&prevEvAfterInfer);
+    cudaEventCreate(&prevEvAfterCsc2);
+
     // Accumulators (milliseconds)
     double totalDemuxMs   = 0.0;
     double totalDecodeMs  = 0.0;
     double totalCsc1Ms    = 0.0;  // NV12->RGB
     double totalInferMs   = 0.0;
     double totalCsc2Ms    = 0.0;  // RGB->NV12
-    double totalSyncMs    = 0.0;  // cudaStreamSynchronize
+    double totalSyncMs    = 0.0;  // event sync wait
     double totalEncodeMs  = 0.0;
     double totalWriteMs   = 0.0;
 
@@ -343,11 +360,59 @@ int main(int argc, char** argv) {
                 nFrameEncoded, fpsNow, elapsed);
     };
 
+    // Deferred encoding state: encode previous frame while GPU processes current
+    bool hasPendingEncode = false;
+    cudaEvent_t pendingDoneEvent;
+    cudaEventCreate(&pendingDoneEvent);
+
+    // Helper: encode the pending frame (called when previous GPU work is done)
+    auto encodePendingFrame = [&]() {
+        if (!hasPendingEncode) return;
+
+        // Wait for previous frame's CSC2 to finish
+        auto syncStart = std::chrono::high_resolution_clock::now();
+        cudaEventSynchronize(pendingDoneEvent);
+        auto syncEnd = std::chrono::high_resolution_clock::now();
+        totalSyncMs += std::chrono::duration<double, std::milli>(syncEnd - syncStart).count();
+
+        // Read previous frame's GPU stage timings
+        float csc1Ms = 0, inferMs = 0, csc2Ms = 0;
+        cudaEventElapsedTime(&csc1Ms, prevEvStart, prevEvAfterCsc1);
+        cudaEventElapsedTime(&inferMs, prevEvAfterCsc1, prevEvAfterInfer);
+        cudaEventElapsedTime(&csc2Ms, prevEvAfterInfer, prevEvAfterCsc2);
+        totalCsc1Ms  += csc1Ms;
+        totalInferMs += inferMs;
+        totalCsc2Ms  += csc2Ms;
+
+        // Encode previous frame (NVENC ASIC runs in parallel with CUDA cores)
+        auto encStart = std::chrono::high_resolution_clock::now();
+        std::vector<std::vector<uint8_t>> vPacket;
+        pEnc->EncodeFrame(vPacket);
+        auto encEnd = std::chrono::high_resolution_clock::now();
+        totalEncodeMs += std::chrono::duration<double, std::milli>(encEnd - encStart).count();
+
+        // Write encoded packets
+        auto writeStart = std::chrono::high_resolution_clock::now();
+        for (auto& packet : vPacket) {
+            writer.pushVideoPacket(packet.data(), (int)packet.size(), nFrameEncoded);
+            nFrameEncoded++;
+        }
+        auto writeEnd = std::chrono::high_resolution_clock::now();
+        totalWriteMs += std::chrono::duration<double, std::milli>(writeEnd - writeStart).count();
+
+        hasPendingEncode = false;
+    };
+
     // Lambda: process decoded frames through inference and encoding
     auto processDecodedFrames = [&](uint8_t** ppFrame, int nFrameReturned) {
         for (int i = 0; i < nFrameReturned; i++) {
             nFrameDecoded++;
-            FrameBuffer& buf = buffers[nFrameDecoded % NUM_BUFFERS];
+            int bufIdx = nFrameDecoded % NUM_BUFFERS;
+            FrameBuffer& buf = buffers[bufIdx];
+
+            // Encode the PREVIOUS frame while we start GPU work on the current one.
+            // This overlaps NVENC (hardware encoder ASIC) with CUDA compute.
+            encodePendingFrame();
 
             // -- Color convert: NV12/P010 -> planar RGB FP16 --
             int decPitch = dec.GetDeviceFramePitch();
@@ -367,8 +432,8 @@ int main(int argc, char** argv) {
             }
             cudaEventRecord(evAfterCsc1, inferStream);
 
-            // -- TRT inference --
-            if (!trt.infer(buf.rgbIn, buf.rgbOut, inferStream)) {
+            // -- TRT inference (with CUDA graph capture for launch overhead reduction) --
+            if (!trt.inferWithGraph(buf.rgbIn, buf.rgbOut, inferStream, bufIdx)) {
                 std::cerr << "\nInference failed at frame " << nFrameDecoded << std::endl;
                 return;
             }
@@ -394,36 +459,16 @@ int main(int argc, char** argv) {
             }
             cudaEventRecord(evAfterCsc2, inferStream);
 
-            // Sync before encode (NVENC needs the data ready)
-            auto syncStart = std::chrono::high_resolution_clock::now();
-            cudaStreamSynchronize(inferStream);
-            auto syncEnd = std::chrono::high_resolution_clock::now();
-            totalSyncMs += std::chrono::duration<double, std::milli>(syncEnd - syncStart).count();
+            // Record completion event and defer encoding to next iteration
+            cudaEventRecord(pendingDoneEvent, inferStream);
 
-            // Read GPU stage timings
-            float csc1Ms = 0, inferMs = 0, csc2Ms = 0;
-            cudaEventElapsedTime(&csc1Ms, evStart, evAfterCsc1);
-            cudaEventElapsedTime(&inferMs, evAfterCsc1, evAfterInfer);
-            cudaEventElapsedTime(&csc2Ms, evAfterInfer, evAfterCsc2);
-            totalCsc1Ms  += csc1Ms;
-            totalInferMs += inferMs;
-            totalCsc2Ms  += csc2Ms;
+            // Swap timing events so we can read them next iteration
+            std::swap(evStart, prevEvStart);
+            std::swap(evAfterCsc1, prevEvAfterCsc1);
+            std::swap(evAfterInfer, prevEvAfterInfer);
+            std::swap(evAfterCsc2, prevEvAfterCsc2);
 
-            // -- Encode --
-            auto encStart = std::chrono::high_resolution_clock::now();
-            std::vector<std::vector<uint8_t>> vPacket;
-            pEnc->EncodeFrame(vPacket);
-            auto encEnd = std::chrono::high_resolution_clock::now();
-            totalEncodeMs += std::chrono::duration<double, std::milli>(encEnd - encStart).count();
-
-            // -- Write encoded packets to muxer via async writer --
-            auto writeStart = std::chrono::high_resolution_clock::now();
-            for (auto& packet : vPacket) {
-                writer.pushVideoPacket(packet.data(), (int)packet.size(), nFrameEncoded);
-                nFrameEncoded++;
-            }
-            auto writeEnd = std::chrono::high_resolution_clock::now();
-            totalWriteMs += std::chrono::duration<double, std::milli>(writeEnd - writeStart).count();
+            hasPendingEncode = true;
 
             // Progress
             if (nFrameDecoded % 30 == 0) {
@@ -471,6 +516,9 @@ int main(int argc, char** argv) {
         totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
     }
     processDecodedFrames(ppFrame, nFrameReturned);
+
+    // Encode the last pending frame
+    encodePendingFrame();
 
     // -----------------------------------------------------------------------
     // 8. Flush encoder
@@ -551,6 +599,11 @@ int main(int argc, char** argv) {
     cudaEventDestroy(evAfterCsc1);
     cudaEventDestroy(evAfterInfer);
     cudaEventDestroy(evAfterCsc2);
+    cudaEventDestroy(prevEvStart);
+    cudaEventDestroy(prevEvAfterCsc1);
+    cudaEventDestroy(prevEvAfterInfer);
+    cudaEventDestroy(prevEvAfterCsc2);
+    cudaEventDestroy(pendingDoneEvent);
 
     // Free pipeline buffers
     for (int i = 0; i < NUM_BUFFERS; i++) {

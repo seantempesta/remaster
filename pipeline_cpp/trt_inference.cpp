@@ -32,6 +32,11 @@ public:
 // ---------------------------------------------------------------------------
 
 TrtInference::~TrtInference() {
+    // Clean up CUDA graphs
+    for (int i = 0; i < kMaxGraphs; i++) {
+        if (graphExecs_[i]) cudaGraphExecDestroy(graphExecs_[i]);
+        if (graphs_[i]) cudaGraphDestroy(graphs_[i]);
+    }
     // TRT 10.x uses normal C++ destructors, not .destroy()
     delete context_;
     context_ = nullptr;
@@ -90,8 +95,11 @@ bool TrtInference::loadEngine(const std::string& enginePath) {
         nvinfer1::Dims dims = engine_->getTensorShape(name);
         nvinfer1::TensorIOMode mode = engine_->getTensorIOMode(name);
 
+        nvinfer1::DataType dtype = engine_->getTensorDataType(name);
+
         if (mode == nvinfer1::TensorIOMode::kINPUT) {
             inputName_ = name;
+            inputDtype_ = dtype;
             // Expect NCHW: [1, 3, H, W]
             if (dims.nbDims >= 4) {
                 inputH_ = dims.d[2];
@@ -99,21 +107,41 @@ bool TrtInference::loadEngine(const std::string& enginePath) {
             }
             std::cerr << "Input tensor '" << name << "': "
                       << dims.d[0] << "x" << dims.d[1] << "x"
-                      << dims.d[2] << "x" << dims.d[3] << std::endl;
+                      << dims.d[2] << "x" << dims.d[3]
+                      << " dtype=" << static_cast<int>(dtype) << std::endl;
         } else if (mode == nvinfer1::TensorIOMode::kOUTPUT) {
             outputName_ = name;
+            outputDtype_ = dtype;
             if (dims.nbDims >= 4) {
                 outputH_ = dims.d[2];
                 outputW_ = dims.d[3];
             }
             std::cerr << "Output tensor '" << name << "': "
                       << dims.d[0] << "x" << dims.d[1] << "x"
-                      << dims.d[2] << "x" << dims.d[3] << std::endl;
+                      << dims.d[2] << "x" << dims.d[3]
+                      << " dtype=" << static_cast<int>(dtype) << std::endl;
         }
     }
 
     if (inputName_.empty() || outputName_.empty()) {
         std::cerr << "Could not find input/output tensors" << std::endl;
+        return false;
+    }
+
+    // Validate I/O formats -- pipeline assumes FP16 buffers
+    if (inputDtype_ != nvinfer1::DataType::kHALF || outputDtype_ != nvinfer1::DataType::kHALF) {
+        auto dtypeName = [](nvinfer1::DataType d) -> const char* {
+            switch (d) {
+                case nvinfer1::DataType::kFLOAT: return "FP32";
+                case nvinfer1::DataType::kHALF:  return "FP16";
+                case nvinfer1::DataType::kINT8:  return "INT8";
+                default: return "unknown";
+            }
+        };
+        std::cerr << "ERROR: Engine has " << dtypeName(inputDtype_) << " input / "
+                  << dtypeName(outputDtype_) << " output, but pipeline requires FP16 I/O.\n"
+                  << "Rebuild engine from FP16 ONNX model, or add "
+                     "--inputIOFormats=fp16:chw --outputIOFormats=fp16:chw" << std::endl;
         return false;
     }
 
@@ -138,4 +166,60 @@ bool TrtInference::infer(__half* input, __half* output, cudaStream_t stream) {
         std::cerr << "TensorRT enqueueV3 failed" << std::endl;
     }
     return ok;
+}
+
+bool TrtInference::inferWithGraph(__half* input, __half* output, cudaStream_t stream, int bufferIdx) {
+    if (bufferIdx < 0 || bufferIdx >= kMaxGraphs) {
+        return infer(input, output, stream);
+    }
+
+    if (!graphSupported_) {
+        return infer(input, output, stream);
+    }
+
+    if (!graphCaptured_[bufferIdx]) {
+        // Set tensor addresses (stable per bufferIdx)
+        if (!context_->setTensorAddress(inputName_.c_str(), input)) return false;
+        if (!context_->setTensorAddress(outputName_.c_str(), output)) return false;
+
+        // Capture
+        cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA graph capture begin failed, falling back to regular inference" << std::endl;
+            graphSupported_ = false;
+            return infer(input, output, stream);
+        }
+
+        context_->enqueueV3(stream);
+
+        err = cudaStreamEndCapture(stream, &graphs_[bufferIdx]);
+        if (err != cudaSuccess || graphs_[bufferIdx] == nullptr) {
+            std::cerr << "CUDA graph capture failed, falling back to regular inference" << std::endl;
+            graphSupported_ = false;
+            // Stream may be in capture error state, try to end capture properly
+            cudaGraph_t dummyGraph = nullptr;
+            cudaStreamEndCapture(stream, &dummyGraph);
+            return infer(input, output, stream);
+        }
+
+        err = cudaGraphInstantiate(&graphExecs_[bufferIdx], graphs_[bufferIdx], 0);
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA graph instantiation failed, falling back" << std::endl;
+            graphSupported_ = false;
+            cudaGraphDestroy(graphs_[bufferIdx]);
+            graphs_[bufferIdx] = nullptr;
+            return infer(input, output, stream);
+        }
+
+        graphCaptured_[bufferIdx] = true;
+        std::cerr << "CUDA graph captured for buffer " << bufferIdx << std::endl;
+    }
+
+    // Launch captured graph
+    cudaError_t err = cudaGraphLaunch(graphExecs_[bufferIdx], stream);
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA graph launch failed: " << cudaGetErrorString(err) << std::endl;
+        return false;
+    }
+    return true;
 }

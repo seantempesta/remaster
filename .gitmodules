@@ -28,3 +28,9 @@
 [submodule "reference-code/NVEnc"]
 	path = reference-code/NVEnc
 	url = https://github.com/rigaya/NVEnc
+[submodule "reference-code/VFX-SDK-Samples"]
+	path = reference-code/VFX-SDK-Samples
+	url = https://github.com/NVIDIA-Maxine/VFX-SDK-Samples.git
+[submodule "reference-code/TensorRT-RTX"]
+	path = reference-code/TensorRT-RTX
+	url = https://github.com/NVIDIA/TensorRT-RTX.git
