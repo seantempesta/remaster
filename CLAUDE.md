@@ -230,23 +230,35 @@ python tools/build_int8_engine.py
 ### Edge-Replicate Padding
 All padding for sub-1080p content uses **edge-replication** (clamp coordinates), not zero-fill. This prevents black-border artifacts at conv boundaries. Applies to: C++ color kernels, Python test suite, INT8 calibrator. Search for "replicate" to find all instances.
 
+### INT8 Quantization Status
+Pure INT8 (all layers quantized) produces 26 dB — the skip-connection Add ops are the suspected cause. The hypothesis is that encoder/decoder paths have mismatched value distributions at addition points, and INT8's 256 levels can't represent the fine residuals. However, this has only been tested with PTQ (post-training quantization). **QAT (quantization-aware training) is untested** and could potentially learn quantization-friendly representations that make pure INT8 viable.
+
+Current approach: exclude Add ops from INT8 via `op_types_to_exclude=["Add"]`. This gives 67.2 dB but limits speedup to ~3% over FP16.
+
+**Engine builders:**
+- `tools/build_engine.py` — Modern: ModelOpt Q/DQ + strongly typed (TRT 11-ready). Best for FP16. INT8 mixed OOMs on 6GB during ORT calibration at 1080p.
+- `tools/build_int8_engine.py` — Legacy: IInt8EntropyCalibrator2 + weak typed. Works for INT8 mixed on 6GB. Manual FP16 layer exclusions.
+
 ### Next Steps
-1. **TRT optimization research** -- explore trtexec flags, layer fusion, sparsity, timing caches for more speed
-2. **QAT (quantization-aware training)** -- could recover INT8 quality without FP16 fallback layers, enabling pure INT8 speed (~52 fps)
-3. **Recurrent temporal context** -- 9-channel input (prev_cleaned + current + next_noisy). PRD at `docs/research/temporal-context/prd.md`. Expected: +0.3-0.8 dB PSNR + temporal consistency
+1. **QAT (quantization-aware training)** -- Train with fake quantization (pytorch-quantization toolkit, ~5K iters on Modal) to learn INT8-safe representations. Could enable pure INT8 on ALL layers including Adds. Expected: 52+ fps with full INT8 quality matching FP16.
+2. **Recurrent temporal context** -- 9-channel input (prev_cleaned + current + next_noisy). PRD at `docs/research/temporal-context/prd.md`. Expected: +0.3-0.8 dB PSNR + temporal consistency
+3. **dynamo=True ONNX export** -- Untested with TRT 10.16 + strongly typed. May work now (opset 18/20 support improved). Would eliminate the legacy TorchScript dependency.
 
 ### Verified Results (2026-04-08)
 - **Teacher**: 13K iters, PSNR 53.27 dB, 107% sharpness, near-perfect color
 - **Student**: Fine-tuned with full-frame (5K iters, crop_size=0), PSNR 49.98 dB, 1.06M params
-- **C++ pipeline FP16**: 42.9 fps end-to-end, 10-bit HEVC MKV, audio passthrough, CUDA graphs
-- **C++ pipeline INT8 mixed**: 44.2 fps end-to-end, 67.2 dB quality (23/68 layers FP16)
-- **TRT FP16**: 42 fps trtexec (19.9ms GPU), 68.9 dB vs PyTorch FP32
-- **TRT INT8 mixed**: 43 fps trtexec (19.2ms GPU), 67.2 dB vs PyTorch FP32
+- **C++ pipeline FP16**: ~42 fps end-to-end, 10-bit HEVC MKV, audio passthrough, CUDA graphs
+- **C++ pipeline INT8 mixed**: ~44 fps end-to-end, 67.2 dB quality (legacy builder)
+- **TRT FP16 (strongly typed)**: 42.6 fps trtexec (19.5ms GPU), 68.0 dB vs PyTorch FP32
+- **TRT INT8 mixed (legacy)**: 43.3 fps trtexec (19.2ms GPU), 67.2 dB vs PyTorch FP32
+- **TRT INT8 pure (ModelOpt Q/DQ)**: 39 fps trtexec (17.9ms GPU), 26.1 dB (Add ops need FP16)
 - **NVEncC pipeline**: 39 fps with audio, VapourSynth in-process
-- **Bottleneck**: NVDEC decode (22ms/frame, 97% of wall time); TRT compute fully overlapped
+- **Bottleneck**: TRT inference (20ms/frame); NVDEC/NVENC fully overlapped via async I/O
+- **Full episodes**: Firefly S01E05 (~42 min @ ~42 fps = ~24 min encode)
 - **Environment**: Python 3.12, PyTorch 2.11+cu130, CUDA 13.2, TRT 10.16.0, VS R73
 - **Build tools**: VS Build Tools 2022, CUDA 13.2, CMake 3.31, TRT 10.16 headers
 - **Test suite**: 6/6 pass (FP32/FP16 precision, TRT FP16/INT8, color roundtrip, ONNX)
+- **ModelOpt**: 0.42.0 installed, Polygraphy 0.49.26. Requires cuDNN on PATH (torch/lib/ fix in build_engine.py)
 
 **Research docs:** `docs/research/` (temporal-context, raft-alignment, cpp-pipeline, training-data). **Guides:** `docs/guides/` (gpu-profiling, modal-graceful-shutdown). **Archive:** `docs/archive/` (old NAFNet-era docs). See `docs/README.md` for full index.
 
