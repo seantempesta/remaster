@@ -259,20 +259,20 @@ class HNeRVSimple(nn.Module):
         )
 
         # Decoder: SFT-conditioned UpConv blocks
-        # Reference kernel pattern: ks 0_1_5 -> [1, 3, 5, 5, 5]
-        # Multiple blocks per stage at high-res for deeper processing
+        # Kernel pattern: min 3x3 for all blocks (was 1x1 for first block)
+        # 3x3 head for spatial mixing in final output
         self.decoder = nn.ModuleList()
         ch = fc_dim
         for i, stride in enumerate(dec_strides):
             new_ch = max(int(ch / reduce), lower_width)
-            ks = min(1 + 2 * i, 5)  # [1, 3, 5, 5, 5] matching reference
+            ks = min(3 + 2 * i, 5)  # [3, 5, 5, 5, 5] -- all have spatial mixing
             n_blks = dec_blks[i] if i < len(dec_blks) else 1
             for j in range(n_blks):
                 s = stride if j == 0 else 1  # only first block upsamples
                 self.decoder.append(SFTUpConvBlock(ch, new_ch, s, ks, cond_ch))
                 ch = new_ch
 
-        self.head = nn.Conv2d(ch, 3, 1)
+        self.head = nn.Conv2d(ch, 3, 3, 1, 1)  # 3x3 with padding
 
     def forward(self, img, norm_idx=None):
         B = img.shape[0]
