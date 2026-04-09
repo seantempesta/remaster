@@ -34,3 +34,21 @@
 [submodule "reference-code/TensorRT-RTX"]
 	path = reference-code/TensorRT-RTX
 	url = https://github.com/NVIDIA/TensorRT-RTX.git
+[submodule "reference-code/ConvNeXt-V2"]
+	path = reference-code/ConvNeXt-V2
+	url = https://github.com/facebookresearch/ConvNeXt-V2
+[submodule "reference-code/ConvNeXt"]
+	path = reference-code/ConvNeXt
+	url = https://github.com/facebookresearch/ConvNeXt
+[submodule "reference-code/FFNeRV"]
+	path = reference-code/FFNeRV
+	url = https://github.com/maincold2/FFNeRV
+[submodule "reference-code/Boosting-NeRV"]
+	path = reference-code/Boosting-NeRV
+	url = https://github.com/Xinjie-Q/Boosting-NeRV
+[submodule "reference-code/HiNeRV"]
+	path = reference-code/HiNeRV
+	url = https://github.com/hmkx/HiNeRV.git
+[submodule "reference-code/PNVC"]
+	path = reference-code/PNVC
+	url = https://github.com/ge1-gao/PNVC.git

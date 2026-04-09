@@ -21,7 +21,7 @@ onnxscript
 
 # Training
 prodigyopt
-wandb
+wandb==0.25.0  # 0.25.1 breaks on Windows (ServicePollForTokenError)
 modal
 
 # Analysis

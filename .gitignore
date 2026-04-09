@@ -34,9 +34,10 @@ build/
 # Modal CLI state
 .modal/
 
-# W&B auth
+# W&B auth and run data
 _netrc
 .netrc
+wandb/
 
 # IDE
 .idea/
