@@ -347,6 +347,24 @@ def compute_loss(pred, target, loss_type="l1_freq"):
         freq_loss = F.l1_loss(pred_freq, target_freq)
         del pred_freq, target_freq
         return 10 * l1 + freq_loss
+    elif loss_type == "fusion6":
+        # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
+        from pytorch_msssim import ssim
+        l1 = F.l1_loss(pred, target)
+        ssim_val = ssim(pred.float(), target.float(), data_range=1, size_average=True)
+        return 0.7 * l1 + 0.3 * (1 - ssim_val)
+    elif loss_type == "l1_ssim_freq":
+        # L1 + SSIM + FFT frequency loss (combines structural + frequency awareness)
+        from pytorch_msssim import ssim
+        l1 = F.l1_loss(pred, target)
+        ssim_val = ssim(pred.float(), target.float(), data_range=1, size_average=True)
+        pred_fft = torch.fft.fft2(pred.float(), dim=(-2, -1))
+        target_fft = torch.fft.fft2(target.float(), dim=(-2, -1))
+        pred_freq = torch.stack([pred_fft.real, pred_fft.imag], -1); del pred_fft
+        target_freq = torch.stack([target_fft.real, target_fft.imag], -1); del target_fft
+        freq_loss = F.l1_loss(pred_freq, target_freq)
+        del pred_freq, target_freq
+        return 10 * (0.7 * l1 + 0.3 * (1 - ssim_val)) + freq_loss
     elif loss_type == "fusion10_freq":
         from pytorch_msssim import ms_ssim
         l1 = F.l1_loss(pred, target)
@@ -986,7 +1004,7 @@ def main():
     parser.add_argument("--dec-blks", default="1,1,2,2,2",
                         help="Blocks per decoder stage (more at high-res)")
     parser.add_argument("--loss", default="l1_freq",
-                        choices=["l1", "l2", "l1_freq", "fusion10_freq"],
+                        choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
 
     # Optimizer
