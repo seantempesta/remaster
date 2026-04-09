@@ -704,9 +704,12 @@ def train(args):
     if args.wandb:
         import wandb
         wb = wandb
-        run_name = f"hnerv-{total_p:.1f}M-enc{args.enc_dim}-fc{args.fc_dim}"
-        if args.late_layer_decay > 0:
-            run_name += f"-decay{args.late_layer_decay}"
+        if args.run_name:
+            run_name = args.run_name
+        else:
+            run_name = f"hnerv-{total_p:.1f}M-enc{args.enc_dim}-fc{args.fc_dim}"
+            if args.late_layer_decay > 0:
+                run_name += f"-decay{args.late_layer_decay}"
         wb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
@@ -1023,6 +1026,8 @@ def main():
                         help="W&B project name")
     parser.add_argument("--wandb-entity", default=None,
                         help="W&B entity (default: from env/config)")
+    parser.add_argument("--run-name", default=None,
+                        help="W&B run name (also used in console output)")
 
     args = parser.parse_args()
 

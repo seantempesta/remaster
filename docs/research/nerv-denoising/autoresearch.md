@@ -53,8 +53,11 @@ PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/remaster/python.exe tools/train_nerv.
     --data-dir E:/upscale-data/nerv-test/micro_gop_01 \
     --epochs 300 --max-time 600 --batch-size 1 --print-interval 10 \
     --fc-dim 120 --output-dir output/nerv/autorun \
+    --wandb --run-name "exp01-baseline-enc16-fc120" \
     > output/nerv/autorun/run.log 2>&1
 ```
+
+**W&B run naming**: Always pass `--wandb --run-name "expNN-short-description"` so each experiment gets a descriptive name in W&B. Number experiments sequentially (exp01, exp02, ...) to match the results.tsv order. The human will be checking W&B on their phone to follow progress.
 
 The `--max-time 600` flag ensures the process **self-terminates after 10 minutes** (saves checkpoint and exits cleanly). No need to manually kill. The script will run up to 300 epochs or 10 minutes, whichever comes first. At ~7s/epoch, expect ~85 epochs per run.
 
