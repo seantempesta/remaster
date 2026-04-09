@@ -140,10 +140,15 @@ class ConvNeXtEncoder(nn.Module):
             self.stages.append(stage)
             ch = dim
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
+        features = []
         for ds, stage in zip(self.downsamples, self.stages):
             x = ds(x)
             x = stage(x)
+            if return_features:
+                features.append(x)
+        if return_features:
+            return x, features
         return x
 
 
@@ -326,11 +331,12 @@ class HNeRVSimple(nn.Module):
 # Loss functions
 # =============================================================================
 
-def compute_loss(pred, target, loss_type="l1_freq"):
+def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0):
     """Compute training loss.
 
-    l1_freq: L1 pixel loss + FFT frequency loss at balanced weight.
-    Simpler and more stable than full Fusion10_freq (which needs Adan optimizer).
+    l1_freq: L1 pixel loss + FFT frequency loss. pixel_weight controls balance.
+    Default pixel_weight=10 makes L1 and FFT roughly equal magnitude.
+    Lower pixel_weight emphasizes frequency reconstruction (sharper output).
     """
     if loss_type == "l1":
         return F.l1_loss(pred, target)
@@ -346,7 +352,7 @@ def compute_loss(pred, target, loss_type="l1_freq"):
         target_freq = torch.stack([target_fft.real, target_fft.imag], -1); del target_fft
         freq_loss = F.l1_loss(pred_freq, target_freq)
         del pred_freq, target_freq
-        return 10 * l1 + freq_loss
+        return pixel_weight * l1 + freq_loss
     elif loss_type == "fusion6":
         # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
         from pytorch_msssim import ssim
@@ -750,6 +756,7 @@ def train(args):
                 "n_frames": len(dataset),
                 "resolution": f"{dataset.width}x{dataset.height}",
                 "loss": args.loss,
+                "pixel_weight": args.pixel_weight,
                 "dec_blks": list(dec_blks),
                 "data_dir": args.data_dir,
                 "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
@@ -812,7 +819,7 @@ def train(args):
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
-                loss = compute_loss(output, batch_img, args.loss)
+                loss = compute_loss(output, batch_img, args.loss, args.pixel_weight)
 
                 if args.late_layer_decay > 0:
                     reg = 0
@@ -1006,6 +1013,8 @@ def main():
     parser.add_argument("--loss", default="l1_freq",
                         choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
+    parser.add_argument("--pixel-weight", type=float, default=10.0,
+                        help="Weight for pixel loss in l1_freq (default: 10, lower = more freq emphasis)")
 
     # Optimizer
     parser.add_argument("--optimizer", default="prodigy", choices=["adam", "prodigy"],
