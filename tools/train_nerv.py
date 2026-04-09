@@ -342,11 +342,10 @@ def compute_loss(pred, target, loss_type="l1_freq"):
         # FFT frequency loss (encourages high-frequency detail reconstruction)
         pred_fft = torch.fft.fft2(pred.float(), dim=(-2, -1))
         target_fft = torch.fft.fft2(target.float(), dim=(-2, -1))
-        pred_freq = torch.stack([pred_fft.real, pred_fft.imag], -1)
-        target_freq = torch.stack([target_fft.real, target_fft.imag], -1)
+        pred_freq = torch.stack([pred_fft.real, pred_fft.imag], -1); del pred_fft
+        target_freq = torch.stack([target_fft.real, target_fft.imag], -1); del target_fft
         freq_loss = F.l1_loss(pred_freq, target_freq)
-        # Balanced: freq_loss is naturally ~100-1000x larger than L1 at 1080p
-        # Scale L1 up to match, not freq down (preserves gradient signal)
+        del pred_freq, target_freq
         return 10 * l1 + freq_loss
     elif loss_type == "fusion10_freq":
         from pytorch_msssim import ms_ssim
@@ -355,9 +354,10 @@ def compute_loss(pred, target, loss_type="l1_freq"):
         spatial = 0.7 * l1 + 0.3 * (1 - msssim)
         pred_fft = torch.fft.fft2(pred.float(), dim=(-2, -1))
         target_fft = torch.fft.fft2(target.float(), dim=(-2, -1))
-        pred_freq = torch.stack([pred_fft.real, pred_fft.imag], -1)
-        target_freq = torch.stack([target_fft.real, target_fft.imag], -1)
+        pred_freq = torch.stack([pred_fft.real, pred_fft.imag], -1); del pred_fft
+        target_freq = torch.stack([target_fft.real, target_fft.imag], -1); del target_fft
         freq_loss = F.l1_loss(pred_freq, target_freq)
+        del pred_freq, target_freq
         return 60 * spatial + freq_loss
     else:
         raise ValueError(f"Unknown loss: {loss_type}")
@@ -691,8 +691,8 @@ def train(args):
     train_subset = torch.utils.data.Subset(dataset, train_indices)
     loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True,
                         num_workers=0, pin_memory=True)
-    # Keep val frames on CPU, move to GPU one at a time during validation
-    val_frames_cpu = torch.stack([dataset[i][0] for i in val_indices])
+    # Keep val frames on CPU, load one at a time during validation
+    val_frames_cpu = [dataset[i][0] for i in val_indices]  # list of (3, H, W) tensors
     print(f"  Train: {len(train_indices)} frames, Holdout: {len(val_indices)} frames")
 
     # AMP
@@ -759,12 +759,26 @@ def train(args):
     import signal
     signal.signal(signal.SIGINT, _handle_interrupt)
 
+    training_start_time = time.perf_counter()
     print(f"\nTraining epochs {start_epoch}-{args.epochs}, ckpt every {args.ckpt_interval}")
+    if args.max_time > 0:
+        print(f"Wall-clock timeout: {args.max_time}s ({args.max_time/60:.0f} min)")
     print(f"Late-layer decay: {args.late_layer_decay}, AMP: {use_amp}, W&B: {wb is not None}")
     print()
 
     for epoch in range(start_epoch, args.epochs):
         _current_epoch = epoch
+
+        # Wall-clock timeout
+        if args.max_time > 0:
+            elapsed = time.perf_counter() - training_start_time
+            if elapsed > args.max_time:
+                print(f"\n  Timeout ({args.max_time}s) reached at epoch {epoch}. Saving and exiting.")
+                torch.save({
+                    "epoch": epoch, "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }, os.path.join(args.output_dir, "latest.pth"))
+                break
         model.train()
         epoch_loss = 0
         epoch_psnr = 0
@@ -774,6 +788,7 @@ def train(args):
             batch_img = batch_img.to(device)
             batch_norm_idx = batch_norm_idx.to(device).float()
 
+            optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
                 loss = compute_loss(output, batch_img, args.loss)
@@ -785,7 +800,6 @@ def train(args):
                             reg = reg + p.pow(2).sum()
                     loss = loss + args.late_layer_decay * reg
 
-            optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -804,6 +818,7 @@ def train(args):
                     return
                 epoch_loss += loss_val
                 epoch_psnr += compute_psnr(output.float(), batch_img)
+            del output, loss, batch_img, batch_norm_idx
 
         scheduler.step()
         n_batches = len(loader)
@@ -811,30 +826,29 @@ def train(args):
         epoch_psnr /= n_batches
         dt = time.perf_counter() - t0
 
-        # Validation metrics (one frame at a time to save VRAM)
+        # Validation: run model on ONE holdout frame for PSNR (lightweight)
         model.eval()
-        val_psnrs, hf_ins, hf_outs = [], [], []
-        val_output_first = None  # keep first frame's output for vis
         with torch.no_grad():
-            for vi, vf in enumerate(val_frames_cpu):
-                vf_gpu = vf.unsqueeze(0).to(device)
-                vi_idx = torch.tensor([val_indices[vi] / len(dataset)], device=device)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    vo = model(vf_gpu, norm_idx=vi_idx)
-                vo_f = vo[0].float().cpu()
-                vf_f = vf.float()
-                val_psnrs.append(compute_psnr(vo_f.unsqueeze(0), vf_f.unsqueeze(0)))
-                hf_ins.append(compute_hf_energy(vf_f))
-                hf_outs.append(compute_hf_energy(vo_f))
-                if vi == 0:
-                    val_output_first = (vf_f, vo_f)  # (input, output) on CPU
-                del vf_gpu, vo, vo_f
+            vf = val_frames_cpu[0]
+            vf_gpu = vf.unsqueeze(0).to(device)
+            vi_idx = torch.tensor([val_indices[0] / len(dataset)], device=device)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                vo = model(vf_gpu, norm_idx=vi_idx)
+            vo_cpu = vo[0].float().cpu()
+            vf_cpu = vf.float()
+            val_psnr = compute_psnr(vo_cpu.unsqueeze(0), vf_cpu.unsqueeze(0))
+            del vf_gpu, vo
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-        val_psnr = np.mean(val_psnrs)
-        hf_input = np.mean(hf_ins)
-        hf_output = np.mean(hf_outs)
-        hf_ratio = hf_output / (hf_input + 1e-8)
+
+        # HF energy only at vis epochs (FFT is expensive)
+        is_vis_epoch = (epoch + 1) % args.ckpt_interval == 0
+        if is_vis_epoch:
+            hf_input = compute_hf_energy(vf_cpu)
+            hf_output = compute_hf_energy(vo_cpu)
+            hf_ratio = hf_output / (hf_input + 1e-8)
+        else:
+            hf_input = hf_output = hf_ratio = 0.0
         late_norm = compute_late_layer_norm(model)
 
         d_val = optimizer.param_groups[0].get("d", None)
@@ -879,37 +893,26 @@ def train(args):
                 wb_log["train/prodigy_d"] = d_val
             wb.log(wb_log, step=epoch)
 
-        # Visual logging (at checkpoint intervals) -- all on CPU
-        is_vis_epoch = (epoch + 1) % args.ckpt_interval == 0 or epoch == start_epoch
-        if is_vis_epoch and val_output_first is not None:
-            inp, out = val_output_first  # already on CPU
-            frame_psnr = compute_psnr(out.unsqueeze(0), inp.unsqueeze(0))
-
+        # Visual logging (at checkpoint intervals only -- vf_cpu/vo_cpu from val above)
+        if is_vis_epoch:
             vis_dir = os.path.join(args.output_dir, "vis")
             os.makedirs(vis_dir, exist_ok=True)
             from PIL import Image as PILImage
 
-            comp = vis_comparison(inp, out)
-            resid = vis_residual(inp, out)
-            dark = vis_dark_crop(inp, out)
-
+            comp = vis_comparison(vf_cpu, vo_cpu)
+            resid = vis_residual(vf_cpu, vo_cpu)
             PILImage.fromarray(comp).save(os.path.join(vis_dir, f"compare_e{epoch:04d}.png"))
             PILImage.fromarray(resid).save(os.path.join(vis_dir, f"residual_e{epoch:04d}.png"))
-            PILImage.fromarray(dark).save(os.path.join(vis_dir, f"darkcrop_e{epoch:04d}.png"))
 
             if wb:
-                wb_vis = {
+                wb.log({
                     "vis/input_vs_output": wb.Image(comp,
-                        caption=f"epoch {epoch} | Left=input Right=output | {frame_psnr:.1f}dB"),
+                        caption=f"epoch {epoch} | Left=input Right=output | {val_psnr:.1f}dB"),
                     "vis/residual_10x": wb.Image(resid,
                         caption=f"epoch {epoch} | 10x amplified removed content"),
-                    "vis/dark_crop_4x": wb.Image(dark,
-                        caption=f"epoch {epoch} | Darkest 256px crop 4x zoom"),
-                    "vis/fft_output": wb.Image(vis_fft_heatmap(out),
-                        caption=f"epoch {epoch} | FFT output | hf_ratio={hf_ratio:.3f}"),
-                }
-                wb.log(wb_vis, step=epoch)
-            del comp, resid, dark
+                }, step=epoch)
+            del comp, resid
+            gc.collect()
 
         # Print
         if epoch % args.print_interval == 0 or epoch == args.epochs - 1:
@@ -957,6 +960,9 @@ def main():
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: output/nerv/<dirname>)")
     parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--max-time", type=int, default=0,
+                        help="Max wall-clock training time in seconds (0=unlimited). "
+                             "Saves checkpoint and exits cleanly when exceeded.")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size (1 for 6GB VRAM at 1080p)")
     parser.add_argument("--lr", type=float, default=1e-3)
