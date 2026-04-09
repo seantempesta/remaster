@@ -229,7 +229,7 @@ class HNeRVSimple(nn.Module):
     def __init__(self, height=1080, width=1920, enc_strides=(5, 3, 2, 2, 2),
                  dec_strides=(5, 3, 2, 2, 2), dec_blks=(1, 1, 2, 2, 2),
                  enc_dim=16, fc_dim=170, reduce=1.2, lower_width=12,
-                 grad_checkpoint=False, cond_ch=32):
+                 grad_checkpoint=False, cond_ch=32, enc_blocks=1):
         super().__init__()
         self.height = height
         self.width = width
@@ -244,7 +244,7 @@ class HNeRVSimple(nn.Module):
         # Encoder
         self.encoder = ConvNeXtEncoder(
             in_chans=3, dims=(64, enc_dim), strides=enc_strides,
-            blocks_per_stage=1,
+            blocks_per_stage=enc_blocks,
         )
 
         # Temporal conditioning
@@ -638,6 +638,7 @@ def train(args):
         reduce=args.reduce,
         lower_width=args.lower_width,
         grad_checkpoint=args.grad_checkpoint,
+        enc_blocks=args.enc_blocks,
     ).to(device)
 
     enc_p = model.encoder_params / 1e6
@@ -746,6 +747,7 @@ def train(args):
                 "enc_strides": enc_strides,
                 "dec_strides": dec_strides,
                 "enc_dim": args.enc_dim,
+                "enc_blocks": args.enc_blocks,
                 "fc_dim": args.fc_dim,
                 "reduce": args.reduce,
                 "lower_width": args.lower_width,
@@ -1010,6 +1012,8 @@ def main():
                         help="Minimum channel width in decoder")
     parser.add_argument("--dec-blks", default="1,1,2,2,2",
                         help="Blocks per decoder stage (more at high-res)")
+    parser.add_argument("--enc-blocks", type=int, default=1,
+                        help="ConvNeXt blocks per encoder stage (1 or 2)")
     parser.add_argument("--loss", default="l1_freq",
                         choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
