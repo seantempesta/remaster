@@ -264,18 +264,40 @@ int main(int argc, char** argv) {
 
         pEnc->CreateDefaultEncoderParams(&initParams, codecGuid, presetGuid, tuning);
 
-        // Constant QP mode (simple, reliable across SDK versions)
+        // Rate control: Constant QP
         encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
         encodeConfig.rcParams.constQP = { (uint32_t)cfg.cq, (uint32_t)cfg.cq, (uint32_t)cfg.cq };
 
-        // HEVC-specific: set pixel bit depth for 10-bit output
+        // GOP structure: keyframe every ~5 seconds for fast seeking
+        int frameIntervalP = 3; // I-B-B-P pattern (2 B-frames for quality)
+        uint32_t gopFrames = (uint32_t)(fps * 5.0 + 0.5);
+        gopFrames = (gopFrames / frameIntervalP) * frameIntervalP;
+        if (gopFrames < (uint32_t)frameIntervalP) gopFrames = (uint32_t)frameIntervalP;
+
+        encodeConfig.gopLength = gopFrames;
+        encodeConfig.frameIntervalP = frameIntervalP;
+
+        // HEVC-specific settings
+        auto& hevc = encodeConfig.encodeCodecConfig.hevcConfig;
+
         if (outIs10bit) {
-            encodeConfig.encodeCodecConfig.hevcConfig.inputBitDepth = NV_ENC_BIT_DEPTH_10;
-            encodeConfig.encodeCodecConfig.hevcConfig.outputBitDepth = NV_ENC_BIT_DEPTH_10;
+            hevc.inputBitDepth  = NV_ENC_BIT_DEPTH_10;
+            hevc.outputBitDepth = NV_ENC_BIT_DEPTH_10;
         }
 
-        // B-frames for quality
-        encodeConfig.frameIntervalP = 3; // 2 B-frames
+        // IDR at every GOP boundary + repeat headers (required for seeking)
+        hevc.idrPeriod = gopFrames;
+        hevc.repeatSPSPPS = 1;
+
+        // BT.709 color metadata (HD content standard)
+        auto& vui = hevc.hevcVUIParameters;
+        vui.videoSignalTypePresentFlag   = 1;
+        vui.videoFormat                  = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+        vui.videoFullRangeFlag           = 0;  // Limited range
+        vui.colourDescriptionPresentFlag = 1;
+        vui.colourPrimaries              = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        vui.transferCharacteristics      = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        vui.colourMatrix                 = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 
         pEnc->CreateEncoder(&initParams);
     }
