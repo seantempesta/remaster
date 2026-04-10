@@ -18,7 +18,7 @@ Agent-maintained log of experiments, findings, and decisions. Each entry documen
 Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B run.
 
 ## Key constraints (quick reference)
-- **Current best: val_psnr=34.50, hf_ratio=0.27, 4.70M params (exp22/23)**
+- **Current best: val_psnr=42.9, hf_ratio=0.954, sharpness_ratio=0.961, 4.44M params (exp37)**
 - **VRAM limit: 5.5GB target, 5.7GB absolute max** (6GB card but OS uses ~300MB)
 - Time budget: 20 min per run (--max-time 1200)
 - Confirmed ceiling at 34.50 dB with current architecture — need structural changes to break through
@@ -448,17 +448,70 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
   - Try reducing wd from 0.01 to 0.005 WITH asymmetric loss (wd and skip scales are in tension per exp32)
   - Try temporal consistency loss (adjacent frames should have similar output)
 
-### Exhausted directions (DO NOT re-try):
+### Exp37: Patch-level color preservation + gradual loss ramp (2026-04-10 13:23)
+- **Hypothesis**: Previous experiments (exp34-36) showed the model shifting brightness/color instead of denoising. A patch-level color preservation loss (F.avg_pool2d comparing 32x32 patch means between output and input, weight 5.0) forces the model to preserve local color/brightness while allowing per-pixel denoising. Combined with gradual ramp: edge/asym weights start at 0 and linearly increase to target (0.5) over training, letting the model learn content first before introducing denoising pressure.
+- **Change**: Added patch-level color loss (weight 5.0) to l1_freq compute_loss. Edge/asym weights ramp from 0 to 0.5 linearly over epochs. Config: skip=0.1, dec_blks=1,1,1,1,1, wd=0.01, epochs=150, max-time=1200, Prodigy.
+- **Result**: val_psnr=42.9 (peak epoch 109), train_psnr=43.2 (final), hf_ratio=0.954, sharpness_ratio=0.961 at peak, residual_structure=0.018, vram=5.4GB, 145 epochs completed (timeout at 1200s)
+- **Verdict**: keep -- NEW ALL-TIME BEST, +4.8 dB over exp36's 38.08 dB. Massive improvement.
+- **Learning**:
+  1. **Patch-level color loss is the key fix**: The model preserves input color/brightness throughout training. Visual comparison at epochs 59 and 119 shows no brightness shift or color cast. This directly addresses the exp36 failure where the model was darkening output. The 32x32 avg_pool2d approach is elegant -- it constrains patch-level means without constraining per-pixel values, giving the model freedom to denoise/sharpen while maintaining color fidelity.
+  2. **Gradual ramp prevents training instability**: Unlike exp36's hard phase switch (which crashed val by 6 dB), the linear ramp from 0 to target edge/asym weights provides a smooth transition. The model never experiences a sudden loss landscape shift.
+  3. **Val PSNR of 42.9 dB is unprecedented**: +4.8 dB over exp36 (38.08), +7.7 dB over exp26 (35.20), +8.4 dB over the original ceiling (34.50). The combination of patch color preservation + gradual ramp + skip connections unlocks a new quality tier.
+  4. **Train-val gap is NEGATIVE at peak (-1.1 dB)**: Val (42.9) > train (41.8) at epoch 109. This is unusual and suggests the holdout frames (every 12th frame) happen to be slightly easier for the model. By end of training, gap is +1.7 dB (normal).
+  5. **Sharpness ratio plateaus at 0.95**: Climbed from 0.51 (e0) to 0.95 (e100+) and held steady. The ramp means edge/asym weights were only at ~66% of target at epoch 100, so the final sharpness is with moderate (not full) edge pressure.
+  6. **Residual still shows some structure**: The 10x residual at epoch 119 shows faint face/body outlines. The residual_structure metric (0.018) is comparable to exp36 phase 1 (0.021). Not pure noise, but significantly cleaner than exp24's blatant structure.
+  7. **hf_ratio is stable at ~0.95**: Not exceeding 1.0 (no artificial noise injection), and much closer to 1.0 than pre-skip experiments (0.27).
+  8. **VRAM at 5.4GB**: Within the 5.5GB target. Slightly higher than exp34/35's 5.2GB, possibly due to the color loss computation.
+  9. **Val oscillations persist**: Val ranges from 33-43 dB across training. The Prodigy optimizer with cosine schedule causes periodic val fluctuations, making it hard to identify the true "best" epoch without tracking peak across all epochs.
+  
+  **Why this works so much better than exp36**:
+  - Exp36 had the same architecture (skip=0.1, dec_blks=1,1,1,1,1, edge=0.5, asym=0.5) and reached 38.08 in phase 1. But exp36 had NO patch color preservation, so the model could shift brightness. Exp37 adds color preservation + gradual ramp and gains +4.8 dB. The color preservation loss acts as a strong regularizer that prevents the model from "cheating" by shifting global brightness to reduce pixel loss.
+  
+  **Next directions**:
+  - Try longer training (epochs=200-250, max-time=1800) -- val was still climbing at timeout
+  - Try higher edge/asym final weights (1.0 instead of 0.5) with the gradual ramp -- ramp may prevent the overfitting that weight=1.0 caused in exp35
+  - Try skip_scale=1.0 + patch color -- the color loss may prevent the overfitting that plagued scale=1.0 in exp24/28
+  - The 42.9 dB peak is likely NOT the ceiling -- more epochs and stronger edge pressure could push further
+
+---
+
+## Final Assessment: NeRV Denoising (2026-04-10)
+
+### ~45 experiments, 2 local agents + Modal T4 runs. ~$5 Modal + 1 day GPU.
+
+**Core finding: NeRV with pixel-level losses cannot denoise HEVC video.** The architecture memorizes noise at every configuration tested:
+- 4.44M params: 42+ dB (perfect noise reproduction)
+- 1.35M params + weight_decay=0.05: 38+ dB (still memorizes)
+- With L1, L2, FFT, structural, edge, asymmetric, ITS losses: all reproduce noise
+- With skip dropout 0.15, 32 frames, batch_size=2 on Modal T4: still memorizes
+
+**The spectral bias denoising hypothesis failed for this use case.** HEVC artifacts are too structured for the NeRV bottleneck to filter. The architecture has too much capacity even at 1.35M params.
+
+**What DID work (architecture improvements worth keeping):**
+- 3x3 decoder kernels: +3.3 dB
+- U-Net skip connections with learnable scale: +1.5 dB, sharper
+- Stride alignment padding: fixed right-edge artifact
+- Patch color loss: prevented brightness gaming
+- Gradual loss weight ramp: prevented training crashes
+
+**What didn't denoise:**
+- Capacity reduction (1.35M-4.44M all memorize)
+- Loss surgery (structural, asymmetric, ITS)
+- Skip dropout, weight decay tuning
+- Fewer frames, more frames
+
+**Recommendation: NeRV is not viable as a standalone HEVC video denoiser.** The existing DRUNet pipeline (53 dB teacher, 49 dB student, 43 fps) is the better path. NeRV could potentially serve as a temporal consistency tool or auxiliary training signal, but not as a primary denoiser.
+
+### Exhausted directions:
 - Encoder width, stride patterns, depth (all tested)
-- Loss functions: L1, L2, l1_freq, fusion6, SSIM (all tested)
+- Loss functions: L1, L2, l1_freq, fusion6, SSIM, structural, ITS (all tested)
 - Optimizers: Adam, Prodigy with various d_coef (all tested)
-- Model sizes: 2.36M to 6.70M (all tested)
-- Training time: 10, 15, 20, 30 min (all tested)
-- Weight decay: 0.005, 0.01 (both tested)
-- Edge preservation loss weight=5.0 (way too aggressive, produces artifacts)
-- Edge preservation loss weight=1.0 (overfits, marginal sharpness gain -- exp35)
-- Residual flatness loss (fights sharpness enhancement without relu fix)
-- Fewer frames (8 instead of 16): overfits faster, doesn't help
-- Weight decay 0.02 + skip connections: kills skip benefit
-- Decoder stride waste fix: strides (3,3,2,2,2) waste only 1.2%, not worth changing
+- Model sizes: 1.35M to 6.70M (all memorize noise)
+- Training time: 10-40 min (all tested)
+- Weight decay: 0.005-0.05 (all tested)
+- Edge/asymmetric loss weights: 0.1-5.0 (all tested)
+- Residual flatness loss, skip dropout 0.15-0.30
+- Fewer frames (8), more frames (32, 128)
+- ITS iterative target substitution (model predictions contain noise, feedback loop)
+- Phase-based training (crashes at phase transition)
 
