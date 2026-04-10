@@ -944,6 +944,7 @@ def train(args):
     # Resume from checkpoint
     start_epoch = 0
     best_psnr = 0
+    best_residual_structure = float('inf')
     if args.resume:
         ckpt_path = args.resume
         if os.path.isfile(ckpt_path):
@@ -1134,6 +1135,7 @@ def train(args):
                         "epoch": epoch, "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
                     }, os.path.join(args.output_dir, "nan_crash.pth"))
+                    metrics_file.close()
                     if wb:
                         wb.finish(exit_code=1)
                     return
@@ -1157,29 +1159,39 @@ def train(args):
         train_sharpness_ratio = train_out_sharpness / (train_inp_sharpness + 1e-8)
         dt = time.perf_counter() - t0
 
-        # Validation: run model on ONE holdout frame for PSNR (lightweight)
+        # Validation: run model on ALL holdout frames, average metrics
         model.eval()
+        val_psnr_sum = 0.0
+        out_sharpness_sum = 0.0
+        inp_sharpness_sum = 0.0
+        resid_struct_sum = 0.0
+        n_val = len(val_frames_cpu)
         with torch.no_grad():
-            vf = val_frames_cpu[0]
-            vf_gpu = vf.unsqueeze(0).to(device)
-            vi_idx = torch.tensor([val_indices[0] / len(dataset)], device=device)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                vo = model(vf_gpu, norm_idx=vi_idx)
-            vo_cpu = vo[0].float().cpu()
-            vf_cpu = vf.float()
-            val_psnr = compute_psnr(vo_cpu.unsqueeze(0), vf_cpu.unsqueeze(0))
-            del vf_gpu, vo
+            for vi in range(n_val):
+                vf = val_frames_cpu[vi]
+                vf_gpu = vf.unsqueeze(0).to(device)
+                vi_idx = torch.tensor([val_indices[vi] / len(dataset)], device=device)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    vo = model(vf_gpu, norm_idx=vi_idx)
+                vo_f = vo[0].float().cpu()
+                vf_f = vf.float()
+                val_psnr_sum += compute_psnr(vo_f.unsqueeze(0), vf_f.unsqueeze(0))
+                out_sharpness_sum += compute_sobel_energy(vo_f).item()
+                inp_sharpness_sum += compute_sobel_energy(vf_f).item()
+                resid_val = (vf_f - vo_f).unsqueeze(0)
+                resid_struct_sum += compute_sobel_energy(resid_val).item()
+                # Keep first frame for visualization
+                if vi == 0:
+                    vo_cpu = vo_f
+                    vf_cpu = vf_f
+                del vf_gpu, vo
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-
-        # Sharpness metrics (every epoch -- Sobel is cheap on CPU)
-        with torch.no_grad():
-            out_sharpness = compute_sobel_energy(vo_cpu).item()
-            inp_sharpness = compute_sobel_energy(vf_cpu).item()
-            sharpness_ratio = out_sharpness / (inp_sharpness + 1e-8)
-            # Residual structure: Sobel energy of (input - output)
-            residual_val = (vf_cpu.float() - vo_cpu.float()).unsqueeze(0)
-            residual_structure = compute_sobel_energy(residual_val).item()
+        val_psnr = val_psnr_sum / n_val
+        out_sharpness = out_sharpness_sum / n_val
+        inp_sharpness = inp_sharpness_sum / n_val
+        sharpness_ratio = out_sharpness / (inp_sharpness + 1e-8)
+        residual_structure = resid_struct_sum / n_val
 
         # HF energy only at vis epochs (FFT is expensive)
         is_vis_epoch = (epoch + 1) % args.ckpt_interval == 0
@@ -1188,7 +1200,7 @@ def train(args):
             hf_output = compute_hf_energy(vo_cpu)
             hf_ratio = hf_output / (hf_input + 1e-8)
         else:
-            hf_input = hf_output = hf_ratio = 0.0
+            hf_input = hf_output = hf_ratio = None  # not computed this epoch
         late_norm = compute_late_layer_norm(model)
 
         d_val = optimizer.param_groups[0].get("d", None)
@@ -1199,9 +1211,9 @@ def train(args):
             "loss": round(epoch_loss, 6),
             "train_psnr": round(epoch_psnr, 2),
             "val_psnr": round(val_psnr, 2),
-            "hf_energy_input": round(hf_input, 4),
-            "hf_energy_output": round(hf_output, 4),
-            "hf_ratio": round(hf_ratio, 4),
+            "hf_energy_input": round(hf_input, 4) if hf_input is not None else None,
+            "hf_energy_output": round(hf_output, 4) if hf_output is not None else None,
+            "hf_ratio": round(hf_ratio, 4) if hf_ratio is not None else None,
             "late_layer_norm": round(late_norm, 4),
             "lr": round(scheduler.get_last_lr()[0], 8),
             "effective_lr": round(effective_lr, 8),
@@ -1229,9 +1241,9 @@ def train(args):
                 "train/loss": epoch_loss,
                 "train/psnr": epoch_psnr,
                 "val/psnr": val_psnr,
-                "noise/hf_ratio": hf_ratio,
-                "noise/hf_energy_output": hf_output,
-                "noise/hf_energy_input": hf_input,
+                **({"noise/hf_ratio": hf_ratio,
+                   "noise/hf_energy_output": hf_output,
+                   "noise/hf_energy_input": hf_input} if hf_ratio is not None else {}),
                 "noise/late_layer_norm": late_norm,
                 "train/lr": scheduler.get_last_lr()[0],
                 "train/effective_lr": effective_lr,
@@ -1302,7 +1314,11 @@ def train(args):
             torch.save(ckpt, path)
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
-                torch.save(ckpt, os.path.join(args.output_dir, "best.pth"))
+                torch.save(ckpt, os.path.join(args.output_dir, "best_psnr.pth"))
+            # Also save best denoising quality (lowest residual structure)
+            if residual_structure < best_residual_structure:
+                best_residual_structure = residual_structure
+                torch.save(ckpt, os.path.join(args.output_dir, "best_denoise.pth"))
 
         # Save latest (every 10 epochs for resume)
         if (epoch + 1) % 10 == 0:

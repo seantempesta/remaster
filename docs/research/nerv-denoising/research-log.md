@@ -372,6 +372,27 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
 - **Verdict**: inconclusive -- exp34 started and overwrote metrics.jsonl
 - **Learning**: Need separate output dirs per experiment to prevent conflicts.
 
+### Exp34: Asymmetric residual loss + edge preservation (2026-04-10 16:00)
+- **Hypothesis**: Using `relu(input - output)` instead of `(input - output)` for the structure penalty (asym_edge_weight=0.5) only penalizes REMOVED content, not ADDED detail. Combined with edge preservation loss (edge_weight=0.5, much lower than exp31's 5.0). This enables the model to enhance detail beyond the noisy input without the loss fighting sharpness improvement. Skip connections (scale=0.1) provide the high-frequency pathway.
+- **Change**: --asym-edge-weight 0.5 --edge-weight 0.5 --skip-connections --skip-scale-init 0.1 --dec-blks 1,1,1,1,1 --weight-decay 0.01 --epochs 150 --max-time 1200
+- **Result**: val_psnr=35.20 (peak epoch 69), train_psnr=35.76 at peak, hf_ratio=0.66 at epoch 149, sharpness_ratio=0.75 at end, vram=5.2GB, 150 epochs completed
+- **Verdict**: keep -- matches exp26's peak PSNR (35.20) WITH much better stability. Train-val gap at peak is only 0.56 dB (vs exp26's 4.26 dB). Val_psnr stabilized at 34.3 from epoch 130 onward instead of crashing.
+- **Learning**: The asymmetric residual loss is a significant training STABILIZER:
+  1. **Val stability**: Val_psnr held at 34.3-34.5 from epoch 100-150 instead of the typical collapse seen in exp24/26/28. The loss only penalizes removed edges, so the model can keep enhancing without fighting the loss function.
+  2. **Sharpness growth**: Sharpness_ratio climbed monotonically from 0.30 to 0.75 throughout training. In previous runs, high sharpness was coupled with noise memorization; here it's decoupled because the asymmetric loss doesn't penalize added detail.
+  3. **Tight gap at peak**: At peak val (epoch 69), the train-val gap was only 0.56 dB. By contrast, exp26 peaked at the same 35.20 dB but with 4.26 dB gap -- indicating much more overfitting.
+  4. **hf_ratio trajectory**: 0.30 -> 0.35 -> 0.51 -> 0.64 -> 0.66 across 5 checkpoints. Steady increase without explosion, unlike exp31's 1.27 artifact generation.
+  5. **Edge weight 0.5 is well-calibrated**: Compared to exp31's 5.0 (artifact generation), 0.5 provides a gentle nudge toward edge preservation without overwhelming the reconstruction loss.
+  6. **Residual quality**: residual_structure held at 0.090-0.101, a reasonable range. Need to visually check the residual images for faces/structure -- the metric alone doesn't confirm clean residuals.
+  
+  **Not a PSNR breakthrough** -- peak matches exp26 at 35.20 dB. But the training dynamics are fundamentally improved: stable val in late epochs, monotonic sharpness growth, tight gap. This is the right FOUNDATION for further improvement.
+  
+  **Next directions**: 
+  - Try higher asym_edge_weight (1.0-2.0) to push sharpness further, since the loss is stable
+  - Combine with skip_scale=1.0 (exp28 config) -- the asymmetric loss may prevent the overfitting that scale=1.0 caused before
+  - Add residual flatness loss ON TOP of asymmetric loss -- the asymmetric version fixes the "fights sharpness" problem
+  - Check residual images visually to confirm no noise memorization
+
 ### Exhausted directions (DO NOT re-try):
 - Encoder width, stride patterns, depth (all tested)
 - Loss functions: L1, L2, l1_freq, fusion6, SSIM (all tested)
