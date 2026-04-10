@@ -161,19 +161,54 @@ The sharpness term is NEGATIVE (we maximize it). Start with small weights and tu
 
 **Key insight from human**: "focusing on the residual (no lines/structure) AND increasing sharpness from the original" — these are complementary signals, not competing ones. Find the balance.
 
+### Code audit findings (2026-04-10 17:00) — Verification agent review
+A verification agent reviewed the full train_nerv.py. Key findings:
+
+**BUGS to fix:**
+1. hf_ratio/hf_energy logged as 0.0 on non-vis epochs -- pollutes W&B charts
+2. Validation PSNR only uses 1 holdout frame (should average all 10)
+3. "Best" checkpoint selected by highest val_psnr (= closest to noisy input = worst denoiser)
+
+**ARCHITECTURE ISSUES:**
+4. With strides (3,3,2,2,2), decoder produces ~1800x3240 then clips to 1080x1920 -- wasting ~70% of compute
+5. Skip connections may not match encoder/decoder spatial resolutions correctly
+6. BatchNorm with batch_size=1 is statistically unreliable (use GroupNorm/InstanceNorm)
+
+**LOSS INTERACTION:**
+7. residual_flatness_loss and asymmetric_residual_structure_loss conflict if both active -- flatness still penalizes enhancement via full residual FFT
+
+**Next agent should address bug #2 (average val over all holdout frames) and #7 (disable flatness loss when asymmetric loss is active).**
+
+### Human guidance (2026-04-10 16:00) — Visualize each loss component separately
+Add a visualization panel (saved as PNG alongside residual images in vis/) that shows what each loss component sees:
+
+```python
+# Panel 1: "Removed content" — should be pure noise, no structure
+removed = relu(input - output)  # only what was subtracted from input
+
+# Panel 2: "Edge comparison" — output edges should be >= input edges  
+input_edges = sobel(input).abs()
+output_edges = sobel(output).abs()
+# side-by-side or overlay
+
+# Panel 3: "Enhancement" — new detail the model learned from cross-frame knowledge
+enhancement = relu(sobel(output) - sobel(input))  # edges that got STRONGER
+
+# Panel 4: "Noise leakage" — structure that shouldn't be in removed content
+leakage = sobel(removed).abs()  # edges in the removed content = BAD
+```
+
+Each panel maps to a loss term. Save as `vis/loss_components_eNNNN.png` every 30 epochs. This lets us visually verify the optimizer is doing what we want.
+
 ### Human guidance (2026-04-10 15:30) — New validation metrics needed
 val_psnr measures distance from noisy input — but we WANT to differ from the noisy input. If the model enhances beyond the input, PSNR goes DOWN even though quality goes UP.
 
-**New metrics to add to training script and log:**
-1. **output_sharpness**: `sobel(output).abs().mean()` — higher = sharper
-2. **input_sharpness**: `sobel(input).abs().mean()` — reference
-3. **sharpness_ratio**: `output_sharpness / input_sharpness` — >1.0 = sharper than input (GOAL)
-4. **residual_flatness**: spectral flatness of `(input - output)` — higher = more noise-like residual
-5. **residual_edge_energy**: `sobel(input - output).abs().mean()` — lower = edges kept in output
+**3 metrics that matter (add to metrics.jsonl for both train and val):**
+1. **val_psnr** — overall reconstruction quality
+2. **sharpness_ratio** — `sobel(output).mean() / sobel(input).mean()` — >1.0 = output is sharper than input (THE goal)
+3. **residual_structure** — `sobel(input - output).abs().mean()` — lower = cleaner residual (edges staying in output)
 
-These should be logged in metrics.jsonl alongside PSNR so we can track them during training. The agent should add these to the validation loop in train_nerv.py.
-
-**Measure these in BOTH training and validation loops** so we can see the same metrics everywhere.
+Drop everything else that's confusing. These 3 answer: "is it good? is it sharp? is the residual clean?"
 
 ### Human insight (2026-04-10 15:00) — More frames, not fewer + asymmetric residual loss
 Exp30 (8 frames) peaked at 33.3 dB — much worse than 16 frames (35+). Confirmed: MORE temporal context is better. The shared weights need diverse frames to learn the scene's visual vocabulary. Don't reduce frames.
@@ -295,6 +330,48 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
 - **Verdict**: discard -- dropout too aggressive, dampens skip benefits. hf_ratio 0.44 vs exp26's 0.74.
 - **Learning**: Dropout2d=0.3 regularizes well (very tight train-val gap) but prevents skip connections from carrying enough high-freq detail. However, the train-val gap control is remarkable -- near zero overfitting. If given more epochs it may keep climbing. The orchestrator noted the residual at epoch 89 looked cleaner than other runs.
 
+### Exp28: Skip scale=1.0 + dec_blks=1,1,1,1,1 (2026-04-10 11:00)
+- **Hypothesis**: Replicate exp24's best PSNR (36.02) but fix VRAM by using smaller decoder (1,1,1,1,1 vs 1,1,2,2,2).
+- **Change**: --skip-scale-init 1.0 --dec-blks 1,1,1,1,1
+- **Result**: val_psnr=35.35 (peak epoch 55), hf_ratio=0.58 at epoch 149, vram=5.2GB
+- **Verdict**: keep -- above ceiling, within VRAM. 2nd best peak PSNR.
+- **Learning**: Fewer decoder blocks means less capacity for detail but VRAM stays under 5.5GB. The peak is lower than exp24 (35.35 vs 36.02) because the extra decoder blocks in exp24 provided more spatial mixing. Overfitting happens faster with scale=1.0.
+
+### Exp29: Residual spectral flatness loss weight=0.5 (2026-04-10 11:30)
+- **Hypothesis**: Penalizing non-flat FFT spectrum in (target - pred) residual forces model to remove noise-like content, not structural content.
+- **Change**: --residual-flatness-weight 0.5 with skip scale=0.1
+- **Result**: val_psnr=35.15 (peak epoch 74), hf_ratio=0.77, vram=5.2GB
+- **Verdict**: discard -- marginal change vs exp26 (35.20). Flatness loss weight 0.5 is only ~5% of total loss.
+- **Learning**: The residual flatness loss at 0.5 is too weak relative to l1_freq (~12 total). Would need much higher weight but that risks instability with Prodigy. The human later noted that this loss penalizes sharpness enhancement (anti-edges in residual), so it's fundamentally flawed without the relu fix.
+
+### Exp30: 8 frames + skip scale=0.1 (2026-04-10 11:00)
+- **Hypothesis**: Fewer frames (8 vs 16) means more capacity per frame = sharper output.
+- **Change**: --num-frames 8 --epochs 250 (2x faster epochs, so 2x more epochs in same time)
+- **Result**: val_psnr=34.76 (peak epoch 88), hf_ratio=0.86 at epoch 239, vram=5.4GB
+- **Verdict**: discard -- fewer frames causes FASTER overfitting. With only 7 training frames, the model memorizes them quickly. The high hf_ratio in late epochs is noise memorization, not sharpness.
+- **Learning**: Fewer frames does NOT help. The network needs diverse training examples to learn generalizable features. With only 7 frames, overfitting is severe (6.7 dB gap). This direction is dead for micro-GOPs.
+
+### Exp31: Edge preservation loss weight=5.0 + epochs=80 (2026-04-10 11:30)
+- **Hypothesis**: Edge loss penalizes output edges being weaker than input, forcing sharpness preservation. Short cosine schedule catches peak before overfitting.
+- **Change**: --edge-weight 5.0 --epochs 80 --skip-scale-init 1.0
+- **Result**: val_psnr=32.82, hf_ratio=1.27 (!) -- model adds artificial edges
+- **Verdict**: discard -- edge weight=5.0 is way too aggressive. hf_ratio>1.0 means output has MORE HF than input, which is artifact generation, not denoising.
+- **Learning**: Edge preservation loss at weight=5 overwhelms reconstruction. The relu(sobel(input)-sobel(output)) formulation only penalizes lost edges, but at high weight it distorts the balance. Need weight <1.0 or ideally ~0.1.
+
+### Exp32: Skip scale=1.0 + weight_decay=0.02 + epochs=60 (2026-04-10 12:00)
+- **Hypothesis**: Stronger weight decay (0.02 vs 0.01) and shorter cosine schedule prevent overfitting while keeping skip scale=1.0.
+- **Change**: --weight-decay 0.02 --epochs 60
+- **Result**: val_psnr=34.67, hf_ratio=0.30, train-val gap=1.35 dB
+- **Verdict**: discard -- wd=0.02 is too strong, prevents skip connections from being effective. hf_ratio barely above no-skip baseline (0.27).
+- **Learning**: Weight decay and skip connections are in TENSION. WD wants to shrink all parameters (including skip scales) toward zero. More WD = less skip contribution = blurry output. The wd=0.01 sweet spot from exp09 is NOT transferable to skip architectures.
+
+### Exp33: Skip scale=1.0 + dec_blks=1,1,2,2,2 + grad_checkpoint (2026-04-10 12:30)
+- **Hypothesis**: Replicate exp24's exact config but use gradient checkpointing to fix VRAM. Trade speed for memory.
+- **Change**: --grad-checkpoint --dec-blks 1,1,2,2,2 --skip-scale-init 1.0
+- **Result**: (metrics overwritten by exp34 from another agent before completion)
+- **Verdict**: inconclusive -- exp34 started and overwrote metrics.jsonl
+- **Learning**: Need separate output dirs per experiment to prevent conflicts.
+
 ### Exhausted directions (DO NOT re-try):
 - Encoder width, stride patterns, depth (all tested)
 - Loss functions: L1, L2, l1_freq, fusion6, SSIM (all tested)
@@ -302,4 +379,8 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
 - Model sizes: 2.36M to 6.70M (all tested)
 - Training time: 10, 15, 20, 30 min (all tested)
 - Weight decay: 0.005, 0.01 (both tested)
+- Edge preservation loss weight=5.0 (way too aggressive, produces artifacts)
+- Residual flatness loss (fights sharpness enhancement without relu fix)
+- Fewer frames (8 instead of 16): overfits faster, doesn't help
+- Weight decay 0.02 + skip connections: kills skip benefit
 

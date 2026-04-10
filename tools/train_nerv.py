@@ -673,6 +673,57 @@ def vis_comparison(inp, out):
     return np.concatenate([_to_uint8(inp), _to_uint8(out)], axis=1)
 
 
+def vis_loss_components(inp, out):
+    """4-panel visualization of what each loss component sees.
+
+    Panel 1: "Removed" - relu(input - output) -- content subtracted (should be noise)
+    Panel 2: "Added" - relu(output - input) -- content added (enhancement from cross-frame)
+    Panel 3: "Noise leakage" - sobel(relu(input - output)) -- edges in removed = BAD
+    Panel 4: "Edge comparison" - sobel(input) vs sobel(output) side by side
+
+    Returns (H*2, W*2, 3) uint8 grid.
+    """
+    inp_f = inp.float()
+    out_f = out.float()
+
+    # Panel 1: Removed content (should look like noise)
+    removed = torch.relu(inp_f - out_f)
+    p1 = _to_uint8(removed * 5.0)  # 5x amplification to see detail
+
+    # Panel 2: Added content (enhancement)
+    added = torch.relu(out_f - inp_f)
+    p2 = _to_uint8(added * 5.0)
+
+    # Panel 3: Structure in removed content (should be minimal)
+    removed_gray = (0.299 * removed[0] + 0.587 * removed[1] + 0.114 * removed[2])
+    sx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=inp.device).view(1,1,3,3)
+    sy = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32, device=inp.device).view(1,1,3,3)
+    gx = F.conv2d(removed_gray.unsqueeze(0).unsqueeze(0), sx, padding=1)
+    gy = F.conv2d(removed_gray.unsqueeze(0).unsqueeze(0), sy, padding=1)
+    noise_edges = torch.sqrt(gx**2 + gy**2 + 1e-8)[0, 0]
+    p3 = _to_uint8(noise_edges.unsqueeze(0).expand(3, -1, -1) * 10.0)
+
+    # Panel 4: Edge comparison - sobel(input) LEFT vs sobel(output) RIGHT
+    inp_gray = (0.299 * inp_f[0] + 0.587 * inp_f[1] + 0.114 * inp_f[2])
+    out_gray = (0.299 * out_f[0] + 0.587 * out_f[1] + 0.114 * out_f[2])
+    igx = F.conv2d(inp_gray.unsqueeze(0).unsqueeze(0), sx, padding=1)
+    igy = F.conv2d(inp_gray.unsqueeze(0).unsqueeze(0), sy, padding=1)
+    ogx = F.conv2d(out_gray.unsqueeze(0).unsqueeze(0), sx, padding=1)
+    ogy = F.conv2d(out_gray.unsqueeze(0).unsqueeze(0), sy, padding=1)
+    inp_edges = torch.sqrt(igx**2 + igy**2 + 1e-8)[0, 0]
+    out_edges = torch.sqrt(ogx**2 + ogy**2 + 1e-8)[0, 0]
+    w = inp_edges.shape[1]
+    half_w = w // 2
+    # Left half = input edges, right half = output edges (same spatial regions)
+    combined_edges = torch.cat([inp_edges[:, :half_w], out_edges[:, half_w:]], dim=1)
+    p4 = _to_uint8(combined_edges.unsqueeze(0).expand(3, -1, -1) * 3.0)
+
+    # Arrange in 2x2 grid
+    top = np.concatenate([p1, p2], axis=1)
+    bot = np.concatenate([p3, p4], axis=1)
+    return np.concatenate([top, bot], axis=0)
+
+
 def vis_residual(inp, out, gain=10.0):
     """Amplified residual (input - output). Gray=no change, color=removed content."""
     diff = (inp.float() - out.float()) * gain + 0.5
@@ -1214,8 +1265,10 @@ def train(args):
 
             comp = vis_comparison(vf_cpu, vo_cpu)
             resid = vis_residual(vf_cpu, vo_cpu)
+            loss_panels = vis_loss_components(vf_cpu, vo_cpu)
             PILImage.fromarray(comp).save(os.path.join(vis_dir, f"compare_e{epoch:04d}.png"))
             PILImage.fromarray(resid).save(os.path.join(vis_dir, f"residual_e{epoch:04d}.png"))
+            PILImage.fromarray(loss_panels).save(os.path.join(vis_dir, f"loss_components_e{epoch:04d}.png"))
 
             if wb:
                 wb.log({
@@ -1223,8 +1276,10 @@ def train(args):
                         caption=f"epoch {epoch} | Left=input Right=output | {val_psnr:.1f}dB"),
                     "vis/residual_10x": wb.Image(resid,
                         caption=f"epoch {epoch} | 10x amplified removed content"),
+                    "vis/loss_components": wb.Image(loss_panels,
+                        caption=f"epoch {epoch} | TL=removed TR=added BL=noise_leakage BR=edges"),
                 }, step=epoch)
-            del comp, resid
+            del comp, resid, loss_panels
             gc.collect()
 
         # Print
