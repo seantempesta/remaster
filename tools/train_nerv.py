@@ -253,6 +253,16 @@ class HNeRVSimple(nn.Module):
         self.fc_w = self.fc_h
         assert total_enc >= total_dec
 
+        # Compute padded dimensions so encoder/decoder output matches exactly
+        # Without padding, floor division in encoder causes decoder to undershoot
+        self.pad_h = (math.ceil(height / total_enc) * total_enc) - height
+        self.pad_w = (math.ceil(width / total_enc) * total_enc) - width
+        self.padded_h = height + self.pad_h
+        self.padded_w = width + self.pad_w
+        if self.pad_h > 0 or self.pad_w > 0:
+            print(f"  Stride alignment: padding input by ({self.pad_h}, {self.pad_w}) "
+                  f"-> {self.padded_h}x{self.padded_w} (was {height}x{width})")
+
         # Encoder
         self.encoder = ConvNeXtEncoder(
             in_chans=3, dims=(64, enc_dim), strides=enc_strides,
@@ -330,6 +340,10 @@ class HNeRVSimple(nn.Module):
 
     def forward(self, img, norm_idx=None):
         B = img.shape[0]
+
+        # Pad input to stride-aligned dimensions (replicate-pad right/bottom)
+        if self.pad_h > 0 or self.pad_w > 0:
+            img = F.pad(img, (0, self.pad_w, 0, self.pad_h), mode='replicate')
 
         # Encode
         if self.skip_connections:
