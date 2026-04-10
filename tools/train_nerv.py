@@ -41,7 +41,12 @@ sys.path.insert(0, PROJECT_ROOT)
 # =============================================================================
 
 class FrameDataset(Dataset):
-    """Load frames from a directory of images."""
+    """Load frames from a directory of images.
+
+    Supports Iterative Target Substitution (ITS): targets start as the noisy
+    input frames, then get blended with model predictions each epoch to
+    progressively denoise the supervision signal.
+    """
 
     def __init__(self, frame_dir, height=1080, width=1920, num_frames=0):
         self.paths = sorted([
@@ -59,14 +64,21 @@ class FrameDataset(Dataset):
         self.height, self.width = first.height, first.width
         print(f"Dataset: {len(self.paths)} frames at {self.width}x{self.height}")
 
+        # Cache all frames in RAM for ITS target updates
+        self._frames = []
+        for p in self.paths:
+            self._frames.append(self.transform(Image.open(p).convert("RGB")))
+        # ITS targets: start as noisy input, get refined each epoch
+        self.targets = [f.clone() for f in self._frames]
+
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        img = Image.open(self.paths[idx]).convert("RGB")
-        img = self.transform(img)  # [3, H, W] in [0, 1]
+        img = self._frames[idx]  # original noisy input (never changes)
+        target = self.targets[idx]  # ITS target (gets refined)
         norm_idx = float(idx) / len(self.paths)
-        return img, norm_idx, idx
+        return img, target, norm_idx, idx
 
 
 # =============================================================================
@@ -1178,14 +1190,15 @@ def train(args):
         train_residual_structure = 0
         t0 = time.perf_counter()
 
-        for batch_img, batch_norm_idx, batch_idx in loader:
+        for batch_img, batch_target, batch_norm_idx, batch_idx in loader:
             batch_img = batch_img.to(device)
+            batch_target = batch_target.to(device)
             batch_norm_idx = batch_norm_idx.to(device).float()
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
-                loss = compute_loss(output, batch_img, args.loss, active_pixel_weight,
+                loss = compute_loss(output, batch_target, args.loss, active_pixel_weight,
                                     args.residual_flatness_weight, active_edge_weight,
                                     active_asym_edge_weight)
 
@@ -1221,12 +1234,39 @@ def train(args):
                 train_resid = (batch_img.float() - output.float())
                 train_residual_structure += compute_sobel_energy(train_resid).item()
                 del train_resid
-            del output, loss, batch_img, batch_norm_idx
+            del output, loss, batch_img, batch_target, batch_norm_idx
 
         scheduler.step()
         n_batches = len(loader)
         epoch_loss /= n_batches
         epoch_psnr /= n_batches
+
+        # ITS: Iterative Target Substitution
+        # Once the model has learned content (val_psnr > 35 dB), blend model
+        # predictions into the training targets. This progressively denoises
+        # the supervision signal — each epoch the targets get cleaner.
+        its_alpha = getattr(args, 'its_alpha', 0.3)
+        its_threshold = getattr(args, 'its_threshold', 35.0)
+        if its_alpha > 0 and epoch_psnr > its_threshold:
+            if not hasattr(train, '_its_active'):
+                train._its_active = True
+                print(f"\n  === ITS ACTIVATED (train_psnr={epoch_psnr:.1f} > {its_threshold}) ===")
+                print(f"  Blending {its_alpha:.0%} of model predictions into targets each epoch")
+                print(f"  Targets will get progressively cleaner", flush=True)
+            model.eval()
+            with torch.no_grad():
+                for i in train_indices:
+                    frame = dataset._frames[i].unsqueeze(0).to(device)
+                    norm_idx = torch.tensor([i / len(dataset)], device=device)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        pred = model(frame, norm_idx=norm_idx)
+                    # Blend: target = (1-alpha)*old_target + alpha*prediction
+                    dataset.targets[i] = (
+                        (1 - its_alpha) * dataset.targets[i] +
+                        its_alpha * pred[0].float().cpu()
+                    ).clamp(0, 1)
+                    del frame, pred
+            model.train()
         train_out_sharpness /= n_batches
         train_inp_sharpness /= n_batches
         train_residual_structure /= n_batches
@@ -1481,6 +1521,15 @@ def main():
                         help="Weight for asymmetric residual structure loss (0=off, try 0.1-1.0). "
                              "Only penalizes REMOVED edges, not added detail.")
 
+    # ITS (Iterative Target Substitution)
+    parser.add_argument("--its-alpha", type=float, default=0.3,
+                        dest="its_alpha",
+                        help="ITS blending factor: target = (1-alpha)*old + alpha*prediction. "
+                             "0 = disabled, 0.3 = conservative, 0.5 = aggressive")
+    parser.add_argument("--its-threshold", type=float, default=35.0,
+                        dest="its_threshold",
+                        help="Train PSNR threshold to activate ITS (default: 35.0 dB)")
+
     # Two-phase training: switch loss weights at a specific epoch
     parser.add_argument("--phase2-epoch", type=int, default=0,
                         dest="phase2_epoch",
@@ -1521,7 +1570,7 @@ def main():
                         help="Resume model weights but reset optimizer/scheduler (for switching optimizers)")
 
     # Logging
-    parser.add_argument("--ckpt-interval", type=int, default=30,
+    parser.add_argument("--ckpt-interval", type=int, default=10,
                         help="Save checkpoint every N epochs")
     parser.add_argument("--print-interval", type=int, default=10,
                         help="Print metrics every N epochs")

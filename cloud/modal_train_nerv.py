@@ -168,6 +168,8 @@ def train_nerv(
         edge_weight=edge_weight,
         asym_edge_weight=asym_edge_weight,
         residual_flatness_weight=0.0,
+        its_alpha=0.3,
+        its_threshold=35.0,
         grad_checkpoint=False,
         late_layer_decay=0.0,
         max_time=max_time,
