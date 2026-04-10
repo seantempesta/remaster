@@ -570,10 +570,15 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
             total = total + edge_weight * edge_preservation_loss(pred, target)
         if asym_edge_weight > 0:
             total = total + asym_edge_weight * asymmetric_residual_structure_loss(pred, target)
-        # Brightness/color preservation: prevent global intensity or color shift
-        # Per-channel mean must match (high weight — shift is never acceptable)
-        brightness_diff = (pred.mean(dim=[2, 3]) - target.mean(dim=[2, 3])).abs().mean()
-        total = total + 5.0 * brightness_diff
+        # Patch-level color/brightness preservation: average color of each patch
+        # must match between output and input. Prevents lighting/color shift while
+        # allowing per-pixel changes (denoising, sharpening).
+        # Using avg_pool to compute patch means — fast and differentiable.
+        patch_size = 32  # 32x32 patches (~1000 patches for 1080p)
+        pred_patches = F.avg_pool2d(pred, patch_size, patch_size)
+        target_patches = F.avg_pool2d(target, patch_size, patch_size)
+        color_loss = F.l1_loss(pred_patches, target_patches)
+        total = total + 5.0 * color_loss
         return total
     elif loss_type == "fusion6":
         # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
