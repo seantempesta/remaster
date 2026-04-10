@@ -996,10 +996,14 @@ def train(args):
     metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
     metrics_file = open(metrics_path, "a")
 
-    # Holdout validation: remove every 12th frame from training entirely
+    # Holdout validation: last 10% of frames (contiguous tail)
+    # Training on a gapless sequence preserves temporal continuity.
+    # Holdout tests temporal extrapolation (can the model generalize to unseen adjacent frames?)
     all_indices = list(range(len(dataset)))
-    val_indices = list(range(0, len(dataset), 12))[:10]  # ~10 held-out frames
-    train_indices = [i for i in all_indices if i not in val_indices]
+    n_val = max(2, len(dataset) // 10)  # 10% holdout, minimum 2
+    n_val = min(n_val, 10)  # cap at 10 holdout frames
+    val_indices = all_indices[-n_val:]
+    train_indices = all_indices[:-n_val]
     train_subset = torch.utils.data.Subset(dataset, train_indices)
     loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True,
                         num_workers=0, pin_memory=True)
