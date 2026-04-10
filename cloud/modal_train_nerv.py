@@ -261,12 +261,9 @@ def main(
     else:
         print("Skipping upload (--skip-upload)")
 
-    # Override GPU on the function
-    train_fn = train_nerv.options(gpu=gpu)
-
-    # Launch training
-    print(f"\nLaunching training on {gpu}...")
-    train_fn.remote(
+    # Launch training (GPU is set in @app.function decorator — change there for different GPU)
+    print(f"\nLaunching training on Modal (GPU set in decorator)...")
+    train_nerv.remote(
         data_remote_dir=remote_dir,
         num_frames=frames,
         fc_dim=fc_dim,
