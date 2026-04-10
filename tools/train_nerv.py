@@ -570,6 +570,10 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
             total = total + edge_weight * edge_preservation_loss(pred, target)
         if asym_edge_weight > 0:
             total = total + asym_edge_weight * asymmetric_residual_structure_loss(pred, target)
+        # Brightness/color preservation: prevent global intensity or color shift
+        # Per-channel mean must match (high weight — shift is never acceptable)
+        brightness_diff = (pred.mean(dim=[2, 3]) - target.mean(dim=[2, 3])).abs().mean()
+        total = total + 5.0 * brightness_diff
         return total
     elif loss_type == "fusion6":
         # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
@@ -1125,19 +1129,26 @@ def train(args):
                 }, os.path.join(args.output_dir, "latest.pth"))
                 break
 
-        # Two-phase training: switch loss weights at phase2_epoch
-        if args.phase2_epoch > 0 and epoch == args.phase2_epoch and not in_phase2:
-            in_phase2 = True
-            active_pixel_weight = args.phase2_pixel_weight
-            active_edge_weight = args.phase2_edge_weight
-            active_asym_edge_weight = args.phase2_asym_edge_weight
-            print(f"\n  === PHASE 2 TRANSITION (epoch {epoch}) ===")
-            print(f"  pixel_weight: {args.pixel_weight} -> {active_pixel_weight}")
-            print(f"  edge_weight: {args.edge_weight} -> {active_edge_weight}")
-            print(f"  asym_edge_weight: {args.asym_edge_weight} -> {active_asym_edge_weight}")
-            print()
-            if wb:
-                wb.log({"phase": 2, "phase_transition": 1}, step=epoch)
+        # Two-phase training: gradual ramp from phase 1 to phase 2 weights
+        # Ramp starts 20 epochs before phase2_epoch and ends 20 epochs after
+        if args.phase2_epoch > 0:
+            ramp_start = args.phase2_epoch - 20
+            ramp_end = args.phase2_epoch + 20
+            if epoch <= ramp_start:
+                alpha = 0.0
+            elif epoch >= ramp_end:
+                alpha = 1.0
+            else:
+                alpha = (epoch - ramp_start) / (ramp_end - ramp_start)
+            active_pixel_weight = (1 - alpha) * args.pixel_weight + alpha * args.phase2_pixel_weight
+            active_edge_weight = (1 - alpha) * args.edge_weight + alpha * args.phase2_edge_weight
+            active_asym_edge_weight = (1 - alpha) * args.asym_edge_weight + alpha * args.phase2_asym_edge_weight
+            if epoch == args.phase2_epoch and not in_phase2:
+                in_phase2 = True
+                print(f"\n  === PHASE 2 MIDPOINT (epoch {epoch}) ===")
+                print(f"  Ramp: {ramp_start}-{ramp_end}, alpha={alpha:.2f}")
+                print(f"  pixel_weight: {active_pixel_weight:.2f}, edge: {active_edge_weight:.2f}, asym: {active_asym_edge_weight:.2f}")
+                print()
 
         model.train()
         epoch_loss = 0
@@ -1311,6 +1322,7 @@ def train(args):
                 wb_log["loss_weights/edge_weight"] = active_edge_weight
                 wb_log["loss_weights/asym_edge_weight"] = active_asym_edge_weight
                 wb_log["loss_weights/phase"] = 2 if in_phase2 else 1
+                wb_log["loss_weights/ramp_alpha"] = alpha if args.phase2_epoch > 0 else 0
             # Log skip connection scales
             if hasattr(model, 'skip_scales'):
                 for si, sc in enumerate(model.skip_scales):

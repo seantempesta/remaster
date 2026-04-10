@@ -161,6 +161,14 @@ The sharpness term is NEGATIVE (we maximize it). Start with small weights and tu
 
 **Key insight from human**: "focusing on the residual (no lines/structure) AND increasing sharpness from the original" — these are complementary signals, not competing ones. Find the balance.
 
+### Human observation (2026-04-10 18:00) — Model changing lighting/brightness
+Exp36 shows the model darkening output. Residual is brighter = model subtracting brightness. The asymmetric loss `relu(input - output)` doesn't penalize systematic darkening.
+
+**Fixes needed:**
+1. Add brightness preservation: `brightness_loss = (output.mean() - input.mean()).abs()`
+2. Use gradual loss weight ramp instead of hard switch (exp36 phase 2 crashed PSNR by 3.3 dB)
+3. Consider per-channel mean preservation to prevent color shift too
+
 ### Code audit findings (2026-04-10 17:00) — Verification agent review
 A verification agent reviewed the full train_nerv.py. Key findings:
 
