@@ -106,6 +106,7 @@ the quality of the original Bluray source material.
 - `vapoursynth/` — VapourSynth core (C++ frame processing runtime)
 - `vs-mlrt/` — ML inference plugin for VapourSynth (TensorRT, ONNX Runtime backends)
 - `bestsource/` — Frame-accurate video source filter for VapourSynth (FFmpeg-based)
+- `Upscale-A-Video/` — Diffusion-based video SR with temporal consistency (CVPR 2024, NTU S-Lab). **Potential alternative to SCUNet for generating high-quality training targets for DRUNet.** Slow (diffusion = iterative) but potentially higher quality than SCUNet GAN. Has flow-guided temporal propagation for frame consistency. Run on Modal with large GPU for target generation, not real-time.
 
 ## Data Directory
 `data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.

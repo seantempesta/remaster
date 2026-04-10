@@ -52,3 +52,6 @@
 [submodule "reference-code/PNVC"]
 	path = reference-code/PNVC
 	url = https://github.com/ge1-gao/PNVC.git
+[submodule "reference-code/Upscale-A-Video"]
+	path = reference-code/Upscale-A-Video
+	url = https://github.com/sczhou/Upscale-A-Video.git
