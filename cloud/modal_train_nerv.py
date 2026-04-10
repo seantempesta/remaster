@@ -164,6 +164,7 @@ def train_nerv(
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         wandb_run_name=run_name,
+        run_name=run_name,
         snapshot_freq=30,
         model_size=0,
         cond_ch=32,
@@ -255,20 +256,25 @@ def main(
     print()
 
     # Upload data
+    # Normalize remote_dir: strip leading slashes (Git Bash converts /path to C:/path)
+    remote_dir = remote_dir.replace("\\", "/").lstrip("/")
+    if not remote_dir.startswith("nerv-data"):
+        remote_dir = f"nerv-data/{remote_dir}"
+
     if not skip_upload:
         local_frames = sorted(glob.glob(os.path.join(data_dir, "*.png")))
         print(f"Uploading {len(local_frames)} frames from {data_dir}...")
         with vol.batch_upload(force=True) as batch:
             for f in local_frames:
-                batch.put_file(f, f"{remote_dir}/{os.path.basename(f)}")
-        print(f"Upload complete: {len(local_frames)} frames -> {remote_dir}")
+                batch.put_file(os.path.abspath(f), f"/{remote_dir}/{os.path.basename(f)}")
+        print(f"Upload complete: {len(local_frames)} frames -> /{remote_dir}")
     else:
         print("Skipping upload (--skip-upload)")
 
     # Launch training (GPU is set in @app.function decorator — change there for different GPU)
     print(f"\nLaunching training on Modal (GPU set in decorator)...")
     train_nerv.remote(
-        data_remote_dir=remote_dir,
+        data_remote_dir=f"/{remote_dir}",
         num_frames=frames,
         fc_dim=fc_dim,
         enc_dim=enc_dim,
