@@ -258,7 +258,12 @@ def main(
     print(f"  GPU: {gpu}")
     print(f"  Frames: {frames}, Batch: {batch_size}, Epochs: {epochs}")
     print(f"  Model: fc_dim={fc_dim}, enc_dim={enc_dim}")
-    print(f"  Loss: edge={edge_weight}, asym_edge={asym_edge_weight}")
+    print(f"  Loss: pixel_weight={pixel_weight}, edge={edge_weight}, asym_edge={asym_edge_weight}")
+    print(f"  Optimizer: {optimizer}, wd={weight_decay}, d_coef={d_coef}")
+    print(f"  Resume: {resume if resume else 'NO (fresh start)'}")
+    print(f"  Fresh optimizer: {fresh_optimizer}")
+    print(f"  Data: {data_dir} -> {remote_dir}")
+    print(f"  Max time: {max_time}s ({max_time/60:.0f} min)")
     print()
 
     # Upload data
