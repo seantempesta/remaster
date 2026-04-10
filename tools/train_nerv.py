@@ -219,21 +219,27 @@ class PositionEncoding(nn.Module):
 
 class HNeRVSimple(nn.Module):
     """
-    HNeRV with SFT conditional decoding.
+    HNeRV with SFT conditional decoding and optional U-Net skip connections.
 
     Each decoder stage is modulated by a per-frame temporal embedding
     (from the frame's position in the video). Shared decoder weights handle
     general visual vocabulary; SFT personalizes each frame's reconstruction.
+
+    When skip_connections=True, encoder features at each stage are projected
+    and added to the decoder at the corresponding reversed stage. This lets
+    high-frequency spatial detail bypass the bottleneck.
     """
 
     def __init__(self, height=1080, width=1920, enc_strides=(5, 3, 2, 2, 2),
                  dec_strides=(5, 3, 2, 2, 2), dec_blks=(1, 1, 2, 2, 2),
                  enc_dim=16, fc_dim=170, reduce=1.2, lower_width=12,
-                 grad_checkpoint=False, cond_ch=32, enc_blocks=1):
+                 grad_checkpoint=False, cond_ch=32, enc_blocks=1,
+                 skip_connections=False):
         super().__init__()
         self.height = height
         self.width = width
         self.grad_checkpoint = grad_checkpoint
+        self.skip_connections = skip_connections
 
         total_enc = math.prod(enc_strides)
         total_dec = math.prod(dec_strides)
@@ -267,23 +273,53 @@ class HNeRVSimple(nn.Module):
         # Kernel pattern: min 3x3 for all blocks (was 1x1 for first block)
         # 3x3 head for spatial mixing in final output
         self.decoder = nn.ModuleList()
+        # Track which decoder blocks are the FIRST block of each stage
+        # (these are the ones that upsample and where we inject skip connections)
+        self._stage_first_block_idx = []
         ch = fc_dim
+        dec_stage_out_channels = []
+        block_idx = 0
         for i, stride in enumerate(dec_strides):
             new_ch = max(int(ch / reduce), lower_width)
             ks = min(3 + 2 * i, 5)  # [3, 5, 5, 5, 5] -- all have spatial mixing
             n_blks = dec_blks[i] if i < len(dec_blks) else 1
+            self._stage_first_block_idx.append(block_idx)
             for j in range(n_blks):
                 s = stride if j == 0 else 1  # only first block upsamples
                 self.decoder.append(SFTUpConvBlock(ch, new_ch, s, ks, cond_ch))
                 ch = new_ch
+                block_idx += 1
+            dec_stage_out_channels.append(new_ch)
 
         self.head = nn.Conv2d(ch, 3, 3, 1, 1)  # 3x3 with padding
+
+        # Skip connection projections: encoder stage i -> decoder stage (N-1-i)
+        # Encoder dims: [64, 64, 64, 64, enc_dim] for 5 stages
+        # We skip the last encoder stage (it IS the bottleneck) and first decoder stage
+        if skip_connections:
+            n_stages = len(enc_strides)
+            # Encoder channel dims per stage
+            enc_dims_list = [64] * (n_stages - 1) + [enc_dim]
+            self.skip_projs = nn.ModuleList()
+            for i in range(n_stages):
+                dec_stage = n_stages - 1 - i  # reversed mapping
+                if dec_stage < len(dec_stage_out_channels):
+                    target_ch = dec_stage_out_channels[dec_stage]
+                    src_ch = enc_dims_list[i]
+                    # 1x1 conv to match decoder channels
+                    self.skip_projs.append(nn.Conv2d(src_ch, target_ch, 1))
+                else:
+                    self.skip_projs.append(None)
 
     def forward(self, img, norm_idx=None):
         B = img.shape[0]
 
         # Encode
-        embed = self.encoder(img)
+        if self.skip_connections:
+            embed, enc_features = self.encoder(img, return_features=True)
+        else:
+            embed = self.encoder(img)
+            enc_features = None
 
         # Temporal conditioning
         if norm_idx is None:
@@ -300,13 +336,39 @@ class HNeRVSimple(nn.Module):
                 B, -1, self.fc_h * eh, self.fc_w * ew
             )
 
+        # Build skip injection map: decoder block index -> encoder feature index
+        skip_map = {}
+        if self.skip_connections and enc_features is not None:
+            n_stages = len(self._stage_first_block_idx)
+            for enc_stage_idx in range(n_stages):
+                dec_stage_idx = n_stages - 1 - enc_stage_idx
+                if dec_stage_idx < n_stages:
+                    # Inject AFTER the first block of this decoder stage
+                    block_idx = self._stage_first_block_idx[dec_stage_idx]
+                    skip_map[block_idx] = enc_stage_idx
+
         # Decode with SFT conditioning
         x = proj
-        for block in self.decoder:
+        for i, block in enumerate(self.decoder):
             if self.grad_checkpoint and self.training and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(block, x, cond, use_reentrant=False)
             else:
                 x = block(x, cond)
+
+            # Add skip connection after the first block of each decoder stage
+            if i in skip_map:
+                enc_idx = skip_map[i]
+                enc_feat = enc_features[enc_idx]
+                proj_layer = self.skip_projs[enc_idx]
+                if proj_layer is not None:
+                    skip_feat = proj_layer(enc_feat)
+                    # Resize to match decoder spatial dims if needed
+                    if skip_feat.shape[-2:] != x.shape[-2:]:
+                        skip_feat = F.interpolate(
+                            skip_feat, size=x.shape[-2:],
+                            mode='bilinear', align_corners=False
+                        )
+                    x = x + skip_feat
 
         out = torch.tanh(self.head(x)) * 0.5 + 0.5  # [0, 1] with steeper gradients
         return out[:, :, :self.height, :self.width]
@@ -639,6 +701,7 @@ def train(args):
         lower_width=args.lower_width,
         grad_checkpoint=args.grad_checkpoint,
         enc_blocks=args.enc_blocks,
+        skip_connections=args.skip_connections,
     ).to(device)
 
     enc_p = model.encoder_params / 1e6
@@ -760,6 +823,7 @@ def train(args):
                 "loss": args.loss,
                 "pixel_weight": args.pixel_weight,
                 "dec_blks": list(dec_blks),
+                "skip_connections": args.skip_connections,
                 "data_dir": args.data_dir,
                 "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
                 "resumed_from_epoch": start_epoch if args.resume else 0,
@@ -1014,6 +1078,9 @@ def main():
                         help="Blocks per decoder stage (more at high-res)")
     parser.add_argument("--enc-blocks", type=int, default=1,
                         help="ConvNeXt blocks per encoder stage (1 or 2)")
+    parser.add_argument("--skip-connections", action="store_true", default=False,
+                        dest="skip_connections",
+                        help="Add U-Net skip connections from encoder to decoder")
     parser.add_argument("--loss", default="l1_freq",
                         choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
