@@ -107,6 +107,8 @@ def train_nerv(
 ):
     """Train NeRV on Modal GPU."""
     import sys
+    import os as _os
+    _os.environ["PYTHONUNBUFFERED"] = "1"  # flush prints immediately for log tailing
     sys.path.insert(0, "/root/project")
     sys.path.insert(0, "/root/project/tools")
 

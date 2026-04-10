@@ -1362,7 +1362,8 @@ def train(args):
                   f"psnr={epoch_psnr:.1f}dB val={val_psnr:.1f}dB "
                   f"hf_ratio={hf_str} sharp={sharpness_ratio:.3f} "
                   f"resid_struct={residual_structure:.5f} "
-                  f"lr={scheduler.get_last_lr()[0]:.6f} ({dt:.1f}s)")
+                  f"lr={scheduler.get_last_lr()[0]:.6f} ({dt:.1f}s)",
+                  flush=True)
 
         # Save checkpoint
         if (epoch + 1) % args.ckpt_interval == 0 or epoch == args.epochs - 1:
