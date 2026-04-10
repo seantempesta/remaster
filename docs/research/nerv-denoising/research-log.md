@@ -137,6 +137,50 @@ Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B ru
 - Match --epochs to actual expected epochs so cosine schedule lands properly
 - We need clear signal that this approach works. Sharp + denoised output is the goal.
 
+### Orchestrator observation (2026-04-10 13:30) — Flatness loss creates stable but flat plateau
+Exp29 with residual flatness loss 0.5: val reaches 34.7 at epoch 45 and holds flat — no decline (unlike without flatness where val peaks then drops). But it also doesn't climb further. The flatness loss prevents overfitting but also prevents improvement.
+
+**Root cause**: Flatness loss can't distinguish noise HF from edge HF. Both show up in the residual FFT. So the model keeps output smooth (low HF) to minimize flatness penalty — but this means edges end up in the residual too.
+
+**Solution**: Combine flatness loss with edge preservation loss. Flatness says "residual = noise," edge loss says "but don't put edges there." Together they break the plateau by giving the model a clear signal for which HF to keep vs remove.
+
+**Next experiment MUST try**: Combined loss with two complementary residual signals:
+
+1. **Residual structure penalty** (minimize): Sobel/Laplacian energy of `(input - output)`. Penalizes edges/lines/geometry in the residual. This keeps sharpness in the output.
+
+2. **Output sharpness reward** (maximize): Sobel energy of the output should be >= Sobel energy of the input. The output should be SHARPER than the noisy input, not smoother.
+
+These are complementary:
+- Structure penalty says "don't put edges in the residual"  
+- Sharpness reward says "the output should have MORE edge energy than the input"
+- Together: edges stay in output AND get enhanced, while noise goes to residual
+
+Implementation: `loss = reconstruction + flatness * residual_spectral_flatness + edge * residual_sobel_energy - sharpness * output_sobel_energy`
+
+The sharpness term is NEGATIVE (we maximize it). Start with small weights and tune.
+
+**Key insight from human**: "focusing on the residual (no lines/structure) AND increasing sharpness from the original" — these are complementary signals, not competing ones. Find the balance.
+
+### Human insight (2026-04-10 13:00) — Minimize edge energy in residual
+Looking at the residual image: straight lines and geometry visible = edges being removed from output into residual. We want edges to STAY in the output.
+
+**Residual edge loss**: `edge_loss = sobel(input - output).abs().mean()` — directly penalizes edges/structure in the residual. Different from spectral flatness: flatness measures overall frequency distribution, edge loss specifically targets visible geometry (lines, contours, hair outlines).
+
+Can combine: `total = reconstruction_loss + flatness_weight * spectral_flatness + edge_weight * residual_edge_loss`
+
+### Human insight (2026-04-10 12:30) — Need explicit sharpness signal
+There's no loss that rewards the model for producing SHARPER output than the input. The temporal knowledge is in the shared weights but the loss doesn't exploit it.
+
+**Sharpness-aware losses to try:**
+
+1. **Edge preservation loss**: `edge_loss = relu(sobel(input) - sobel(output)).mean()` — penalize output edges being weaker than input edges. Encourages the model to preserve and enhance edges while removing inter-edge noise.
+
+2. **Temporal median as soft target**: Compute `median(output[t-1], output[t], output[t+1])` as a denoised reference. Use as an auxiliary loss target at low weight. The median of multiple outputs is cleaner than any single one.
+
+3. **Laplacian sharpness reward**: Maximize the Laplacian energy of the output: `sharpness = laplacian(output).abs().mean()`. This directly rewards edge sharpness. Must balance with reconstruction loss to avoid artifacts.
+
+4. **Combined approach**: `total_loss = l1_freq + residual_flatness + edge_preservation`. Each loss targets a different aspect: reconstruct the content, remove noise, keep edges sharp.
+
 ### Human insight (2026-04-10 12:00) — Loss function is fundamentally wrong
 The current loss trains the model to reconstruct the NOISY input. A "perfect" model would reproduce noise perfectly. We need losses that reward being BETTER than the input.
 

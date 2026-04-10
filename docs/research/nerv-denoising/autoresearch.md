@@ -170,26 +170,36 @@ After EVERY experiment (keep, discard, or crash), append a short entry to `docs/
 
 This log is critical — it prevents future agents from repeating failed experiments. Before formulating a hypothesis, ALWAYS read the research log first.
 
-## The experiment loop
+## The experiment lifecycle
 
-**LOOP FOREVER:**
+**You are ONE researcher running ONE experiment.** A different agent will run the next one. Your job:
 
-1. Read `results.tsv`, `research-log.md`, and recent git log to understand what's been tried
-2. Formulate a hypothesis — what change should improve val_psnr or hf_ratio?
-3. Edit `tools/train_nerv.py` (architecture, loss, hyperparameters, anything)
-4. `git commit -m "experiment: <description>"`
-5. Run the experiment (redirect stdout/stderr to run.log — do NOT flood your context)
-6. **ACTIVELY MONITOR** the run:
-   - Check metrics at epoch 5-10 (~1 min in). If loss is NaN, PSNR below 15 dB, or VRAM above 5.5GB: kill immediately, log as crash, move on.
-   - Check again at epoch 20-30 (~3 min in). Is PSNR tracking above/below the baseline curve? This tells you early if the experiment is promising.
-   - Don't just sleep for 10 minutes. Read the tail of metrics.jsonl periodically.
-7. After the run completes (~10 min), extract final results from `metrics.jsonl`
-8. Check the visual output in `output/nerv/autorun/vis/` — is it sharper than the previous best?
-9. Record in `results.tsv` AND append to `research-log.md` — **BOTH ARE MANDATORY, EVERY EXPERIMENT, NO EXCEPTIONS**. The research log entry must include your hypothesis, what happened, and what you learned. Without this, the next agent starts from scratch.
-10. If val_psnr improved OR hf_ratio improved significantly: **keep** (advance branch)
-11. If worse or equal: **discard** (`git reset --hard` to previous commit)
-12. **Clean up**: Kill any stale python.exe processes before next run
-13. Go to step 1
+1. **Research phase** (~5 min): Read `research-log.md`, `results.tsv`, git log, reference code. Understand the problem deeply. Formulate a novel hypothesis — something the previous researchers haven't tried.
+2. **Implementation**: Edit `tools/train_nerv.py`, commit with `git commit -m "experiment: <description>"`
+3. **Run the experiment**: Launch training, redirect output. Use `--max-time 1200` (20 min).
+4. **ACTIVELY MONITOR** the run:
+   - Check metrics at epoch 5-10 (~1 min in). If loss is NaN, PSNR below 15 dB, or VRAM above 5.5GB: kill immediately.
+   - Check again at epoch 20-30. Is it tracking above/below previous experiments? 
+   - If promising, extend: `echo 600 > output/nerv/autorun/extend_time`
+   - Check the residual images in `output/nerv/autorun/vis/` — is the residual mostly noise (good) or does it show structure/edges (bad)?
+5. **After the run completes**, extract final results from `metrics.jsonl`
+6. **Log results** — BOTH are MANDATORY:
+   - Append to `results.tsv`
+   - Append detailed entry to `research-log.md` with hypothesis, result, and what you learned
+7. **Keep or discard**: If improved, keep the commit. If worse, revert ONLY the code change:
+   ```bash
+   # Save the research log and results first (they must survive the reset)
+   cp docs/research/nerv-denoising/research-log.md /tmp/research-log-backup.md
+   cp output/nerv/autorun/results.tsv /tmp/results-backup.tsv
+   git reset --hard HEAD~1
+   cp /tmp/research-log-backup.md docs/research/nerv-denoising/research-log.md
+   cp /tmp/results-backup.tsv output/nerv/autorun/results.tsv
+   ```
+   This reverts the code but keeps the experiment log intact.
+8. **Kill stale processes**: `wmic process where "name='python.exe'" get ProcessId`
+9. **EXIT.** You are done. The orchestrator will launch the next researcher.
+
+**DO NOT loop.** Run one experiment, write thorough notes, and stop. The NEXT agent will read your notes and build on your work — or take a completely different approach. This is how science works: each researcher brings fresh eyes, informed by but not constrained by the past.
 
 ## What to try (research directions, in priority order)
 
@@ -241,14 +251,14 @@ The encoder extracts features at multiple scales, but ALL spatial info is crushe
 
 ## Success criteria
 
-**Current best: val_psnr=34.50, hf_ratio=0.27. Both must improve to break the ceiling.**
+**Current best: val_psnr=36.02 (exp24), hf_ratio=0.74 (exp26). But residual quality varies — see research log.**
 
-The experiment loop succeeds when:
-1. **val_psnr > 35 dB** on holdout frames (currently stuck at 34.50)
-2. **hf_ratio > 0.40** (currently stuck at 0.27 — need 50% more HF energy for sharp output)
-3. **Visual output is noticeably sharper** than the current best in the comparison images
+Three things must ALL be good:
+1. **val_psnr > 35 dB** on holdout frames
+2. **hf_ratio > 0.50** (output should be SHARPER than input, not smoother)
+3. **Residual should be pure noise** — check `output/nerv/autorun/vis/residual_*.png`. If you see faces, edges, or geometry in the residual, the model is memorizing noise, not removing it.
 
-**BOTH PSNR and sharpness matter.** A config that gets 35 dB but hf_ratio=0.20 is worse than one at 34 dB with hf_ratio=0.45. The goal is usable denoised output, not just a good PSNR number on blurry frames.
+**The residual is the ground truth metric.** A model with 36 dB but faces visible in the residual is WORSE than 35 dB with pure noise residual. The goal is remastering: remove compression artifacts while enhancing detail using cross-frame knowledge.
 
 ## Key gotchas
 
@@ -268,6 +278,6 @@ Read these for architecture ideas (DO NOT import from them — copy patterns int
 - `reference-code/HiNeRV/` — hierarchical NeRV with trilinear upsampling (no PixelShuffle)
 - `reference-code/FFNeRV/model.py` — flow-guided temporal grids
 
-## NEVER STOP
+## ONE EXPERIMENT PER AGENT
 
-Once the loop begins, do NOT pause to ask the human. Run experiments continuously until interrupted. If you run out of ideas, re-read the reference code, combine previous near-misses, or try more radical changes. The human may be asleep.
+You run ONE experiment, write thorough notes, then EXIT. The orchestrator launches a fresh agent for the next experiment. This ensures each experiment gets fresh thinking, informed by the research log but not anchored to previous approaches. Think of yourself as one scientist in a research lab — you read the lab notebook, do your experiment, write up your findings, and hand off to the next researcher.
