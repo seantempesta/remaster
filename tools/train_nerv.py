@@ -848,7 +848,7 @@ def log_visuals(wb, epoch, val_frames, val_output, dataset, model, device,
         ),
         "vis/fft_output": wb.Image(
             vis_fft_heatmap(out),
-            caption=f"epoch {epoch} | FFT output | hf_ratio={hf_ratio:.3f}",
+            caption=f"epoch {epoch} | FFT output | hf_ratio={hf_ratio if hf_ratio is not None else 'N/A'}",
         ),
         "vis/dark_crop_4x": wb.Image(
             vis_dark_crop(inp, out, crop_size=256, zoom=4),
@@ -1296,9 +1296,10 @@ def train(args):
 
         # Print
         if epoch % args.print_interval == 0 or epoch == args.epochs - 1:
+            hf_str = f"{hf_ratio:.3f}" if hf_ratio is not None else "-"
             print(f"  [{epoch:4d}/{args.epochs}] loss={epoch_loss:.5f} "
                   f"psnr={epoch_psnr:.1f}dB val={val_psnr:.1f}dB "
-                  f"hf_ratio={hf_ratio:.3f} sharp={sharpness_ratio:.3f} "
+                  f"hf_ratio={hf_str} sharp={sharpness_ratio:.3f} "
                   f"resid_struct={residual_structure:.5f} "
                   f"lr={scheduler.get_last_lr()[0]:.6f} ({dt:.1f}s)")
 
