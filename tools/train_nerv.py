@@ -902,7 +902,7 @@ def train(args):
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True  # auto-tune conv algorithms
         torch.set_float32_matmul_precision('high')  # TF32 for faster matmuls
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB"
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB"
               f" ({torch.cuda.get_device_name(0)})")
 
     # Dataset
