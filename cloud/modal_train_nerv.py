@@ -93,6 +93,9 @@ def train_nerv(
     wandb_project: str = "remaster",
     wandb_entity: str = "seantempesta",
     run_name: str = "",
+    # Resume
+    resume: str = "",
+    fresh_optimizer: bool = False,
     # Misc
     max_time: int = 3600,
     print_interval: int = 10,
@@ -155,7 +158,8 @@ def train_nerv(
         output_dir=checkpoint_dir,
         ckpt_interval=30,
         print_interval=print_interval,
-        resume=None,
+        resume=resume if resume else None,
+        fresh_optimizer=fresh_optimizer,
         wandb=wandb_enabled,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
