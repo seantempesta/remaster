@@ -137,6 +137,51 @@ Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B ru
 - Match --epochs to actual expected epochs so cosine schedule lands properly
 - We need clear signal that this approach works. Sharp + denoised output is the goal.
 
+### Human insight (2026-04-10 12:00) — Loss function is fundamentally wrong
+The current loss trains the model to reconstruct the NOISY input. A "perfect" model would reproduce noise perfectly. We need losses that reward being BETTER than the input.
+
+**Loss directions to try (in priority order):**
+
+1. **Residual spectral flatness loss**: `residual = input - output`, then penalize non-flat FFT spectrum of the residual. Pure noise has flat spectrum; structure has peaks. `flatness = geometric_mean(|fft(residual)|) / arithmetic_mean(|fft(residual)|)` — maximize this.
+
+2. **Temporal consistency loss**: Adjacent frames show the same scene. Noise is random per-frame but structure is stable. Penalize `|output[t] - output[t+1]|` for pixels that should be the same.
+
+3. **Asymmetric HF loss**: Only penalize output having MORE HF than input (prevents adding noise), but don't penalize having LESS (allows removing noise). `loss = relu(|highpass(output)| - |highpass(input)|)`.
+
+4. **Total variation on output**: Encourages smooth output. Balance with other losses to control denoising strength.
+
+These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1 at low weight.
+
+### Orchestrator observation (2026-04-10 11:30) — Skip connection sweep results and residual analysis
+
+**Summary of skip connection experiments (exp24-27):**
+
+| Config | Val PSNR | hf_ratio | Gap | VRAM | Residual quality |
+|--------|----------|----------|-----|------|-----------------|
+| No skip (exp22) | 34.50 | 0.27 | ~0.5 | 4.7 | mostly noise, but output is blurry |
+| Scale=0.01 (exp25) | 34.94 | 0.60 | 0.95 | 5.1 | good, some edge ghosting |
+| Scale=0.1 (exp26) | 35.20 | 0.74 | 0.78 | 5.2 | good balance |
+| Scale=1.0 (exp24) | 36.02 | 0.72 | 1.19 | 5.8 | BAD — faces visible in residual |
+| Scale=0.1 + drop=0.3 (exp27) | ~34.75 | ~0.6 | 0.19 | 5.2 | BEST — mostly pure noise |
+
+**Key insight: val_psnr alone is misleading.** Exp24 gets 36 dB but its residual shows structure = it's memorizing noise. Exp27 gets 34.75 dB with the tightest gap (0.19 dB) and cleanest residual = it's actually denoising.
+
+**The real goal is: residual should be pure noise.** We want the model to separate signal from noise, not just reconstruct the noisy input well.
+
+**Next directions to try:**
+1. Dropout=0.1 with scale=0.1 (less aggressive dropout, faster convergence)
+2. Dropout=0.3 with --epochs=200+ (give the dropout model more time since it converges slower)
+3. Scale=0.2 or 0.3 without dropout (between 0.1 and 1.0)
+4. Residual loss: penalize non-noise structure in (input - output) via FFT flatness
+
+### Orchestrator observation (2026-04-10 11:00) — Exp27 residual quality is BEST yet
+- Exp27 (dropout 0.3 + scale 0.1) at epoch 89: residual is mostly noise, faces barely visible
+- Train-val gap at epoch 92: only 0.19 dB — nearly zero overfitting
+- Val still climbing at epoch 92 (34.36), has NOT peaked yet
+- This model converges slower but keeps climbing without overfitting
+- **The dropout is working as a noise filter on the skip path**
+- For epoch optimization: with dropout, the model needs MORE epochs than without (peak later). Set --epochs higher (200-250?) to let it converge fully.
+
 ### Human guidance (2026-04-10 10:30) — Dropout on skip connections
 - **Add dropout on the skip path** (e.g., nn.Dropout2d(p=0.3) applied to skip features before adding to decoder)
 - At training time: randomly drops skip features, forcing the bottleneck to encode more info (bottleneck naturally denoises via compression)
@@ -157,6 +202,20 @@ Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B ru
 - **Result**: val_psnr=34.94 (peak epoch 70), train_psnr=35.89, hf_ratio=0.605 at epoch 149, vram=5.1GB
 - **Verdict**: keep -- VRAM fixed, good hf_ratio (2.2x baseline), but peak PSNR only marginally above ceiling
 - **Learning**: 0.01 init is too conservative -- model can't pass enough detail early. The scale does help prevent overfitting (gap 3.58 dB vs exp24's 4.65 dB). Sweet spot is between 0.01 and 1.0. Try 0.1 next. Also try limiting skips to lower-res stages only.
+
+### Exp26: Skip scale=0.1, dec_blks=1,1,1,1,1 (2026-04-10 09:30)
+- **Hypothesis**: scale=0.1 is a middle ground between 0.01 (too conservative) and 1.0 (noise passthrough). Smaller decoder saves VRAM.
+- **Change**: --skip-scale-init 0.1, dec_blks=1,1,1,1,1
+- **Result**: val_psnr=35.20 (peak epoch 58), hf_ratio=0.74 at epoch 149, vram=5.2GB
+- **Verdict**: keep -- +0.70 dB over ceiling, 2.7x hf_ratio, VRAM within limits
+- **Learning**: 0.1 scale lets more detail through than 0.01 but still overfits in late epochs (gap 4.26 dB). The scale parameter grows during training via optimizer updates.
+
+### Exp27: Skip dropout=0.3 + scale=0.1 (2026-04-10 10:00)
+- **Hypothesis**: Dropout2d on skip features forces bottleneck to encode more info during training, reducing noise memorization. At inference, all features flow through for full sharpness.
+- **Change**: Added --skip-dropout 0.3 with nn.Dropout2d on skip path
+- **Result**: val_psnr=34.93 (peak epoch 121), hf_ratio=0.44, train-val gap=1.53 dB, vram=5.2GB
+- **Verdict**: discard -- dropout too aggressive, dampens skip benefits. hf_ratio 0.44 vs exp26's 0.74.
+- **Learning**: Dropout2d=0.3 regularizes well (very tight train-val gap) but prevents skip connections from carrying enough high-freq detail. However, the train-val gap control is remarkable -- near zero overfitting. If given more epochs it may keep climbing. The orchestrator noted the residual at epoch 89 looked cleaner than other runs.
 
 ### Exhausted directions (DO NOT re-try):
 - Encoder width, stride patterns, depth (all tested)

@@ -412,12 +412,42 @@ class HNeRVSimple(nn.Module):
 # Loss functions
 # =============================================================================
 
-def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0):
+def residual_flatness_loss(pred, target):
+    """Penalize non-flat FFT spectrum in the residual (target - pred).
+
+    Pure noise has a flat FFT magnitude spectrum. Structure in the residual
+    means the model is memorizing noise. We want the residual to be as
+    noise-like as possible.
+
+    Uses spectral flatness: geometric_mean / arithmetic_mean of |FFT(residual)|.
+    Flat spectrum -> ratio near 1. Peaked spectrum (structure) -> ratio near 0.
+    We return (1 - flatness) as a loss to minimize.
+    """
+    residual = (target.float() - pred.float())
+    # Convert to grayscale for efficiency
+    gray_residual = 0.299 * residual[:, 0] + 0.587 * residual[:, 1] + 0.114 * residual[:, 2]
+    # FFT
+    fft_mag = torch.abs(torch.fft.fft2(gray_residual))
+    # Avoid log(0) -- clamp to small positive value
+    fft_mag = fft_mag.clamp(min=1e-8)
+    # Spectral flatness = exp(mean(log(mag))) / mean(mag)
+    log_mean = fft_mag.log().mean()
+    arith_mean = fft_mag.mean()
+    flatness = torch.exp(log_mean) / (arith_mean + 1e-8)
+    # Loss = 1 - flatness (minimize to make spectrum flatter)
+    return 1.0 - flatness
+
+
+def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
+                 residual_flatness_weight=0.0):
     """Compute training loss.
 
     l1_freq: L1 pixel loss + FFT frequency loss. pixel_weight controls balance.
     Default pixel_weight=10 makes L1 and FFT roughly equal magnitude.
     Lower pixel_weight emphasizes frequency reconstruction (sharper output).
+
+    residual_flatness_weight: if > 0, adds residual spectral flatness loss
+    that penalizes non-noise structure in (target - pred).
     """
     if loss_type == "l1":
         return F.l1_loss(pred, target)
@@ -433,7 +463,10 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0):
         target_freq = torch.stack([target_fft.real, target_fft.imag], -1); del target_fft
         freq_loss = F.l1_loss(pred_freq, target_freq)
         del pred_freq, target_freq
-        return pixel_weight * l1 + freq_loss
+        total = pixel_weight * l1 + freq_loss
+        if residual_flatness_weight > 0:
+            total = total + residual_flatness_weight * residual_flatness_loss(pred, target)
+        return total
     elif loss_type == "fusion6":
         # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
         from pytorch_msssim import ssim
@@ -848,6 +881,7 @@ def train(args):
                 "resolution": f"{dataset.width}x{dataset.height}",
                 "loss": args.loss,
                 "pixel_weight": args.pixel_weight,
+                "residual_flatness_weight": args.residual_flatness_weight,
                 "dec_blks": list(dec_blks),
                 "skip_connections": args.skip_connections,
                 "skip_scale_init": args.skip_scale_init,
@@ -925,7 +959,8 @@ def train(args):
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
-                loss = compute_loss(output, batch_img, args.loss, args.pixel_weight)
+                loss = compute_loss(output, batch_img, args.loss, args.pixel_weight,
+                                    args.residual_flatness_weight)
 
                 if args.late_layer_decay > 0:
                     reg = 0
@@ -1140,6 +1175,9 @@ def main():
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
     parser.add_argument("--pixel-weight", type=float, default=10.0,
                         help="Weight for pixel loss in l1_freq (default: 10, lower = more freq emphasis)")
+    parser.add_argument("--residual-flatness-weight", type=float, default=0.0,
+                        dest="residual_flatness_weight",
+                        help="Weight for residual spectral flatness loss (0=off, try 0.1-1.0)")
 
     # Optimizer
     parser.add_argument("--optimizer", default="prodigy", choices=["adam", "prodigy"],
