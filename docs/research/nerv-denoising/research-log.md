@@ -19,7 +19,7 @@ Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B ru
 
 ## Key constraints (quick reference)
 - **Current best: val_psnr=34.50, hf_ratio=0.27, 4.70M params (exp22/23)**
-- VRAM limit: 5.5GB (6GB card, need headroom)
+- **VRAM limit: 5.5GB target, 5.7GB absolute max** (6GB card but OS uses ~300MB)
 - Time budget: 20 min per run (--max-time 1200)
 - Confirmed ceiling at 34.50 dB with current architecture — need structural changes to break through
 
@@ -104,6 +104,38 @@ Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B ru
 4. **Perceptual/edge loss terms** — Sobel/Laplacian emphasis on edges
 5. **Sin activation** — periodic functions represent fine detail better (Boosting-NeRV uses this)
 6. **Data augmentation** — random flips/crops for better regularization
+
+### Human guidance (2026-04-10 09:30) — Skip connections are replicating noise
+- exp24 skip connections produce SHARP output BUT the residual shows too much structure (faces, clothing visible in residual at epoch 59). This means the model is memorizing noise, not just removing it.
+- **The goal is REMASTER quality: sharp + denoised.** The network learns features across frames to reconstruct realistic detail that was lost to compression. The residual should be mostly random noise — no structure.
+- Skip connections help sharpness but also let noise bypass the bottleneck. Need to find the balance:
+  - Maybe skip connections with REDUCED weight (learnable scale factor, initialize to 0.1?)
+  - Or skip connections only at lower-resolution scales (not the highest-res ones where noise lives)
+  - Or add dropout/noise to the skip path to prevent noise passthrough
+  - Or use attention-gated skip connections that learn what to pass vs block
+  - Or soft-thresholding on skip features: small values (noise) -> 0, large values (edges) -> pass through
+  - Or channel-wise attention gate (squeeze-and-excite style) that learns which channels carry signal vs noise
+- **Simplest approach: learnable scale per skip, init to 0.01** — `out = decoder_out + alpha * skip_features` where alpha is a nn.Parameter starting near zero. The model must learn to use skip info gradually, preventing noise blowthrough early in training.
+- **Check the residual image after every run** — if structure is visible, the model is memorizing noise. A good denoiser's residual is pure noise.
+- **Residual loss idea**: Add a loss term that penalizes non-noise structure in the residual (input - output). Pure noise has: flat FFT spectrum, no spatial autocorrelation, Gaussian-like distribution. Structure has: peaks in FFT, high autocorrelation, heavy tails. Could use FFT magnitude of the residual as a penalty — flat spectrum = noise, peaked spectrum = structure being removed.
+- **Read the reference denoising code** for ideas: `reference-code/SCUNet/`, `reference-code/KAIR/`, `reference-code/DISTS/` — these are proven denoisers. How do they handle the noise vs structure separation?
+
+### Human guidance (2026-04-10 09:00) — VRAM and skip connections
+- exp24 (skip connections) uses **5.8GB VRAM** — OVER the limit. Only **5.7GB is actually usable** (OS/display takes ~300MB). At 5.8GB we are 0.2GB into shared system RAM = PCIe spill = degraded speed.
+- **Hard VRAM ceiling: 5.5GB target, 5.7GB absolute max.**
+- The visual output is SHARP — skip connections are clearly working
+- **Priority: keep skip connections but reduce VRAM.** Options:
+  - Drop dec_blks back to 1,1,1,1,1 (skip connections alone may be enough without extra decoder blocks)
+  - Reduce fc_dim from 120 to 100
+  - Use gradient checkpointing on the skip path
+- If a promising run emerges, train it LONGER (30 min, or resume from checkpoint)
+
+### Human guidance (2026-04-10 08:30)
+- The W&B visual output from exp24 (skip connections) looks SHARP — much better than previous runs visually
+- **If a run is promising, train it LONGER** — 30 min, or resume from checkpoint and continue
+- The script saves checkpoints — use `--resume` to continue training from where a previous run left off
+- Match --epochs to actual expected epochs so cosine schedule lands properly
+- We need clear signal that this approach works. Sharp + denoised output is the goal.
 
 ### Exhausted directions (DO NOT re-try):
 - Encoder width, stride patterns, depth (all tested)

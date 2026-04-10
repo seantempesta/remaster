@@ -6,18 +6,33 @@ Autonomous experimentation loop for finding the optimal HNeRV configuration for 
 
 We're fitting an HNeRV neural video representation to a 16-frame micro-GOP of 1080p Firefly video. The network's spectral bias denoises by learning structure before noise. The goal is to **maximize PSNR on holdout frames while producing visually sharp (non-blurry) output**.
 
-### Current state
-- Best config: 2.83M params, fc_dim=120, reduce=1.2, enc_dim=16, SFT conditioning
-- **Plateaus at ~33-34 dB train / ~30 dB val** regardless of model size, loss, or training duration
-- Output is blurry — low HF energy ratio (~0.17 = only 17% of input high-frequency content reconstructed
-- Suspected bottleneck: encoder compresses 1080p to only 2,304 values (16ch at 9x16)
+### Current state (after 23 experiments on 2026-04-09)
+- Best config: 4.70M params, fc_dim=120, enc_dim=16, 3x3 decoder kernels, 332 strides, wd=0.01
+- **Ceiling at 34.50 dB val** — confirmed by two independent runs (exp22, exp23)
+- Output is still somewhat blurry — HF ratio only 0.27 (27% of input high-frequency content)
+- Previous plateau at 29.64 dB was broken by 3x3 decoder kernels (+3.3 dB) and weight decay (+1.2 dB)
+- The current ceiling requires **architectural innovation**, not hyperparameter tuning
 
-### What's been tried (and didn't break the plateau)
-- Model sizes from 0.92M to 8.19M params — same ceiling
-- SFT temporal conditioning — faster convergence, same ceiling
-- L1 loss, L1+FFT frequency loss, Fusion10_freq — same ceiling (Fusion10_freq was unstable)
-- Prodigy vs Adam optimizer — same ceiling
-- 16 frames vs 240 frames — same ceiling, just faster with fewer frames
+### What's been tried (see research-log.md for full details)
+**DO NOT re-try these — they've been thoroughly tested:**
+- Wider encoder bottleneck (enc_dim=64): WORSE, more noise passes through
+- Pure L1 loss: overfits without frequency regularizer
+- L2 (MSE) loss: severe overfitting (29.05 dB)
+- Fusion6/SSIM losses: collapse with both Prodigy and Adam
+- Adam optimizer: less stable than Prodigy for this task
+- Higher Prodigy d_coef (2.0): slightly more overfitting
+- Extra decoder blocks (dec_blks 1,1,3,3,3): overfit or OOM
+- pixel_weight tuning (5.0 vs 10.0): marginal, not worth it
+- Smaller model (fc_dim=80): peaks lower
+- Longer training (30 min): overfits past ~20 min
+
+**What worked:**
+- 3x3 min decoder kernels + 3x3 head: +3.3 dB (THE breakthrough)
+- Strides 3,3,2,2,2 (72x downsample): +0.6 dB
+- Weight decay 0.01: +1.2 dB by delaying overfitting
+- Cosine schedule matched to actual epochs (--epochs 150): +0.2 dB
+- Prodigy optimizer with d_coef=1.0: best optimizer tested
+- l1_freq loss: critical — the FFT component regularizes against noise memorization
 
 ## Setup
 
@@ -27,13 +42,47 @@ We're fitting an HNeRV neural video representation to a 16-frame micro-GOP of 10
 - Run all Python with: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/remaster/python.exe`
 - Working directory: `C:/Users/sean/src/upscale-experiment`
 
+### FIRST THING YOU DO — understand the problem (before writing any code)
+
+**Step 1: Read the research log**
+`docs/research/nerv-denoising/research-log.md` — Contains findings from all previous agents. Without this, you'll waste hours repeating failed experiments.
+
+**Step 2: Review the git history**
+`git log --oneline autoresearch/nerv-apr9` — See what code changes were made and which were kept vs reverted.
+
+**Step 3: Check W&B visualizations**
+Go through the W&B comparison images and training curves from recent runs. Look at:
+- The **residual images** (input - output): Is the residual mostly noise (good) or does it show structure like faces/edges (bad = memorizing noise)?
+- The **val_psnr curve**: Does it plateau, oscillate, or crash?
+- The **train-val gap**: Large gap = overfitting = memorizing noise
+
+**Step 4: Read reference denoising code for ideas**
+- `reference-code/SCUNet/` — state-of-the-art blind denoiser
+- `reference-code/KAIR/` — image restoration toolkit (DRUNet, etc.)
+- `reference-code/DISTS/` — perceptual similarity metric
+- `reference-code/Boosting-NeRV/` — HNeRV architecture with SFT conditioning
+Look at how proven denoisers handle noise vs structure separation.
+
+**Step 5: Then formulate your first hypothesis and start experimenting.**
+
 ### Files you modify
 - **`tools/train_nerv.py`** — training script, model architecture, loss functions. Everything is in this one file.
+
+### Files you MUST update after EVERY experiment (keep, discard, or crash)
+- **`output/nerv/autorun/results.tsv`** — metrics table (append one row per experiment)
+- **`docs/research/nerv-denoising/research-log.md`** — **MANDATORY**. Append a detailed entry explaining your hypothesis, what happened, and what you learned. This is how the NEXT agent avoids repeating your work. If you skip this, the next agent starts from scratch and wastes hours. Write the *why*, not just the *what*.
+
+### Extending a promising run
+If a run is going well and you want it to train longer, write the extra seconds to the extend file:
+```bash
+echo 600 > output/nerv/autorun/extend_time   # adds 10 min to current run
+```
+The training script checks this file every epoch and adds the time. No need to kill and restart.
 
 ### Files you DO NOT modify
 - `training/` — the main DRUNet pipeline, unrelated
 - `lib/` — shared libraries, don't change
-- `reference-code/` — read for ideas only
+- `reference-code/` — read for ideas, copy patterns, but don't modify
 
 ### Data
 - **Training frames**: `E:/upscale-data/nerv-test/micro_gop_01/` (16 frames, 1080p PNG, from Firefly S01E01)
@@ -79,99 +128,127 @@ Look at `output/nerv/autorun/vis/compare_e0149.png` — is the output sharp or b
 
 ## Logging results
 
+### results.tsv (metrics table)
+
 Append to `results.tsv` (tab-separated):
 
 ```
-commit	val_psnr	train_psnr	hf_ratio	vram_gb	status	description
+exp	commit	val_psnr	train_psnr	hf_ratio	vram_gb	epochs	params_M	status	description
 ```
 
+- `exp`: experiment number (exp01, exp02, ...)
 - `commit`: short git hash (7 chars)
 - `val_psnr`: holdout PSNR (higher = better, target: 32+)
 - `train_psnr`: training PSNR
 - `hf_ratio`: high-frequency energy ratio (higher = sharper output, target: 0.4+)
 - `vram_gb`: peak VRAM in GB (must stay under 5.5)
+- `epochs`: number of epochs completed in the 10-min window
+- `params_M`: model parameter count in millions
 - `status`: `keep`, `discard`, or `crash`
 - `description`: what you tried
 
 Example:
 ```
-commit	val_psnr	train_psnr	hf_ratio	vram_gb	status	description
-a1b2c3d	30.0	34.0	0.17	3.4	keep	baseline (enc_dim=16 fc_dim=120)
-b2c3d4e	32.5	36.0	0.35	4.1	keep	wider bottleneck enc_dim=64
-c3d4e5f	0.0	0.0	0.0	0.0	crash	enc_dim=128 OOM
+exp	commit	val_psnr	train_psnr	hf_ratio	vram_gb	epochs	params_M	status	description
+exp01	a1b2c3d	30.0	34.0	0.17	3.4	85	2.83	keep	baseline (enc_dim=16 fc_dim=120)
+exp02	b2c3d4e	32.5	36.0	0.35	4.1	72	3.10	keep	wider bottleneck enc_dim=64
+exp03	c3d4e5f	0.0	0.0	0.0	0.0	0	5.20	crash	enc_dim=128 OOM
 ```
+
+### research-log.md (detailed findings)
+
+After EVERY experiment (keep, discard, or crash), append a short entry to `docs/research/nerv-denoising/research-log.md`:
+
+```
+### ExpNN: <short title> (YYYY-MM-DD HH:MM)
+- **Hypothesis**: What you expected and why
+- **Change**: What you modified
+- **Result**: val_psnr=XX.X, train_psnr=XX.X, hf_ratio=X.XX, vram=X.XGB
+- **Verdict**: keep / discard / crash
+- **Learning**: What this tells us. What to try next.
+```
+
+This log is critical — it prevents future agents from repeating failed experiments. Before formulating a hypothesis, ALWAYS read the research log first.
 
 ## The experiment loop
 
 **LOOP FOREVER:**
 
-1. Read the current `results.tsv` and git log to understand what's been tried
+1. Read `results.tsv`, `research-log.md`, and recent git log to understand what's been tried
 2. Formulate a hypothesis — what change should improve val_psnr or hf_ratio?
 3. Edit `tools/train_nerv.py` (architecture, loss, hyperparameters, anything)
 4. `git commit -m "experiment: <description>"`
-5. Run the experiment (redirect output, don't flood context)
-6. After ~18 min, extract results from `metrics.jsonl`
-7. **Early termination**: Check metrics at epoch 10-20 (~2 min in). If loss is NaN, PSNR is below 15 dB, or VRAM exceeded 5.5GB, kill immediately and treat as crash.
-8. Check the visual output — is it sharper than the previous best?
-9. Record in `results.tsv`
+5. Run the experiment (redirect stdout/stderr to run.log — do NOT flood your context)
+6. **ACTIVELY MONITOR** the run:
+   - Check metrics at epoch 5-10 (~1 min in). If loss is NaN, PSNR below 15 dB, or VRAM above 5.5GB: kill immediately, log as crash, move on.
+   - Check again at epoch 20-30 (~3 min in). Is PSNR tracking above/below the baseline curve? This tells you early if the experiment is promising.
+   - Don't just sleep for 10 minutes. Read the tail of metrics.jsonl periodically.
+7. After the run completes (~10 min), extract final results from `metrics.jsonl`
+8. Check the visual output in `output/nerv/autorun/vis/` — is it sharper than the previous best?
+9. Record in `results.tsv` AND append to `research-log.md` — **BOTH ARE MANDATORY, EVERY EXPERIMENT, NO EXCEPTIONS**. The research log entry must include your hypothesis, what happened, and what you learned. Without this, the next agent starts from scratch.
 10. If val_psnr improved OR hf_ratio improved significantly: **keep** (advance branch)
-11. If worse or equal: **discard** (git reset to previous commit)
-12. Go to step 1
+11. If worse or equal: **discard** (`git reset --hard` to previous commit)
+12. **Clean up**: Kill any stale python.exe processes before next run
+13. Go to step 1
 
 ## What to try (research directions, in priority order)
 
-### 1. Wider encoder bottleneck (HIGHEST PRIORITY)
-The encoder compresses 1080p to `enc_dim` channels at 9x16. Current: 16ch = 2,304 values.
-- Try `enc_dim=32` (4,608 values) — does val_psnr exceed 30 dB?
-- Try `enc_dim=64` (9,216 values) — does it exceed 32 dB?
-- Try `enc_dim=128` — might OOM, test carefully
-- If wider bottleneck helps, find the sweet spot between sharpness and VRAM
+**The 34.50 dB ceiling is architectural.** Hyperparameter tuning (LR, weight decay, loss weights, d_coef, training time) has been exhausted — all variations land at 33-34.5 dB. Breaking through requires structural changes to how information flows through the network.
 
-### 2. Encoder depth and architecture
-- More ConvNeXt blocks per encoder stage (`blocks_per_stage=2`)
-- Different encoder strides (less aggressive downsampling = more spatial info)
-- Try stride pattern `[3,3,2,2,2]` instead of `[5,3,2,2,2]` (72x total vs 120x)
-- Consider adding skip connections from encoder to decoder (U-Net style) — this is a bigger change but the research suggests it's critical for sharp output
+### 1. U-Net skip connections (HIGHEST PRIORITY — untested)
+The encoder extracts features at multiple scales, but ALL spatial info is crushed to the bottleneck before the decoder sees it. Adding skip connections from encoder to decoder lets high-frequency detail bypass the bottleneck.
+- Connect encoder stage outputs to corresponding decoder stages (add, not concatenate — saves VRAM)
+- This is the standard fix for "blurry autoencoder" in the literature (U-Net, ResNet, etc.)
+- The reference HNeRV architecture does NOT have skips — adding them is a novel modification
+- Start simple: just add skips at 2-3 scales, not all 5
 
-### 3. Loss function experiments
-- L2 (MSE) instead of l1_freq — the reference HNeRV uses L2
-- Lower frequency loss weight: change `10 * l1 + freq_loss` to `1 * l1 + freq_loss`
-- SSIM loss component (already available via pytorch_msssim)
-- Try Charbonnier loss (available in `training/losses.py`)
-- Remove frequency loss entirely and just use L1 — isolate whether the FFT loss helps
+### 2. Fewer frames (untested)
+- Currently fitting 16 frames. Try 8, 4, or even 2 frames.
+- Fewer frames = the model can spend more capacity per-frame = sharper output
+- More epochs per frame in the same wall clock time
+- May dramatically improve hf_ratio even if val_psnr doesn't change
+- To test: create a subdirectory with fewer frames, or add `--num-frames N` flag
 
-### 4. Decoder experiments
-- More decoder blocks at high resolution: dec_blks `[1,1,3,3,3]`
-- Residual connections within decoder blocks
-- Change PixelShuffle to bilinear upsample + conv (fixes grid artifacts in FFT)
-- Larger decoder kernels at final stages
+### 3. Decoder residual connections (untested)
+- Each decoder PixelShuffle block currently has NO residual path
+- Adding `output = block(x) + upsample(x)` lets the block learn residual corrections
+- This is standard in modern architectures but missing from HNeRV
+- Could help with both PSNR and sharpness
 
-### 5. Training dynamics
-- Higher learning rate (Adam lr=0.003 matching Adan reference)
-- Different warmup schedules
-- OneCycleLR instead of cosine
-- Gradient clipping (the reference uses clip_max_norm)
+### 4. Perceptual / frequency loss tuning (partially tested)
+- The l1_freq loss is `10 * L1 + FFT_loss`. The FFT component helps but the balance may not be optimal.
+- Try Charbonnier loss (from `training/losses.py`) instead of L1 — smoother gradient near zero
+- Try adding a high-frequency EMPHASIS term: extra weight on edges/textures via Sobel or Laplacian filter
+- Do NOT try: pure L1, pure L2, SSIM, fusion6 — all confirmed failures
 
-### 6. Activation function
+### 5. Activation function (untested)
 - Current: GELU in decoder, tanh output head
-- Try: SiLU/Swish, Sin (the Boosting-NeRV reference uses Sin activation)
-- Try: sigmoid output head instead of tanh (we used sigmoid in earlier runs)
+- Try: SiLU/Swish (similar to GELU but simpler), Sin (Boosting-NeRV uses this)
+- Try: sigmoid output head instead of tanh (different output range mapping)
+- Sin activation is theoretically interesting for NeRV — periodic activations can represent fine detail better
+
+### 6. Data augmentation (untested)
+- Random horizontal flip, random crop during training
+- Could regularize better than weight decay alone
+- Standard in image reconstruction but not in NeRV papers (since they overfit by design)
 
 ## Constraints
 
-- **VRAM**: Must stay under 5.5GB peak. 6GB is the hard limit but leave headroom for OS/display.
-- **Time**: Each run uses `--max-time 600` (10 minutes). The script exits cleanly, no manual kill needed.
+- **VRAM**: Must stay under 5.5GB peak. The card is 6GB but only **5.7GB is usable** (OS/display driver takes ~300MB). At 5.7GB+ PyTorch spills into shared system RAM via PCIe — 10x slower and makes the run useless.
+- **Time**: Default `--max-time 600` (10 minutes). You may increase to `--max-time 1200` (20 min) if a promising experiment needs more convergence time. The script exits cleanly, no manual kill needed.
 - **Simplicity**: Prefer simple changes. A 0.5 dB improvement from one parameter change beats a 0.5 dB improvement from 50 lines of new code.
 - **No new dependencies**: Only use what's already installed in the conda env.
 
 ## Success criteria
 
-The experiment loop succeeds when:
-1. **val_psnr > 32 dB** on holdout frames (currently stuck at ~30 dB)
-2. **hf_ratio > 0.4** (currently stuck at ~0.17 — need 2x more HF energy)
-3. **Visual output is noticeably sharper** than the baseline in the comparison images
+**Current best: val_psnr=34.50, hf_ratio=0.27. Both must improve to break the ceiling.**
 
-Any ONE of these would be a significant advance. All three together would validate NeRV denoising as a viable approach for generating training targets.
+The experiment loop succeeds when:
+1. **val_psnr > 35 dB** on holdout frames (currently stuck at 34.50)
+2. **hf_ratio > 0.40** (currently stuck at 0.27 — need 50% more HF energy for sharp output)
+3. **Visual output is noticeably sharper** than the current best in the comparison images
+
+**BOTH PSNR and sharpness matter.** A config that gets 35 dB but hf_ratio=0.20 is worse than one at 34 dB with hf_ratio=0.45. The goal is usable denoised output, not just a good PSNR number on blurry frames.
 
 ## Key gotchas
 

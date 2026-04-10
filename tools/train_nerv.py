@@ -863,9 +863,20 @@ def train(args):
     for epoch in range(start_epoch, args.epochs):
         _current_epoch = epoch
 
-        # Wall-clock timeout
+        # Wall-clock timeout (with file-based extension)
         if args.max_time > 0:
             elapsed = time.perf_counter() - training_start_time
+            # Check for extend file: write seconds to output_dir/extend_time to add time
+            extend_file = os.path.join(args.output_dir, "extend_time")
+            if os.path.exists(extend_file):
+                try:
+                    with open(extend_file, "r") as f:
+                        extra = int(f.read().strip())
+                    args.max_time += extra
+                    os.remove(extend_file)
+                    print(f"  Timer extended by {extra}s -> new max_time={args.max_time}s ({args.max_time/60:.0f} min)")
+                except (ValueError, OSError):
+                    pass
             if elapsed > args.max_time:
                 print(f"\n  Timeout ({args.max_time}s) reached at epoch {epoch}. Saving and exiting.")
                 torch.save({
