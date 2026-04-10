@@ -393,6 +393,30 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
   - Add residual flatness loss ON TOP of asymmetric loss -- the asymmetric version fixes the "fights sharpness" problem
   - Check residual images visually to confirm no noise memorization
 
+### Exp35: Edge weight 1.0 + decoder waste analysis (2026-04-10 12:10)
+- **Hypothesis**: Pushing edge_weight from 0.5 (exp34) to 1.0 will drive sharpness_ratio above 0.8-1.0 while the asymmetric loss (asym_edge_weight=0.5) keeps training stable. Additionally investigated whether the decoder stride pattern (3,3,2,2,2) wastes ~70% of computation as reported by a verification agent.
+- **Change**: --edge-weight 1.0 (was 0.5 in exp34). All other params identical to exp34: asym_edge_weight=0.5, skip_scale_init=0.1, dec_blks=1,1,1,1,1, wd=0.01, epochs=150.
+- **Result**: val_psnr=34.61 (peak epoch 76), train_psnr=38.09 (final), hf_ratio=0.70, sharpness_ratio=0.78 (final), vram=5.2GB, 150 epochs
+- **Verdict**: discard -- higher edge weight causes 3x worse overfitting for marginal sharpness gain
+- **Learning**: 
+  1. **Edge weight 1.0 causes overfitting, not more sharpness**: Val peaked at 34.61 (vs exp34's 35.20) with 1.90 dB gap at peak (vs exp34's 0.56 dB). By end of training, gap ballooned to 4.21 dB with train at 38.09 while val stagnated at 33.88. The edge preservation loss at 1.0 makes the model memorize per-frame noisy edges during training, failing to generalize.
+  2. **Sharpness gain is marginal**: Final sharpness_ratio=0.78 vs exp34's 0.75 (only +0.03). Final hf_ratio=0.70 vs 0.66 (+0.04). Not enough to justify the -0.59 dB val PSNR drop.
+  3. **Edge weight 0.5 was already optimal**: Combined with exp31 (weight=5.0, artifacts) and this experiment (weight=1.0, overfitting), the sweet spot is confirmed at ~0.5. Lower weights don't push sharpness enough; higher weights cause the model to preserve noisy edges.
+  4. **Decoder waste is 1.2%, NOT 70%**: The verification agent's claim was incorrect. With strides (3,3,2,2,2), encoder output is 15x27. Decoder produces 1080x1944 via PixelShuffle (15*72=1080 height exact, 27*72=1944 width). Final clip to 1080x1920 discards only 24 width pixels = 1.2% waste. This is negligible and not worth changing.
+  5. **Skip connection spatial mismatches are real but handled**: All 5 skip connections have encoder/decoder size mismatches (e.g., enc stage 0 outputs 360x640 but dec stage 4 outputs 1080x1944). The code handles this with F.interpolate(bilinear), which is inexpensive. A true fix would require the encoder to produce exactly divisible dimensions, but this is an architectural constraint of PixelShuffle (exact integer multiplication) vs strided convolution (floor division).
+  
+  **Stride waste analysis summary:**
+  - Strides (3,3,2,2,2): 1.2% waste (24 extra width pixels). Not a problem.
+  - Pattern (2,3,2,2,5) would give 0% waste (1080x1920 exact) but doesn't fix skip mismatches.
+  - Skip mismatches exist regardless of stride pattern due to encoder floor division vs decoder exact multiplication.
+  - Bilinear interpolation at skip injection is cheap and does not appear to degrade quality.
+  
+  **Next directions**:
+  - The edge_weight=0.5 + asym_edge_weight=0.5 combo from exp34 is confirmed as the best loss config tested. Further sharpness improvement likely needs architectural changes, not loss tuning.
+  - Try skip_scale=1.0 + asymmetric loss (exp34's loss config prevented exp24/28's overfitting -- asymmetric loss may stabilize higher skip scale)
+  - Try reducing wd from 0.01 to 0.005 WITH asymmetric loss (wd and skip scales are in tension per exp32)
+  - Try temporal consistency loss (adjacent frames should have similar output)
+
 ### Exhausted directions (DO NOT re-try):
 - Encoder width, stride patterns, depth (all tested)
 - Loss functions: L1, L2, l1_freq, fusion6, SSIM (all tested)
@@ -401,7 +425,9 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
 - Training time: 10, 15, 20, 30 min (all tested)
 - Weight decay: 0.005, 0.01 (both tested)
 - Edge preservation loss weight=5.0 (way too aggressive, produces artifacts)
+- Edge preservation loss weight=1.0 (overfits, marginal sharpness gain -- exp35)
 - Residual flatness loss (fights sharpness enhancement without relu fix)
 - Fewer frames (8 instead of 16): overfits faster, doesn't help
 - Weight decay 0.02 + skip connections: kills skip benefit
+- Decoder stride waste fix: strides (3,3,2,2,2) waste only 1.2%, not worth changing
 

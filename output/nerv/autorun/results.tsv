@@ -31,4 +31,5 @@ exp29	5c55e38	35.15	36.60	0.7735	5.2	150	4.70	discard	residual flatness loss 0.5
 exp30	5cc9383	34.76	35.90	0.8591	5.4	250	4.70	discard	8 frames + skip scale=0.1 -- overfits faster, fewer frames hurts
 exp31	30a186a	32.82	33.10	1.2653	5.4	80	4.70	discard	skip1.0 + edge_weight=5.0 + epochs=80 -- edge loss too aggressive, hf>1
 exp32	30a186a	34.67	35.60	0.3047	5.4	60	4.70	discard	skip1.0 wd=0.02 ep=60 -- too much regularization kills skip benefit
-exp34	d334f3a	35.20	35.76	0.6638	5.2	150	4.70	keep	asym_edge=0.5 edge=0.5 skip=0.1 dec_blks=1,1,1,1,1 wd=0.01 -- asymmetric residual loss, stable val, high sharpness
+exp34	79e3be0	35.20	35.76	0.6638	5.2	150	4.70	keep	asym_edge=0.5 edge=0.5 skip=0.1 dec_blks=1,1,1,1,1 wd=0.01 -- asymmetric residual loss, stable val, high sharpness
+exp35	21d9052	34.61	38.09	0.7048	5.2	150	4.44	discard	asym_edge=0.5 edge=1.0 skip=0.1 -- higher edge weight causes overfitting, marginal sharpness gain not worth 0.6dB val loss
