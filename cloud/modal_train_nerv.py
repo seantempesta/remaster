@@ -18,6 +18,10 @@ Usage:
         --fc-dim 170 --enc-dim 24 --weight-decay 0.02 --epochs 300 \
         --run-name modal-170fc-128f
 
+    # Resume previous run (automatically finds latest.pth on volume)
+    modal run cloud/modal_train_nerv.py --skip-upload --resume \
+        --run-name modal-repro-16f-bs1
+
     # Skip upload after first run
     modal run cloud/modal_train_nerv.py --skip-upload --gpu T4 ...
 """
@@ -94,7 +98,7 @@ def train_nerv(
     wandb_entity: str = "seantempesta",
     run_name: str = "",
     # Resume
-    resume: str = "",
+    resume: bool = False,
     fresh_optimizer: bool = False,
     # Misc
     max_time: int = 3600,
@@ -106,7 +110,7 @@ def train_nerv(
     sys.path.insert(0, "/root/project")
     sys.path.insert(0, "/root/project/tools")
 
-    # Reload volume to see uploaded data
+    # Reload volume to see latest data and checkpoints from previous runs
     vol.reload()
 
     # Set up data path
@@ -119,10 +123,20 @@ def train_nerv(
     if num_frames > 0 and len(frames) > num_frames:
         print(f"Using first {num_frames} frames")
 
-    # Set up output/checkpoint dir
+    # Set up output/checkpoint dir ON the volume
     if not checkpoint_dir:
         checkpoint_dir = os.path.join(VOL_MOUNT, "nerv-output", run_name or "default")
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Handle resume: construct path to latest.pth on the volume
+    resume_path = None
+    if resume:
+        resume_path = os.path.join(checkpoint_dir, "latest.pth")
+        if os.path.exists(resume_path):
+            print(f"Resuming from {resume_path}")
+        else:
+            print(f"  No checkpoint found at {resume_path}, starting fresh")
+            resume_path = None
 
     # Build args namespace to match train_nerv.py's parse_args
     import argparse
@@ -158,9 +172,9 @@ def train_nerv(
         output_dir=checkpoint_dir,
         ckpt_interval=30,
         print_interval=print_interval,
-        resume=resume if resume else None,
+        resume=resume_path,
         fresh_optimizer=fresh_optimizer,
-        wandb=wandb_enabled,
+        wandb=wandb_enabled and os.environ.get("WANDB_API_KEY", "") != "",
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
         wandb_run_name=run_name,
@@ -180,11 +194,9 @@ def train_nerv(
     from train_nerv import train
     train(args)
 
-    # Commit volume so checkpoints persist
-    try:
-        vol.commit()
-    except OSError:
-        pass  # Volume auto-commits on container exit
+    # Commit volume so checkpoints persist between runs
+    vol.commit()
+    print("Training complete, volume committed.")
 
     # Print results summary
     metrics_path = os.path.join(checkpoint_dir, "metrics.jsonl")
@@ -204,6 +216,9 @@ def train_nerv(
             print(f"  Epochs: {last['epoch'] + 1}")
             print(f"  Params: {last.get('params_M', 'N/A')}M")
             print(f"{'='*60}")
+
+    # Return checkpoint dir so local_entrypoint can download
+    return checkpoint_dir
 
 
 @app.local_entrypoint()
@@ -239,7 +254,7 @@ def main(
     edge_weight: float = 0.5,
     asym_edge_weight: float = 0.5,
     # Resume
-    resume: str = "",
+    resume: bool = False,
     fresh_optimizer: bool = False,
     # Logging
     wandb: bool = True,
@@ -248,11 +263,13 @@ def main(
     max_time: int = 3600,
 ):
     """Local entrypoint: upload data then launch training on Modal."""
-    import pathlib
 
     # Auto-generate run name if not specified
     if not run_name:
         run_name = f"modal-nerv-{frames}f-bs{batch_size}-fc{fc_dim}"
+
+    # Checkpoint dir on volume (must match remote function's logic)
+    vol_ckpt_dir = f"{VOL_MOUNT}/nerv-output/{run_name}"
 
     print(f"NeRV Modal Training: {run_name}")
     print(f"  GPU: {gpu}")
@@ -260,8 +277,9 @@ def main(
     print(f"  Model: fc_dim={fc_dim}, enc_dim={enc_dim}")
     print(f"  Loss: pixel_weight={pixel_weight}, edge={edge_weight}, asym_edge={asym_edge_weight}")
     print(f"  Optimizer: {optimizer}, wd={weight_decay}, d_coef={d_coef}")
-    print(f"  Resume: {resume if resume else 'NO (fresh start)'}")
+    print(f"  Resume: {'YES (from latest.pth on volume)' if resume else 'NO (fresh start)'}")
     print(f"  Fresh optimizer: {fresh_optimizer}")
+    print(f"  Checkpoint dir: {vol_ckpt_dir}")
     print(f"  Data: {data_dir} -> {remote_dir}")
     print(f"  Max time: {max_time}s ({max_time/60:.0f} min)")
     print()
@@ -282,9 +300,9 @@ def main(
     else:
         print("Skipping upload (--skip-upload)")
 
-    # Launch training (GPU is set in @app.function decorator — change there for different GPU)
+    # Launch training (GPU is set in @app.function decorator -- change there for different GPU)
     print(f"\nLaunching training on Modal (GPU set in decorator)...")
-    train_nerv.remote(
+    result_path = train_nerv.remote(
         data_remote_dir=f"/{remote_dir}",
         num_frames=frames,
         fc_dim=fc_dim,
@@ -311,6 +329,48 @@ def main(
         wandb_enabled=wandb,
         run_name=run_name,
         max_time=max_time,
+        checkpoint_dir=vol_ckpt_dir,
     )
+    print(f"\nTraining complete. Checkpoints at: {result_path}")
 
-    print(f"\nDone. Check W&B for results: {run_name}")
+    # Download checkpoints from volume to local
+    ckpt_rel = vol_ckpt_dir.replace(VOL_MOUNT + "/", "")
+    local_ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ckpt_rel)
+    os.makedirs(local_ckpt_dir, exist_ok=True)
+
+    for name in ["best_psnr.pth", "best_denoise.pth", "latest.pth", "metrics.jsonl"]:
+        vol_path = f"/{ckpt_rel}/{name}"
+        local_path = os.path.join(local_ckpt_dir, name)
+        try:
+            with open(local_path, "wb") as f:
+                vol.read_file_into_fileobj(vol_path, f)
+            size_mb = os.path.getsize(local_path) / 1024**2
+            print(f"  Downloaded {name} ({size_mb:.1f} MB)")
+        except Exception as e:
+            print(f"  Could not download {name}: {e}")
+
+    # Download visualization images
+    local_vis_dir = os.path.join(local_ckpt_dir, "vis")
+    os.makedirs(local_vis_dir, exist_ok=True)
+    try:
+        vis_prefix = f"{ckpt_rel}/vis/"
+        vis_count = 0
+        for entry in vol.listdir(vis_prefix):
+            name = entry.path.split("/")[-1]
+            if not name.endswith(".png"):
+                continue
+            local_path = os.path.join(local_vis_dir, name)
+            try:
+                with open(local_path, "wb") as f:
+                    vol.read_file_into_fileobj(f"/{vis_prefix}{name}", f)
+                vis_count += 1
+            except Exception:
+                pass
+        if vis_count > 0:
+            print(f"  Downloaded {vis_count} visualization images to {local_vis_dir}")
+    except Exception as e:
+        print(f"  Could not list vis dir: {e}")
+
+    print(f"\n{'='*60}")
+    print(f"DONE. Checkpoints in: {local_ckpt_dir}")
+    print(f"{'='*60}")
