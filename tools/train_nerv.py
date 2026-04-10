@@ -1260,9 +1260,11 @@ def train(args):
                     norm_idx = torch.tensor([i / len(dataset)], device=device)
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         pred = model(frame, norm_idx=norm_idx)
-                    # Blend: target = (1-alpha)*old_target + alpha*prediction
+                    # Anchored ITS: always blend from ORIGINAL, not previous target
+                    # target = (1-alpha)*original + alpha*prediction
+                    # This prevents drift while still incorporating denoised predictions
                     dataset.targets[i] = (
-                        (1 - its_alpha) * dataset.targets[i] +
+                        (1 - its_alpha) * dataset._frames[i] +
                         its_alpha * pred[0].float().cpu()
                     ).clamp(0, 1)
                     del frame, pred
