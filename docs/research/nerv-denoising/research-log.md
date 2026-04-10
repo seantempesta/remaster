@@ -417,6 +417,29 @@ These can be ADDED to the existing l1_freq loss, not replacing it. Start with #1
   - Strides (3,3,2,2,2): 1.2% waste (24 extra width pixels). Not a problem.
   - Pattern (2,3,2,2,5) would give 0% waste (1080x1920 exact) but doesn't fix skip mismatches.
   - Skip mismatches exist regardless of stride pattern due to encoder floor division vs decoder exact multiplication.
+
+### Exp36: Two-phase training (2026-04-10 12:40)
+- **Hypothesis**: The quality ceiling is caused by l1_freq dominating the loss, which rewards matching the noisy input. Two-phase training: Phase 1 (epochs 0-79) learns content with normal loss weights, Phase 2 (epochs 80-149) reduces pixel_weight 10x (10.0 -> 1.0) and increases edge/asym weights 4x (0.5 -> 2.0) to push denoising and sharpness now that the model already knows the content.
+- **Change**: Added --phase2-epoch 80 --phase2-pixel-weight 1.0 --phase2-edge-weight 2.0 --phase2-asym-edge-weight 2.0. Base config: skip_scale=0.1, dec_blks=1,1,1,1,1, edge=0.5, asym=0.5, wd=0.01, epochs=150, max-time=1200.
+- **Result**: 
+  - **Phase 1 peak**: val_psnr=38.08 at epoch 79, train=39.47, sharp=0.918, resid=0.0207, gap=1.39 dB. Phase 1 avg (last 10 epochs): val=36.66, sharp=0.915.
+  - **Phase 2**: val_psnr dropped to 30.1 by epoch 149, train=26.84, sharp=0.933, resid=0.0184, hf_ratio=0.81.
+  - VRAM: 5.3GB, 150 epochs completed in ~18 min.
+- **Verdict**: keep -- Phase 1 alone produces val_psnr=38.08 (NEW ALL-TIME BEST, +2.06 dB over exp24's 36.02). Phase 2 is a failure: pixel_weight=1.0 too aggressive.
+- **Learning**:
+  1. **Phase 1 is spectacularly good**: 38.08 dB peak is +2.06 dB over previous best (exp24: 36.02) and +2.88 dB over the 34.50 ceiling (exp22/23). The 4.44M model with strides 3,3,2,2,2 + skip=0.1 + edge=0.5 + asym=0.5 was already near-optimal -- it just needed more training time. Phase 1 ran 80 epochs with these weights, vs 150 epochs in exp34 (which peaked at 35.20). The difference is that THIS run (4.44M, strides 332 for both enc AND dec) has different param allocation than exp34. Need to verify which architectural detail made the difference.
+  2. **Phase 2 pixel_weight=1.0 is too aggressive (10x reduction)**: Immediately after transition, val drops from 36.0 to 30.1 over 70 epochs. The model drifts too far from pixel accuracy. The L1 anchor is critical -- without it at sufficient weight, the edge/asym losses push the model toward sharp-but-wrong output. 
+  3. **Sharpness improves slightly in phase 2**: 0.918 -> 0.933 (+1.6%). But this comes at a -6 dB val_psnr cost. Not remotely worth it.
+  4. **Residual structure improves in phase 2**: 0.021 -> 0.018 (-14%). The edge/asym losses DO clean the residual, but again the PSNR cost is too high.
+  5. **Two-phase training concept is valid but calibration is wrong**: Instead of 10x pixel reduction, try 2x-3x (pixel_weight=3.0-5.0). Or start phase 2 later (epoch 100-120) when the model is more converged. Or use a gradual transition (linear ramp) instead of a step function.
+  6. **Val PSNR oscillates heavily in phase 1**: Epochs 28-45 show wild swings (37.7 -> 28.6 -> 34.6). This is characteristic of Prodigy with high LR. The peaks at epochs 31, 60, 70, 79 are all >36 dB. The oscillation makes it hard to identify the true peak without averaging.
+  7. **The 4.44M param count differs from exp34's 4.70M**: This run used strides 3,3,2,2,2 for BOTH encoder AND decoder (matching), which slightly reduces params. Exp34 may have used different enc/dec stride configs. This architectural alignment may contribute to the better results.
+
+  **Next directions**:
+  - Run the same config WITHOUT phase 2 (just phase 1 for 150 epochs) to see if the model keeps improving past epoch 80 with normal weights -- the 38.08 peak may not be the ceiling.
+  - If phase 2 is retried, use pixel_weight=5.0 (2x reduction instead of 10x) and transition at epoch 100+.
+  - Try gradual weight transition: linearly interpolate pixel_weight from 10.0 to 3.0 over epochs 80-150.
+  - The sharpness_ratio of 0.92 in phase 1 is already near the goal of 1.0 -- maybe no phase 2 is needed at all.
   - Bilinear interpolation at skip injection is cheap and does not appear to degrade quality.
   
   **Next directions**:

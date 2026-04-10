@@ -33,3 +33,4 @@ exp31	30a186a	32.82	33.10	1.2653	5.4	80	4.70	discard	skip1.0 + edge_weight=5.0 +
 exp32	30a186a	34.67	35.60	0.3047	5.4	60	4.70	discard	skip1.0 wd=0.02 ep=60 -- too much regularization kills skip benefit
 exp34	79e3be0	35.20	35.76	0.6638	5.2	150	4.70	keep	asym_edge=0.5 edge=0.5 skip=0.1 dec_blks=1,1,1,1,1 wd=0.01 -- asymmetric residual loss, stable val, high sharpness
 exp35	21d9052	34.61	38.09	0.7048	5.2	150	4.44	discard	asym_edge=0.5 edge=1.0 skip=0.1 -- higher edge weight causes overfitting, marginal sharpness gain not worth 0.6dB val loss
+exp36	fae0f67	38.08	39.47	0.8057	5.3	150	4.44	keep	two-phase training: phase1 edge=0.5 asym=0.5, phase2@e80 pixel=1.0 edge=2.0 asym=2.0. Phase1 PEAK 38.08dB NEW BEST. Phase2 pixel_weight too low, val drops to 30.
