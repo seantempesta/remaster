@@ -1,8 +1,10 @@
 # NeRV Denoising - Implementation Status
 
-## Status: CONCLUDED (2026-04-10)
+## Status: PAUSED — next step identified (2026-04-10)
 
-NeRV-based video denoising was explored over ~45 experiments across local RTX 3060 and Modal T4 GPUs. The approach does not produce usable denoised output for HEVC-compressed video.
+NeRV-based video denoising was explored over ~45 experiments across local RTX 3060 and Modal T4 GPUs. Frame2Frame (Noise2Noise) successfully denoises but produces blurry output. A two-phase curriculum approach is proposed to combine denoising (Frame2Frame) with sharpening (same-frame + edge losses).
+
+**Next step:** Two-phase curriculum training. See `docs/research/nerv-denoising/two-phase-curriculum.md`
 
 ### Key Finding
 NeRV architecture with pixel-level losses (L1, FFT, etc.) memorizes per-frame noise at all model sizes tested (1.35M-4.44M params). The spectral bias denoising hypothesis does not hold for structured HEVC artifacts with this architecture.
