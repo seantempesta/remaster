@@ -234,12 +234,15 @@ class HNeRVSimple(nn.Module):
                  dec_strides=(5, 3, 2, 2, 2), dec_blks=(1, 1, 2, 2, 2),
                  enc_dim=16, fc_dim=170, reduce=1.2, lower_width=12,
                  grad_checkpoint=False, cond_ch=32, enc_blocks=1,
-                 skip_connections=False):
+                 skip_connections=False, skip_scale_init=1.0,
+                 skip_stages=None):
         super().__init__()
         self.height = height
         self.width = width
         self.grad_checkpoint = grad_checkpoint
         self.skip_connections = skip_connections
+        self.skip_scale_init = skip_scale_init
+        self.skip_stages = skip_stages  # None = all stages, else list of encoder stage indices to use
 
         total_enc = math.prod(enc_strides)
         total_dec = math.prod(dec_strides)
@@ -301,15 +304,24 @@ class HNeRVSimple(nn.Module):
             # Encoder channel dims per stage
             enc_dims_list = [64] * (n_stages - 1) + [enc_dim]
             self.skip_projs = nn.ModuleList()
+            # Learnable scale per skip connection (init near zero to prevent noise passthrough)
+            self.skip_scales = nn.ParameterList()
+            # Which encoder stages to use for skips
+            active_stages = set(skip_stages) if skip_stages is not None else set(range(n_stages))
+            self._skip_active = []
             for i in range(n_stages):
                 dec_stage = n_stages - 1 - i  # reversed mapping
-                if dec_stage < len(dec_stage_out_channels):
+                if dec_stage < len(dec_stage_out_channels) and i in active_stages:
                     target_ch = dec_stage_out_channels[dec_stage]
                     src_ch = enc_dims_list[i]
                     # 1x1 conv to match decoder channels
                     self.skip_projs.append(nn.Conv2d(src_ch, target_ch, 1))
+                    self.skip_scales.append(nn.Parameter(torch.tensor(skip_scale_init)))
+                    self._skip_active.append(i)
                 else:
                     self.skip_projs.append(None)
+                    self.skip_scales.append(None)
+                    self._skip_active.append(None)
 
     def forward(self, img, norm_idx=None):
         B = img.shape[0]
@@ -360,7 +372,8 @@ class HNeRVSimple(nn.Module):
                 enc_idx = skip_map[i]
                 enc_feat = enc_features[enc_idx]
                 proj_layer = self.skip_projs[enc_idx]
-                if proj_layer is not None:
+                skip_scale = self.skip_scales[enc_idx]
+                if proj_layer is not None and skip_scale is not None:
                     skip_feat = proj_layer(enc_feat)
                     # Resize to match decoder spatial dims if needed
                     if skip_feat.shape[-2:] != x.shape[-2:]:
@@ -368,7 +381,7 @@ class HNeRVSimple(nn.Module):
                             skip_feat, size=x.shape[-2:],
                             mode='bilinear', align_corners=False
                         )
-                    x = x + skip_feat
+                    x = x + skip_scale * skip_feat
 
         out = torch.tanh(self.head(x)) * 0.5 + 0.5  # [0, 1] with steeper gradients
         return out[:, :, :self.height, :self.width]
@@ -689,6 +702,10 @@ def train(args):
     dec_strides = [int(x) for x in args.dec_strides.split(',')]
     dec_blks = tuple(int(x) for x in args.dec_blks.split(','))
 
+    skip_stages = None
+    if args.skip_stages is not None:
+        skip_stages = [int(x) for x in args.skip_stages.split(',')]
+
     model = HNeRVSimple(
         height=dataset.height,
         width=dataset.width,
@@ -702,6 +719,8 @@ def train(args):
         grad_checkpoint=args.grad_checkpoint,
         enc_blocks=args.enc_blocks,
         skip_connections=args.skip_connections,
+        skip_scale_init=args.skip_scale_init,
+        skip_stages=skip_stages,
     ).to(device)
 
     enc_p = model.encoder_params / 1e6
@@ -824,6 +843,8 @@ def train(args):
                 "pixel_weight": args.pixel_weight,
                 "dec_blks": list(dec_blks),
                 "skip_connections": args.skip_connections,
+                "skip_scale_init": args.skip_scale_init,
+                "skip_stages": args.skip_stages,
                 "data_dir": args.data_dir,
                 "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
                 "resumed_from_epoch": start_epoch if args.resume else 0,
@@ -996,6 +1017,11 @@ def train(args):
             }
             if d_val is not None:
                 wb_log["train/prodigy_d"] = d_val
+            # Log skip connection scales
+            if hasattr(model, 'skip_scales'):
+                for si, sc in enumerate(model.skip_scales):
+                    if sc is not None:
+                        wb_log[f"skip/scale_{si}"] = sc.item()
             wb.log(wb_log, step=epoch)
 
         # Visual logging (at checkpoint intervals only -- vf_cpu/vo_cpu from val above)
@@ -1092,6 +1118,12 @@ def main():
     parser.add_argument("--skip-connections", action="store_true", default=False,
                         dest="skip_connections",
                         help="Add U-Net skip connections from encoder to decoder")
+    parser.add_argument("--skip-scale-init", type=float, default=1.0,
+                        dest="skip_scale_init",
+                        help="Initial learnable scale for skip connections (0.01=gradual, 1.0=full)")
+    parser.add_argument("--skip-stages", default=None,
+                        dest="skip_stages",
+                        help="Comma-separated encoder stage indices for skip connections (0-based, default: all)")
     parser.add_argument("--loss", default="l1_freq",
                         choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
