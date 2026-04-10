@@ -174,7 +174,7 @@ def train_nerv(
         late_layer_decay=0.0,
         max_time=max_time,
         output_dir=checkpoint_dir,
-        ckpt_interval=30,
+        ckpt_interval=10,
         print_interval=print_interval,
         resume=resume_path,
         fresh_optimizer=fresh_optimizer,
