@@ -898,6 +898,13 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # GPU optimizations
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # auto-tune conv algorithms
+        torch.set_float32_matmul_precision('high')  # TF32 for faster matmuls
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB"
+              f" ({torch.cuda.get_device_name(0)})")
+
     # Dataset
     dataset = FrameDataset(args.data_dir, num_frames=args.num_frames)
 
