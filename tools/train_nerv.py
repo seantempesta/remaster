@@ -64,19 +64,33 @@ class FrameDataset(Dataset):
         self.height, self.width = first.height, first.width
         print(f"Dataset: {len(self.paths)} frames at {self.width}x{self.height}")
 
-        # Cache all frames in RAM for ITS target updates
+        # Cache all frames in RAM
         self._frames = []
         for p in self.paths:
             self._frames.append(self.transform(Image.open(p).convert("RGB")))
-        # ITS targets: start as noisy input, get refined each epoch
+        # Targets: can be same-frame (default) or adjacent-frame (Frame2Frame/N2N)
         self.targets = [f.clone() for f in self._frames]
+        self.frame2frame = False  # set True for Noise2Noise with adjacent frames
+
+    def enable_frame2frame(self):
+        """Set targets to adjacent frames (Noise2Noise for video).
+
+        Frame t's target becomes frame t+1. Noise is independent per-frame,
+        so the model can only learn the shared signal (structure), not
+        per-frame noise. Last frame wraps to first.
+        """
+        self.frame2frame = True
+        for i in range(len(self._frames)):
+            next_i = (i + 1) % len(self._frames)
+            self.targets[i] = self._frames[next_i].clone()
+        print(f"  Frame2Frame enabled: target[t] = input[t+1] (Noise2Noise)")
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
         img = self._frames[idx]  # original noisy input (never changes)
-        target = self.targets[idx]  # ITS target (gets refined)
+        target = self.targets[idx]  # same frame or adjacent frame
         norm_idx = float(idx) / len(self.paths)
         return img, target, norm_idx, idx
 
@@ -937,6 +951,8 @@ def train(args):
 
     # Dataset
     dataset = FrameDataset(args.data_dir, num_frames=args.num_frames)
+    if getattr(args, 'frame2frame', False):
+        dataset.enable_frame2frame()
 
     enc_strides = [int(x) for x in args.enc_strides.split(',')]
     dec_strides = [int(x) for x in args.dec_strides.split(',')]
@@ -1531,6 +1547,9 @@ def main():
     parser.add_argument("--its-threshold", type=float, default=35.0,
                         dest="its_threshold",
                         help="Train PSNR threshold to activate ITS (default: 35.0 dB)")
+    parser.add_argument("--frame2frame", action="store_true", default=False,
+                        help="Noise2Noise: use adjacent frame as target. "
+                             "Model learns shared signal, not per-frame noise.")
 
     # Two-phase training: switch loss weights at a specific epoch
     parser.add_argument("--phase2-epoch", type=int, default=0,

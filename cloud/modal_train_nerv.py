@@ -92,6 +92,7 @@ def train_nerv(
     pixel_weight: float = 10.0,
     edge_weight: float = 0.5,
     asym_edge_weight: float = 0.5,
+    frame2frame: bool = False,
     # Logging
     wandb_enabled: bool = True,
     wandb_project: str = "remaster",
@@ -168,7 +169,8 @@ def train_nerv(
         edge_weight=edge_weight,
         asym_edge_weight=asym_edge_weight,
         residual_flatness_weight=0.0,
-        its_alpha=0.3,
+        its_alpha=0.0,
+        frame2frame=frame2frame,
         its_threshold=35.0,
         grad_checkpoint=False,
         late_layer_decay=0.0,
@@ -257,6 +259,7 @@ def main(
     pixel_weight: float = 10.0,
     edge_weight: float = 0.5,
     asym_edge_weight: float = 0.5,
+    frame2frame: bool = False,
     # Resume
     resume: bool = False,
     fresh_optimizer: bool = False,
@@ -328,6 +331,7 @@ def main(
         pixel_weight=pixel_weight,
         edge_weight=edge_weight,
         asym_edge_weight=asym_edge_weight,
+        frame2frame=frame2frame,
         resume=resume,
         fresh_optimizer=fresh_optimizer,
         wandb_enabled=wandb,
