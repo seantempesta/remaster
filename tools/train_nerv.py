@@ -1046,6 +1046,10 @@ def train(args):
                 "skip_scale_init": args.skip_scale_init,
                 "skip_stages": args.skip_stages,
                 "skip_dropout": args.skip_dropout,
+                "phase2_epoch": args.phase2_epoch,
+                "phase2_pixel_weight": args.phase2_pixel_weight,
+                "phase2_edge_weight": args.phase2_edge_weight,
+                "phase2_asym_edge_weight": args.phase2_asym_edge_weight,
                 "data_dir": args.data_dir,
                 "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
                 "resumed_from_epoch": start_epoch if args.resume else 0,
@@ -1084,7 +1088,17 @@ def train(args):
         print(f"Asymmetric residual structure loss: weight={args.asym_edge_weight}")
     if args.edge_weight > 0:
         print(f"Edge preservation loss: weight={args.edge_weight}")
+    if args.phase2_epoch > 0:
+        print(f"Two-phase training: phase 2 at epoch {args.phase2_epoch}")
+        print(f"  Phase 1: pixel_weight={args.pixel_weight}, edge_weight={args.edge_weight}, asym_edge_weight={args.asym_edge_weight}")
+        print(f"  Phase 2: pixel_weight={args.phase2_pixel_weight}, edge_weight={args.phase2_edge_weight}, asym_edge_weight={args.phase2_asym_edge_weight}")
     print()
+
+    # Active loss weights (may change at phase 2 transition)
+    active_pixel_weight = args.pixel_weight
+    active_edge_weight = args.edge_weight
+    active_asym_edge_weight = args.asym_edge_weight
+    in_phase2 = False
 
     for epoch in range(start_epoch, args.epochs):
         _current_epoch = epoch
@@ -1110,6 +1124,21 @@ def train(args):
                     "optimizer": optimizer.state_dict(),
                 }, os.path.join(args.output_dir, "latest.pth"))
                 break
+
+        # Two-phase training: switch loss weights at phase2_epoch
+        if args.phase2_epoch > 0 and epoch == args.phase2_epoch and not in_phase2:
+            in_phase2 = True
+            active_pixel_weight = args.phase2_pixel_weight
+            active_edge_weight = args.phase2_edge_weight
+            active_asym_edge_weight = args.phase2_asym_edge_weight
+            print(f"\n  === PHASE 2 TRANSITION (epoch {epoch}) ===")
+            print(f"  pixel_weight: {args.pixel_weight} -> {active_pixel_weight}")
+            print(f"  edge_weight: {args.edge_weight} -> {active_edge_weight}")
+            print(f"  asym_edge_weight: {args.asym_edge_weight} -> {active_asym_edge_weight}")
+            print()
+            if wb:
+                wb.log({"phase": 2, "phase_transition": 1}, step=epoch)
+
         model.train()
         epoch_loss = 0
         epoch_psnr = 0
@@ -1125,9 +1154,9 @@ def train(args):
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
-                loss = compute_loss(output, batch_img, args.loss, args.pixel_weight,
-                                    args.residual_flatness_weight, args.edge_weight,
-                                    args.asym_edge_weight)
+                loss = compute_loss(output, batch_img, args.loss, active_pixel_weight,
+                                    args.residual_flatness_weight, active_edge_weight,
+                                    active_asym_edge_weight)
 
                 if args.late_layer_decay > 0:
                     reg = 0
@@ -1276,6 +1305,12 @@ def train(args):
             }
             if d_val is not None:
                 wb_log["train/prodigy_d"] = d_val
+            # Log active loss weights (shows phase transition)
+            if args.phase2_epoch > 0:
+                wb_log["loss_weights/pixel_weight"] = active_pixel_weight
+                wb_log["loss_weights/edge_weight"] = active_edge_weight
+                wb_log["loss_weights/asym_edge_weight"] = active_asym_edge_weight
+                wb_log["loss_weights/phase"] = 2 if in_phase2 else 1
             # Log skip connection scales
             if hasattr(model, 'skip_scales'):
                 for si, sc in enumerate(model.skip_scales):
@@ -1414,6 +1449,21 @@ def main():
                         dest="asym_edge_weight",
                         help="Weight for asymmetric residual structure loss (0=off, try 0.1-1.0). "
                              "Only penalizes REMOVED edges, not added detail.")
+
+    # Two-phase training: switch loss weights at a specific epoch
+    parser.add_argument("--phase2-epoch", type=int, default=0,
+                        dest="phase2_epoch",
+                        help="Epoch to switch to phase 2 loss weights (0=disabled). "
+                             "Phase 1 uses normal weights, phase 2 uses reduced pixel + boosted edge.")
+    parser.add_argument("--phase2-pixel-weight", type=float, default=1.0,
+                        dest="phase2_pixel_weight",
+                        help="pixel_weight in phase 2 (default: 1.0, reduced from phase 1's 10.0)")
+    parser.add_argument("--phase2-edge-weight", type=float, default=2.0,
+                        dest="phase2_edge_weight",
+                        help="edge_weight in phase 2 (default: 2.0, increased from phase 1)")
+    parser.add_argument("--phase2-asym-edge-weight", type=float, default=2.0,
+                        dest="phase2_asym_edge_weight",
+                        help="asym_edge_weight in phase 2 (default: 2.0, increased from phase 1)")
 
     # Optimizer
     parser.add_argument("--optimizer", default="prodigy", choices=["adam", "prodigy"],
