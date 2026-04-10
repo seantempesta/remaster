@@ -553,10 +553,31 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
         return F.l1_loss(pred, target)
     elif loss_type == "l2":
         return F.mse_loss(pred, target)
+    elif loss_type == "structural":
+        # NO pixel matching. NO FFT matching. The network gets ZERO reward for
+        # reproducing noise. It only gets rewarded for:
+        # 1. Matching regional color/brightness (patch level)
+        # 2. Preserving/enhancing edges
+        # 3. Not memorizing noise patterns into the output
+        # Combined with skip dropout, the network's optimal strategy is to output
+        # clean sharp structure from its learned cross-frame vocabulary.
+        total = torch.tensor(0.0, device=pred.device)
+        # Edge preservation: penalize output edges being weaker than input
+        if edge_weight > 0:
+            total = total + edge_weight * edge_preservation_loss(pred, target)
+        # Asymmetric residual: penalize structure in removed content
+        if asym_edge_weight > 0:
+            total = total + asym_edge_weight * asymmetric_residual_structure_loss(pred, target)
+        # Patch color: regional brightness/color must match (32x32 patches)
+        patch_size = 32
+        pred_patches = F.avg_pool2d(pred, patch_size, patch_size)
+        target_patches = F.avg_pool2d(target, patch_size, patch_size)
+        color_loss = F.l1_loss(pred_patches, target_patches)
+        total = total + 5.0 * color_loss
+        return total
     elif loss_type == "l1_freq":
-        # L1 pixel loss
+        # Original loss: L1 pixel + FFT frequency (matches noisy input)
         l1 = F.l1_loss(pred, target)
-        # FFT frequency loss (encourages high-frequency detail reconstruction)
         pred_fft = torch.fft.fft2(pred.float(), dim=(-2, -1))
         target_fft = torch.fft.fft2(target.float(), dim=(-2, -1))
         pred_freq = torch.stack([pred_fft.real, pred_fft.imag], -1); del pred_fft
@@ -570,11 +591,8 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
             total = total + edge_weight * edge_preservation_loss(pred, target)
         if asym_edge_weight > 0:
             total = total + asym_edge_weight * asymmetric_residual_structure_loss(pred, target)
-        # Patch-level color/brightness preservation: average color of each patch
-        # must match between output and input. Prevents lighting/color shift while
-        # allowing per-pixel changes (denoising, sharpening).
-        # Using avg_pool to compute patch means — fast and differentiable.
-        patch_size = 32  # 32x32 patches (~1000 patches for 1080p)
+        # Patch color preservation
+        patch_size = 32
         pred_patches = F.avg_pool2d(pred, patch_size, patch_size)
         target_patches = F.avg_pool2d(target, patch_size, patch_size)
         color_loss = F.l1_loss(pred_patches, target_patches)
@@ -1448,7 +1466,7 @@ def main():
                         dest="skip_dropout",
                         help="Dropout2d probability on skip features (0.0=off, 0.3=moderate, 0.5=aggressive)")
     parser.add_argument("--loss", default="l1_freq",
-                        choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
+                        choices=["l1", "l2", "l1_freq", "structural", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")
     parser.add_argument("--pixel-weight", type=float, default=10.0,
                         help="Weight for pixel loss in l1_freq (default: 10, lower = more freq emphasis)")
