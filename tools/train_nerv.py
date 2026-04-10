@@ -414,6 +414,32 @@ class HNeRVSimple(nn.Module):
 # Loss functions
 # =============================================================================
 
+def _sobel_filters(device):
+    """Return Sobel X and Y filters on the given device."""
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                           dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    return sobel_x, sobel_y
+
+
+def compute_sobel_energy(img, device=None):
+    """Sobel edge energy of an image tensor (B,C,H,W) or (C,H,W).
+
+    Returns scalar mean of |sobel(grayscale)|.
+    """
+    if img.dim() == 3:
+        img = img.unsqueeze(0)
+    gray = (0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]).float()
+    dev = device or img.device
+    sobel_x, sobel_y = _sobel_filters(dev)
+    edges = torch.sqrt(
+        F.conv2d(gray, sobel_x, padding=1) ** 2 +
+        F.conv2d(gray, sobel_y, padding=1) ** 2 + 1e-8
+    )
+    return edges.mean()
+
+
 def residual_flatness_loss(pred, target):
     """Penalize non-flat FFT spectrum in the residual (target - pred).
 
@@ -440,6 +466,31 @@ def residual_flatness_loss(pred, target):
     return 1.0 - flatness
 
 
+def asymmetric_residual_structure_loss(pred, target):
+    """Penalize REMOVED structure in the residual, but not ADDED detail.
+
+    Uses relu(target - pred) -- the asymmetric residual. This is positive
+    where the model removed content (output < input) and zero where the
+    model added detail (output >= input). We compute Sobel energy of this
+    asymmetric residual to penalize removed edges/structure.
+
+    Key insight: if output is sharper than input, the normal residual
+    (input - output) has "anti-edges" that would be penalized by symmetric
+    losses. The asymmetric residual ignores added detail entirely.
+    """
+    # Asymmetric residual: only where model REMOVED content
+    asym_residual = F.relu(target.float() - pred.float())  # (B,C,H,W)
+    # Compute Sobel energy of this asymmetric residual
+    gray = (0.299 * asym_residual[:, 0:1] + 0.587 * asym_residual[:, 1:2]
+            + 0.114 * asym_residual[:, 2:3])
+    sobel_x, sobel_y = _sobel_filters(pred.device)
+    edges = torch.sqrt(
+        F.conv2d(gray, sobel_x, padding=1) ** 2 +
+        F.conv2d(gray, sobel_y, padding=1) ** 2 + 1e-8
+    )
+    return edges.mean()
+
+
 def edge_preservation_loss(pred, target):
     """Penalize output edges being weaker than input edges.
 
@@ -447,11 +498,7 @@ def edge_preservation_loss(pred, target):
     only penalizes LOST edges, not added detail. This encourages the model
     to preserve and enhance edges while removing inter-edge noise.
     """
-    # Sobel filters
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                           dtype=torch.float32, device=pred.device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                           dtype=torch.float32, device=pred.device).view(1, 1, 3, 3)
+    sobel_x, sobel_y = _sobel_filters(pred.device)
 
     # Convert to grayscale
     pred_gray = (0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]).float()
@@ -474,7 +521,8 @@ def edge_preservation_loss(pred, target):
 
 
 def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
-                 residual_flatness_weight=0.0, edge_weight=0.0):
+                 residual_flatness_weight=0.0, edge_weight=0.0,
+                 asym_edge_weight=0.0):
     """Compute training loss.
 
     l1_freq: L1 pixel loss + FFT frequency loss. pixel_weight controls balance.
@@ -484,6 +532,8 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
     residual_flatness_weight: if > 0, adds residual spectral flatness loss
     that penalizes non-noise structure in (target - pred).
     edge_weight: if > 0, adds edge preservation loss that penalizes blurred edges.
+    asym_edge_weight: if > 0, adds asymmetric residual structure loss that only
+    penalizes REMOVED edges, not added detail. Enables enhancement beyond input.
     """
     if loss_type == "l1":
         return F.l1_loss(pred, target)
@@ -504,6 +554,8 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
             total = total + residual_flatness_weight * residual_flatness_loss(pred, target)
         if edge_weight > 0:
             total = total + edge_weight * edge_preservation_loss(pred, target)
+        if asym_edge_weight > 0:
+            total = total + asym_edge_weight * asymmetric_residual_structure_loss(pred, target)
         return total
     elif loss_type == "fusion6":
         # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
@@ -922,6 +974,7 @@ def train(args):
                 "pixel_weight": args.pixel_weight,
                 "residual_flatness_weight": args.residual_flatness_weight,
                 "edge_weight": args.edge_weight,
+                "asym_edge_weight": args.asym_edge_weight,
                 "dec_blks": list(dec_blks),
                 "skip_connections": args.skip_connections,
                 "skip_scale_init": args.skip_scale_init,
@@ -961,6 +1014,10 @@ def train(args):
     if args.max_time > 0:
         print(f"Wall-clock timeout: {args.max_time}s ({args.max_time/60:.0f} min)")
     print(f"Late-layer decay: {args.late_layer_decay}, AMP: {use_amp}, W&B: {wb is not None}")
+    if args.asym_edge_weight > 0:
+        print(f"Asymmetric residual structure loss: weight={args.asym_edge_weight}")
+    if args.edge_weight > 0:
+        print(f"Edge preservation loss: weight={args.edge_weight}")
     print()
 
     for epoch in range(start_epoch, args.epochs):
@@ -990,6 +1047,9 @@ def train(args):
         model.train()
         epoch_loss = 0
         epoch_psnr = 0
+        train_out_sharpness = 0
+        train_inp_sharpness = 0
+        train_residual_structure = 0
         t0 = time.perf_counter()
 
         for batch_img, batch_norm_idx, batch_idx in loader:
@@ -1000,7 +1060,8 @@ def train(args):
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
                 loss = compute_loss(output, batch_img, args.loss, args.pixel_weight,
-                                    args.residual_flatness_weight, args.edge_weight)
+                                    args.residual_flatness_weight, args.edge_weight,
+                                    args.asym_edge_weight)
 
                 if args.late_layer_decay > 0:
                     reg = 0
@@ -1027,12 +1088,22 @@ def train(args):
                     return
                 epoch_loss += loss_val
                 epoch_psnr += compute_psnr(output.float(), batch_img)
+                # Train sharpness metrics (on GPU, cheap)
+                train_out_sharpness += compute_sobel_energy(output.float()).item()
+                train_inp_sharpness += compute_sobel_energy(batch_img.float()).item()
+                train_resid = (batch_img.float() - output.float())
+                train_residual_structure += compute_sobel_energy(train_resid).item()
+                del train_resid
             del output, loss, batch_img, batch_norm_idx
 
         scheduler.step()
         n_batches = len(loader)
         epoch_loss /= n_batches
         epoch_psnr /= n_batches
+        train_out_sharpness /= n_batches
+        train_inp_sharpness /= n_batches
+        train_residual_structure /= n_batches
+        train_sharpness_ratio = train_out_sharpness / (train_inp_sharpness + 1e-8)
         dt = time.perf_counter() - t0
 
         # Validation: run model on ONE holdout frame for PSNR (lightweight)
@@ -1049,6 +1120,15 @@ def train(args):
             del vf_gpu, vo
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+
+        # Sharpness metrics (every epoch -- Sobel is cheap on CPU)
+        with torch.no_grad():
+            out_sharpness = compute_sobel_energy(vo_cpu).item()
+            inp_sharpness = compute_sobel_energy(vf_cpu).item()
+            sharpness_ratio = out_sharpness / (inp_sharpness + 1e-8)
+            # Residual structure: Sobel energy of (input - output)
+            residual_val = (vf_cpu.float() - vo_cpu.float()).unsqueeze(0)
+            residual_structure = compute_sobel_energy(residual_val).item()
 
         # HF energy only at vis epochs (FFT is expensive)
         is_vis_epoch = (epoch + 1) % args.ckpt_interval == 0
@@ -1078,6 +1158,16 @@ def train(args):
             "batch_size": args.batch_size,
             "iters_per_sec": round(iters_per_sec, 2),
             "time": round(dt, 1),
+            # Sharpness metrics (val)
+            "val_output_sharpness": round(out_sharpness, 6),
+            "val_input_sharpness": round(inp_sharpness, 6),
+            "val_sharpness_ratio": round(sharpness_ratio, 4),
+            "val_residual_structure": round(residual_structure, 6),
+            # Sharpness metrics (train)
+            "train_output_sharpness": round(train_out_sharpness, 6),
+            "train_input_sharpness": round(train_inp_sharpness, 6),
+            "train_sharpness_ratio": round(train_sharpness_ratio, 4),
+            "train_residual_structure": round(train_residual_structure, 6),
         }
         metrics_file.write(json.dumps(metrics) + "\n")
         metrics_file.flush()
@@ -1097,6 +1187,15 @@ def train(args):
                 "train/epoch_time": dt,
                 "train/iters_per_sec": iters_per_sec,
                 "train/batch_size": args.batch_size,
+                # Sharpness metrics
+                "sharpness/val_output": out_sharpness,
+                "sharpness/val_input": inp_sharpness,
+                "sharpness/val_ratio": sharpness_ratio,
+                "sharpness/val_residual_structure": residual_structure,
+                "sharpness/train_output": train_out_sharpness,
+                "sharpness/train_input": train_inp_sharpness,
+                "sharpness/train_ratio": train_sharpness_ratio,
+                "sharpness/train_residual_structure": train_residual_structure,
             }
             if d_val is not None:
                 wb_log["train/prodigy_d"] = d_val
@@ -1132,7 +1231,8 @@ def train(args):
         if epoch % args.print_interval == 0 or epoch == args.epochs - 1:
             print(f"  [{epoch:4d}/{args.epochs}] loss={epoch_loss:.5f} "
                   f"psnr={epoch_psnr:.1f}dB val={val_psnr:.1f}dB "
-                  f"hf_ratio={hf_ratio:.3f} late_norm={late_norm:.2f} "
+                  f"hf_ratio={hf_ratio:.3f} sharp={sharpness_ratio:.3f} "
+                  f"resid_struct={residual_structure:.5f} "
                   f"lr={scheduler.get_last_lr()[0]:.6f} ({dt:.1f}s)")
 
         # Save checkpoint
@@ -1224,6 +1324,10 @@ def main():
     parser.add_argument("--edge-weight", type=float, default=0.0,
                         dest="edge_weight",
                         help="Weight for edge preservation loss (0=off, try 1.0-10.0)")
+    parser.add_argument("--asym-edge-weight", type=float, default=0.0,
+                        dest="asym_edge_weight",
+                        help="Weight for asymmetric residual structure loss (0=off, try 0.1-1.0). "
+                             "Only penalizes REMOVED edges, not added detail.")
 
     # Optimizer
     parser.add_argument("--optimizer", default="prodigy", choices=["adam", "prodigy"],
