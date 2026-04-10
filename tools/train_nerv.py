@@ -43,11 +43,13 @@ sys.path.insert(0, PROJECT_ROOT)
 class FrameDataset(Dataset):
     """Load frames from a directory of images."""
 
-    def __init__(self, frame_dir, height=1080, width=1920):
+    def __init__(self, frame_dir, height=1080, width=1920, num_frames=0):
         self.paths = sorted([
             os.path.join(frame_dir, f) for f in os.listdir(frame_dir)
             if f.lower().endswith(('.png', '.jpg', '.jpeg'))
         ])
+        if num_frames > 0:
+            self.paths = self.paths[:num_frames]
         self.height = height
         self.width = width
         self.transform = transforms.ToTensor()
@@ -735,7 +737,7 @@ def train(args):
     print(f"Device: {device}")
 
     # Dataset
-    dataset = FrameDataset(args.data_dir)
+    dataset = FrameDataset(args.data_dir, num_frames=args.num_frames)
 
     enc_strides = [int(x) for x in args.enc_strides.split(',')]
     dec_strides = [int(x) for x in args.dec_strides.split(',')]
@@ -878,6 +880,7 @@ def train(args):
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "n_frames": len(dataset),
+                "num_frames_arg": args.num_frames,
                 "resolution": f"{dataset.width}x{dataset.height}",
                 "loss": args.loss,
                 "pixel_weight": args.pixel_weight,
@@ -1139,6 +1142,9 @@ def main():
                              "Saves checkpoint and exits cleanly when exceeded.")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size (1 for 6GB VRAM at 1080p)")
+    parser.add_argument("--num-frames", type=int, default=0,
+                        dest="num_frames",
+                        help="Limit number of frames from data dir (0=all, 8=first 8)")
     parser.add_argument("--lr", type=float, default=1e-3)
 
     # Architecture

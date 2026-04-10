@@ -161,6 +161,16 @@ The sharpness term is NEGATIVE (we maximize it). Start with small weights and tu
 
 **Key insight from human**: "focusing on the residual (no lines/structure) AND increasing sharpness from the original" — these are complementary signals, not competing ones. Find the balance.
 
+### Human insight (2026-04-10 14:00) — Residual loss penalizes sharpness enhancement
+If output is sharper than input, `residual = input - output` has "anti-edges" (inverted structure). The flatness loss sees this as structure and penalizes it — but it's actually GOOD (enhancement).
+
+**Fix options:**
+1. Use `relu(input - output)` for flatness loss — only penalize REMOVED content, not ADDED detail
+2. Decompose: separate noise component (lowpass of residual) from enhancement (highpass of output - highpass of input). Only penalize noise component.
+3. Use absolute residual with asymmetric weighting
+
+This is important — without this fix, the flatness loss actively fights against sharpness enhancement.
+
 ### Human insight (2026-04-10 13:00) — Minimize edge energy in residual
 Looking at the residual image: straight lines and geometry visible = edges being removed from output into residual. We want edges to STAY in the output.
 
