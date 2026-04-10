@@ -181,7 +181,10 @@ def train_nerv(
     train(args)
 
     # Commit volume so checkpoints persist
-    vol.commit()
+    try:
+        vol.commit()
+    except OSError:
+        pass  # Volume auto-commits on container exit
 
     # Print results summary
     metrics_path = os.path.join(checkpoint_dir, "metrics.jsonl")
@@ -235,6 +238,9 @@ def main(
     pixel_weight: float = 10.0,
     edge_weight: float = 0.5,
     asym_edge_weight: float = 0.5,
+    # Resume
+    resume: str = "",
+    fresh_optimizer: bool = False,
     # Logging
     wandb: bool = True,
     run_name: str = "",
@@ -295,6 +301,8 @@ def main(
         pixel_weight=pixel_weight,
         edge_weight=edge_weight,
         asym_edge_weight=asym_edge_weight,
+        resume=resume,
+        fresh_optimizer=fresh_optimizer,
         wandb_enabled=wandb,
         run_name=run_name,
         max_time=max_time,
