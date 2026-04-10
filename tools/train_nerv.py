@@ -1092,17 +1092,15 @@ def train(args):
         print(f"Asymmetric residual structure loss: weight={args.asym_edge_weight}")
     if args.edge_weight > 0:
         print(f"Edge preservation loss: weight={args.edge_weight}")
-    if args.phase2_epoch > 0:
-        print(f"Two-phase training: phase 2 at epoch {args.phase2_epoch}")
-        print(f"  Phase 1: pixel_weight={args.pixel_weight}, edge_weight={args.edge_weight}, asym_edge_weight={args.asym_edge_weight}")
-        print(f"  Phase 2: pixel_weight={args.phase2_pixel_weight}, edge_weight={args.phase2_edge_weight}, asym_edge_weight={args.phase2_asym_edge_weight}")
+    if args.edge_weight > 0 or args.asym_edge_weight > 0:
+        print(f"Loss weight ramp: edge/asym weights ramp 0 -> target over {args.epochs} epochs")
     print()
 
     # Active loss weights (may change at phase 2 transition)
     active_pixel_weight = args.pixel_weight
     active_edge_weight = args.edge_weight
     active_asym_edge_weight = args.asym_edge_weight
-    in_phase2 = False
+    # (ramp_alpha computed per-epoch in the loop below)
 
     for epoch in range(start_epoch, args.epochs):
         _current_epoch = epoch
@@ -1129,26 +1127,14 @@ def train(args):
                 }, os.path.join(args.output_dir, "latest.pth"))
                 break
 
-        # Two-phase training: gradual ramp from phase 1 to phase 2 weights
-        # Ramp starts 20 epochs before phase2_epoch and ends 20 epochs after
-        if args.phase2_epoch > 0:
-            ramp_start = args.phase2_epoch - 20
-            ramp_end = args.phase2_epoch + 20
-            if epoch <= ramp_start:
-                alpha = 0.0
-            elif epoch >= ramp_end:
-                alpha = 1.0
-            else:
-                alpha = (epoch - ramp_start) / (ramp_end - ramp_start)
-            active_pixel_weight = (1 - alpha) * args.pixel_weight + alpha * args.phase2_pixel_weight
-            active_edge_weight = (1 - alpha) * args.edge_weight + alpha * args.phase2_edge_weight
-            active_asym_edge_weight = (1 - alpha) * args.asym_edge_weight + alpha * args.phase2_asym_edge_weight
-            if epoch == args.phase2_epoch and not in_phase2:
-                in_phase2 = True
-                print(f"\n  === PHASE 2 MIDPOINT (epoch {epoch}) ===")
-                print(f"  Ramp: {ramp_start}-{ramp_end}, alpha={alpha:.2f}")
-                print(f"  pixel_weight: {active_pixel_weight:.2f}, edge: {active_edge_weight:.2f}, asym: {active_asym_edge_weight:.2f}")
-                print()
+        # Gradual loss weight ramp: edge/asymmetric weights ramp from 0 to target
+        # over the full training run. Pixel weight stays constant.
+        # This lets the model learn content first (L1 dominates early) then
+        # gradually shift toward denoising/sharpness (edge/asym grow).
+        ramp_alpha = min(epoch / max(args.epochs - 1, 1), 1.0)
+        active_pixel_weight = args.pixel_weight  # constant
+        active_edge_weight = ramp_alpha * args.edge_weight
+        active_asym_edge_weight = ramp_alpha * args.asym_edge_weight
 
         model.train()
         epoch_loss = 0
@@ -1316,13 +1302,11 @@ def train(args):
             }
             if d_val is not None:
                 wb_log["train/prodigy_d"] = d_val
-            # Log active loss weights (shows phase transition)
-            if args.phase2_epoch > 0:
-                wb_log["loss_weights/pixel_weight"] = active_pixel_weight
-                wb_log["loss_weights/edge_weight"] = active_edge_weight
-                wb_log["loss_weights/asym_edge_weight"] = active_asym_edge_weight
-                wb_log["loss_weights/phase"] = 2 if in_phase2 else 1
-                wb_log["loss_weights/ramp_alpha"] = alpha if args.phase2_epoch > 0 else 0
+            # Log active loss weights (ramp progress)
+            wb_log["loss_weights/pixel_weight"] = active_pixel_weight
+            wb_log["loss_weights/edge_weight"] = active_edge_weight
+            wb_log["loss_weights/asym_edge_weight"] = active_asym_edge_weight
+            wb_log["loss_weights/ramp_alpha"] = ramp_alpha
             # Log skip connection scales
             if hasattr(model, 'skip_scales'):
                 for si, sc in enumerate(model.skip_scales):
