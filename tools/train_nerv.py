@@ -235,7 +235,7 @@ class HNeRVSimple(nn.Module):
                  enc_dim=16, fc_dim=170, reduce=1.2, lower_width=12,
                  grad_checkpoint=False, cond_ch=32, enc_blocks=1,
                  skip_connections=False, skip_scale_init=1.0,
-                 skip_stages=None):
+                 skip_stages=None, skip_dropout=0.0):
         super().__init__()
         self.height = height
         self.width = width
@@ -243,6 +243,7 @@ class HNeRVSimple(nn.Module):
         self.skip_connections = skip_connections
         self.skip_scale_init = skip_scale_init
         self.skip_stages = skip_stages  # None = all stages, else list of encoder stage indices to use
+        self.skip_dropout_p = skip_dropout
 
         total_enc = math.prod(enc_strides)
         total_dec = math.prod(dec_strides)
@@ -306,6 +307,8 @@ class HNeRVSimple(nn.Module):
             self.skip_projs = nn.ModuleList()
             # Learnable scale per skip connection (init near zero to prevent noise passthrough)
             self.skip_scales = nn.ParameterList()
+            # Dropout on skip path (regularizes against noise passthrough)
+            self.skip_dropout = nn.Dropout2d(p=skip_dropout) if skip_dropout > 0 else None
             # Which encoder stages to use for skips
             active_stages = set(skip_stages) if skip_stages is not None else set(range(n_stages))
             self._skip_active = []
@@ -381,6 +384,9 @@ class HNeRVSimple(nn.Module):
                             skip_feat, size=x.shape[-2:],
                             mode='bilinear', align_corners=False
                         )
+                    # Apply dropout to skip features (training only)
+                    if self.skip_dropout is not None:
+                        skip_feat = self.skip_dropout(skip_feat)
                     x = x + skip_scale * skip_feat
 
         out = torch.tanh(self.head(x)) * 0.5 + 0.5  # [0, 1] with steeper gradients
@@ -721,6 +727,7 @@ def train(args):
         skip_connections=args.skip_connections,
         skip_scale_init=args.skip_scale_init,
         skip_stages=skip_stages,
+        skip_dropout=args.skip_dropout,
     ).to(device)
 
     enc_p = model.encoder_params / 1e6
@@ -845,6 +852,7 @@ def train(args):
                 "skip_connections": args.skip_connections,
                 "skip_scale_init": args.skip_scale_init,
                 "skip_stages": args.skip_stages,
+                "skip_dropout": args.skip_dropout,
                 "data_dir": args.data_dir,
                 "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
                 "resumed_from_epoch": start_epoch if args.resume else 0,
@@ -1124,6 +1132,9 @@ def main():
     parser.add_argument("--skip-stages", default=None,
                         dest="skip_stages",
                         help="Comma-separated encoder stage indices for skip connections (0-based, default: all)")
+    parser.add_argument("--skip-dropout", type=float, default=0.0,
+                        dest="skip_dropout",
+                        help="Dropout2d probability on skip features (0.0=off, 0.3=moderate, 0.5=aggressive)")
     parser.add_argument("--loss", default="l1_freq",
                         choices=["l1", "l2", "l1_freq", "fusion6", "l1_ssim_freq", "fusion10_freq"],
                         help="Loss function (default: l1_freq = L1 + FFT frequency)")

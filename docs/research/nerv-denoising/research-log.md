@@ -137,6 +137,27 @@ Keep entries concise — 3-5 lines max. The detail is in the git diff and W&B ru
 - Match --epochs to actual expected epochs so cosine schedule lands properly
 - We need clear signal that this approach works. Sharp + denoised output is the goal.
 
+### Human guidance (2026-04-10 10:30) — Dropout on skip connections
+- **Add dropout on the skip path** (e.g., nn.Dropout2d(p=0.3) applied to skip features before adding to decoder)
+- At training time: randomly drops skip features, forcing the bottleneck to encode more info (bottleneck naturally denoises via compression)
+- At inference time: all features flow through (scaled), giving full sharpness
+- Try p=0.3 and p=0.5. Can combine with skip-scale-init.
+- This is a well-understood regularization approach — forces the model to not rely entirely on either path.
+
+### Exp24: U-Net skip connections (2026-04-10 08:22)
+- **Hypothesis**: Adding skip connections from encoder to decoder lets high-frequency detail bypass the bottleneck, breaking the 34.50 dB ceiling.
+- **Change**: Used --skip-connections flag (already implemented). Best config from exp22/23 + dec_blks 1,1,2,2,2. skip_scale=1.0 (no scaling).
+- **Result**: val_psnr=36.02 (PEAK at epoch 84), train_psnr=37.21, hf_ratio=0.72 at epoch 119, vram=5.8GB
+- **Verdict**: keep -- BREAKTHROUGH +1.5 dB and 3x hf_ratio
+- **Learning**: Skip connections are THE fix for the blurry bottleneck. However: (1) VRAM at 5.8GB is over limit, (2) model overfits badly in late epochs (val drops from 36.02 to 34.70), (3) residual shows structural content = noise memorization. Need: learnable skip scale, VRAM reduction, and/or skip only low-res stages.
+
+### Exp25: Learnable skip scale init=0.01 + smaller decoder (2026-04-10 08:50)
+- **Hypothesis**: Starting skip scale near zero forces the model to gradually learn how much encoder info to pass, preventing noise blowthrough. dec_blks=1,1,1,1,1 saves VRAM.
+- **Change**: Added --skip-scale-init 0.01 with nn.Parameter per skip. dec_blks=1,1,1,1,1 (from 1,1,2,2,2).
+- **Result**: val_psnr=34.94 (peak epoch 70), train_psnr=35.89, hf_ratio=0.605 at epoch 149, vram=5.1GB
+- **Verdict**: keep -- VRAM fixed, good hf_ratio (2.2x baseline), but peak PSNR only marginally above ceiling
+- **Learning**: 0.01 init is too conservative -- model can't pass enough detail early. The scale does help prevent overfitting (gap 3.58 dB vs exp24's 4.65 dB). Sweet spot is between 0.01 and 1.0. Try 0.1 next. Also try limiting skips to lower-res stages only.
+
 ### Exhausted directions (DO NOT re-try):
 - Encoder width, stride patterns, depth (all tested)
 - Loss functions: L1, L2, l1_freq, fusion6, SSIM (all tested)
