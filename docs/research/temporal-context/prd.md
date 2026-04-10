@@ -1175,6 +1175,43 @@ print("Memory estimate: ~13 GB peak, 48 GB available. SAFE at batch=128.")
 
 ---
 
+## 14.5 Insights from NeRV Denoising Experiments (2026-04-10)
+
+The NeRV exploration (`docs/research/nerv-denoising/`) ran 45+ experiments trying to use neural video representations for self-supervised denoising. While NeRV didn't produce usable denoised output, the experiments yielded insights relevant to temporal DRUNet:
+
+### Loss function insights
+- **Patch-level color preservation** (`F.avg_pool2d` 32x32 patch L1, weight 5.0) effectively prevents brightness/color shift without constraining per-pixel values. Consider adding this to DRUNet training.
+- **Asymmetric residual loss** (`relu(input - output)` for Sobel penalty) only penalizes removed detail, not added detail. Useful if we want the temporal model to enhance beyond its training targets.
+- **Edge preservation loss** (`relu(sobel(input) - sobel(output))`) at weight 0.5 maintains sharpness. Weight 5.0 produces artifacts.
+- **L1+FFT loss** is a strong regularizer — the FFT component prevents the model from ignoring high-frequency content. Don't remove it.
+
+### Architecture insights
+- **3x3 minimum kernel size** in all decoder blocks significantly improves quality (+3.3 dB in NeRV). Check if DRUNet's student could benefit from larger kernels in early layers.
+- **Skip connections with learnable scale** (init 0.1) let the model control how much encoder detail bypasses the bottleneck. Too much (scale 1.0) passes noise; too little (0.01) is blurry.
+- **Skip dropout 0.15-0.30** regularizes but kills high-frequency output. Only use if overfitting is severe.
+- **Stride alignment padding** (replicate-pad to stride-aligned dimensions) prevents edge artifacts. DRUNet already handles this but worth verifying for the 9-channel input.
+
+### Frame2Frame / temporal insights
+- **Adjacent frames as targets (Noise2Noise)** successfully prevents noise memorization in NeRV — the model can't memorize per-frame noise when the target has different noise. This validates the temporal DRUNet approach of using multiple frames.
+- **Motion between frames causes blur** if frames aren't aligned. The 9-channel DRUNet avoids this because it inputs raw frames (not aligned) and lets the network learn alignment internally.
+- **More frames = more temporal context = better** but only up to a point. 32 frames was better than 16, but 8 was worse (not enough diversity). The 3-frame window (prev + current + next) in this PRD is the minimum viable temporal context.
+
+### Autoresearch infrastructure
+The autoresearch agent loop (`docs/research/nerv-denoising/autoresearch.md`) worked well for rapid experimentation:
+- Agents run one experiment, write to a shared research log, then exit
+- Next agent reads the log and builds on previous findings
+- `results.tsv` tracks metrics across experiments
+- W&B provides visual comparison across runs
+- This infrastructure can be applied to DRUNet temporal context experiments
+
+### What NeRV couldn't do (and DRUNet can)
+- NeRV is self-supervised — no clean targets. DRUNet has SCUNet targets (53 dB teacher).
+- NeRV must fit one video clip per model. DRUNet generalizes across all content.
+- NeRV's bottleneck is too narrow to filter structured HEVC noise. DRUNet's U-Net architecture with skip connections is designed for this.
+- The 9-channel temporal DRUNet combines the best of both: temporal context (like NeRV) with supervised training on clean targets (like DRUNet).
+
+---
+
 ## 15. Risks & Mitigations
 
 ### 15.1 Frame Gap Problem (MEDIUM)
