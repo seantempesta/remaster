@@ -161,6 +161,30 @@ The sharpness term is NEGATIVE (we maximize it). Start with small weights and tu
 
 **Key insight from human**: "focusing on the residual (no lines/structure) AND increasing sharpness from the original" — these are complementary signals, not competing ones. Find the balance.
 
+### Human guidance (2026-04-10 15:30) — New validation metrics needed
+val_psnr measures distance from noisy input — but we WANT to differ from the noisy input. If the model enhances beyond the input, PSNR goes DOWN even though quality goes UP.
+
+**New metrics to add to training script and log:**
+1. **output_sharpness**: `sobel(output).abs().mean()` — higher = sharper
+2. **input_sharpness**: `sobel(input).abs().mean()` — reference
+3. **sharpness_ratio**: `output_sharpness / input_sharpness` — >1.0 = sharper than input (GOAL)
+4. **residual_flatness**: spectral flatness of `(input - output)` — higher = more noise-like residual
+5. **residual_edge_energy**: `sobel(input - output).abs().mean()` — lower = edges kept in output
+
+These should be logged in metrics.jsonl alongside PSNR so we can track them during training. The agent should add these to the validation loop in train_nerv.py.
+
+**Measure these in BOTH training and validation loops** so we can see the same metrics everywhere.
+
+### Human insight (2026-04-10 15:00) — More frames, not fewer + asymmetric residual loss
+Exp30 (8 frames) peaked at 33.3 dB — much worse than 16 frames (35+). Confirmed: MORE temporal context is better. The shared weights need diverse frames to learn the scene's visual vocabulary. Don't reduce frames.
+
+**The winning combination:**
+1. 16+ frames (temporal context)
+2. Skip connections with scale=0.1 (sharpness)
+3. Asymmetric residual loss: `relu(input - output)` for flatness/structure penalty — only penalize REMOVED content, not ADDED detail. This way the model can be sharper than the input without the loss fighting it.
+
+**Key: `relu(input - output)` instead of `(input - output)` for the residual-based losses.** This one change enables enhancement while still penalizing noise memorization.
+
 ### Human insight (2026-04-10 14:00) — Residual loss penalizes sharpness enhancement
 If output is sharper than input, `residual = input - output` has "anti-edges" (inverted structure). The flatness loss sees this as structure and penalizes it — but it's actually GOOD (enhancement).
 

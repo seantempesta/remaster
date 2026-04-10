@@ -440,8 +440,41 @@ def residual_flatness_loss(pred, target):
     return 1.0 - flatness
 
 
+def edge_preservation_loss(pred, target):
+    """Penalize output edges being weaker than input edges.
+
+    Uses Sobel filters to detect edges. relu(sobel(target) - sobel(pred))
+    only penalizes LOST edges, not added detail. This encourages the model
+    to preserve and enhance edges while removing inter-edge noise.
+    """
+    # Sobel filters
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=torch.float32, device=pred.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                           dtype=torch.float32, device=pred.device).view(1, 1, 3, 3)
+
+    # Convert to grayscale
+    pred_gray = (0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]).float()
+    target_gray = (0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]).float()
+
+    # Compute edge magnitudes
+    pred_edges = torch.sqrt(
+        F.conv2d(pred_gray, sobel_x, padding=1) ** 2 +
+        F.conv2d(pred_gray, sobel_y, padding=1) ** 2 + 1e-8
+    )
+    target_edges = torch.sqrt(
+        F.conv2d(target_gray, sobel_x, padding=1) ** 2 +
+        F.conv2d(target_gray, sobel_y, padding=1) ** 2 + 1e-8
+    )
+
+    # Only penalize edges that are WEAKER in output than input
+    # (allows enhancement, penalizes blurring)
+    edge_loss = F.relu(target_edges - pred_edges).mean()
+    return edge_loss
+
+
 def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
-                 residual_flatness_weight=0.0):
+                 residual_flatness_weight=0.0, edge_weight=0.0):
     """Compute training loss.
 
     l1_freq: L1 pixel loss + FFT frequency loss. pixel_weight controls balance.
@@ -450,6 +483,7 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
 
     residual_flatness_weight: if > 0, adds residual spectral flatness loss
     that penalizes non-noise structure in (target - pred).
+    edge_weight: if > 0, adds edge preservation loss that penalizes blurred edges.
     """
     if loss_type == "l1":
         return F.l1_loss(pred, target)
@@ -468,6 +502,8 @@ def compute_loss(pred, target, loss_type="l1_freq", pixel_weight=10.0,
         total = pixel_weight * l1 + freq_loss
         if residual_flatness_weight > 0:
             total = total + residual_flatness_weight * residual_flatness_loss(pred, target)
+        if edge_weight > 0:
+            total = total + edge_weight * edge_preservation_loss(pred, target)
         return total
     elif loss_type == "fusion6":
         # Reference HNeRV loss: 0.7*L1 + 0.3*(1-SSIM)
@@ -885,6 +921,7 @@ def train(args):
                 "loss": args.loss,
                 "pixel_weight": args.pixel_weight,
                 "residual_flatness_weight": args.residual_flatness_weight,
+                "edge_weight": args.edge_weight,
                 "dec_blks": list(dec_blks),
                 "skip_connections": args.skip_connections,
                 "skip_scale_init": args.skip_scale_init,
@@ -963,7 +1000,7 @@ def train(args):
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(batch_img, norm_idx=batch_norm_idx)
                 loss = compute_loss(output, batch_img, args.loss, args.pixel_weight,
-                                    args.residual_flatness_weight)
+                                    args.residual_flatness_weight, args.edge_weight)
 
                 if args.late_layer_decay > 0:
                     reg = 0
@@ -1184,6 +1221,9 @@ def main():
     parser.add_argument("--residual-flatness-weight", type=float, default=0.0,
                         dest="residual_flatness_weight",
                         help="Weight for residual spectral flatness loss (0=off, try 0.1-1.0)")
+    parser.add_argument("--edge-weight", type=float, default=0.0,
+                        dest="edge_weight",
+                        help="Weight for edge preservation loss (0=off, try 1.0-10.0)")
 
     # Optimizer
     parser.add_argument("--optimizer", default="prodigy", choices=["adam", "prodigy"],
