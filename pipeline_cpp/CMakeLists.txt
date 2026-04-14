@@ -132,6 +132,10 @@ find_library(AVUTIL_LIB avutil
     PATHS ${FFMPEG_SEARCH_PATHS}
     PATH_SUFFIXES lib lib64 lib/x64 lib/x86_64-linux-gnu
 )
+find_library(SWSCALE_LIB swscale
+    PATHS ${FFMPEG_SEARCH_PATHS}
+    PATH_SUFFIXES lib lib64 lib/x64 lib/x86_64-linux-gnu
+)
 
 if(NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIB)
     message(FATAL_ERROR
@@ -141,6 +145,9 @@ endif()
 
 message(STATUS "FFmpeg include: ${FFMPEG_INCLUDE_DIR}")
 message(STATUS "FFmpeg libs:    ${AVFORMAT_LIB} ${AVCODEC_LIB} ${AVUTIL_LIB}")
+if(SWSCALE_LIB)
+    message(STATUS "FFmpeg swscale: ${SWSCALE_LIB}")
+endif()
 
 # ---------------------------------------------------------------------------
 # Video SDK sources (NvDecoder, NvEncoder are not header-only)
@@ -162,6 +169,7 @@ set(VIDEO_SDK_SOURCES
 add_executable(remaster_pipeline
     main.cpp
     trt_inference.cpp
+    sw_decoder.cpp
     color_kernels.cu
     ${VIDEO_SDK_SOURCES}
 )
@@ -193,6 +201,7 @@ target_link_libraries(remaster_pipeline PRIVATE
     ${AVFORMAT_LIB}
     ${AVCODEC_LIB}
     ${AVUTIL_LIB}
+    $<$<BOOL:${SWSCALE_LIB}>:${SWSCALE_LIB}>
 )
 
 # Platform-specific linking

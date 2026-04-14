@@ -1,8 +1,12 @@
-// main.cpp -- GPU-only video enhancement pipeline
+// main.cpp -- GPU video enhancement pipeline
 //
-// NVDEC decode -> CUDA color convert -> TensorRT inference -> CUDA color convert -> NVENC encode
+// Decode -> CUDA color convert -> TensorRT inference -> CUDA color convert -> NVENC encode
 //
-// All frames stay on the GPU. No Python, no VapourSynth, no stdio pipes.
+// Decoding: NVDEC hardware by default, automatic fallback to FFmpeg software decode
+// for codecs/profiles NVDEC doesn't support (e.g., H264 High 10-bit on RTX 3060).
+// Use --sw-decode to force software decode.
+//
+// All processed frames stay on the GPU. No Python, no VapourSynth, no stdio pipes.
 // Output is a proper MKV container with audio/subtitle passthrough.
 
 #include <cuda.h>
@@ -23,6 +27,7 @@
 
 // Our modules
 #include "simple_demuxer.h"
+#include "sw_decoder.h"
 #include "trt_inference.h"
 #include "color_kernels.h"
 #include "mkv_muxer.h"
@@ -42,6 +47,7 @@ struct PipelineConfig {
     std::string preset = "p4"; // NVENC preset (SDK 10+: p1-p7, p1=fastest, p7=best quality)
     bool tenBit      = true;   // 10-bit HEVC output (matches source quality)
     bool noAudio     = false;  // skip audio/subtitle passthrough
+    bool swDecode    = false;  // force FFmpeg software decode (skip NVDEC)
 };
 
 static void printUsage() {
@@ -56,6 +62,7 @@ static void printUsage() {
         << "  --preset         NVENC preset: p1-p7 (p1=fastest, p7=best quality, default: p4)\n"
         << "  --10bit          Output 10-bit HEVC\n"
         << "  --no-audio       Skip audio/subtitle passthrough\n"
+        << "  --sw-decode      Force FFmpeg software decode (skip NVDEC)\n"
         << "  --help   / -h    Show this message\n"
         << std::endl;
 }
@@ -75,6 +82,7 @@ static bool parseArgs(int argc, char** argv, PipelineConfig& cfg) {
         else if (arg == "--preset" && i+1 < argc)                   cfg.preset = argv[++i];
         else if (arg == "--10bit")                                   cfg.tenBit = true;
         else if (arg == "--no-audio")                                cfg.noAudio = true;
+        else if (arg == "--sw-decode")                              cfg.swDecode = true;
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage();
@@ -174,7 +182,7 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Open input with SimpleDemuxer + NVDEC decoder
+    // 2. Open input with SimpleDemuxer + decoder (NVDEC or software fallback)
     // -----------------------------------------------------------------------
     SimpleDemuxer demuxer(cfg.inputPath.c_str());
     if (!demuxer.IsValid()) {
@@ -194,9 +202,25 @@ int main(int argc, char** argv) {
         fps = 24000.0 / 1001.0;
     }
 
+    // Get codec name for display
+    const char* codecName = "unknown";
+    switch (demuxer.GetVideoCodec()) {
+        case AV_CODEC_ID_HEVC: codecName = "HEVC"; break;
+        case AV_CODEC_ID_H264: codecName = "H264"; break;
+        case AV_CODEC_ID_VP9:  codecName = "VP9";  break;
+        case AV_CODEC_ID_VP8:  codecName = "VP8";  break;
+        case AV_CODEC_ID_AV1:  codecName = "AV1";  break;
+        case AV_CODEC_ID_MPEG2VIDEO: codecName = "MPEG2"; break;
+        case AV_CODEC_ID_MPEG4: codecName = "MPEG4"; break;
+        default: {
+            const AVCodecDescriptor* desc = avcodec_descriptor_get(demuxer.GetVideoCodec());
+            if (desc) codecName = desc->name;
+            break;
+        }
+    }
+
     std::cerr << "Input: " << srcWidth << "x" << srcHeight
-              << " " << bitDepth << "-bit "
-              << (demuxer.GetVideoCodec() == AV_CODEC_ID_HEVC ? "HEVC" : "H264")
+              << " " << bitDepth << "-bit " << codecName
               << " @ " << fps << " fps"
               << std::endl;
 
@@ -212,9 +236,66 @@ int main(int argc, char** argv) {
                   << nSubStreams << " subtitle stream(s)" << std::endl;
     }
 
-    NvDecoder dec(cuContext, srcWidth, srcHeight, true,
-                  FFmpeg2NvCodecId(demuxer.GetVideoCodec()),
-                  nullptr, false, true);
+    // Try NVDEC first, fall back to software decode if unsupported.
+    // The --sw-decode flag forces software decode (useful for testing/debugging).
+    bool useSwDecoder = cfg.swDecode;
+    std::unique_ptr<NvDecoder> nvDec;
+    std::unique_ptr<SwDecoder> swDec;
+
+    if (!useSwDecoder) {
+        // Check if NVDEC supports this codec + bit depth combination
+        cudaVideoCodec nvCodec = FFmpeg2NvCodecId(demuxer.GetVideoCodec());
+        if (nvCodec == cudaVideoCodec_NumCodecs) {
+            // FFmpeg codec has no NVDEC equivalent (e.g., AV1 on older GPUs, obscure codecs)
+            fprintf(stderr, "Decoder: %s has no NVDEC mapping, using software decode\n", codecName);
+            useSwDecoder = true;
+        } else {
+            // Proactively check NVDEC capabilities before construction
+            CUVIDDECODECAPS caps = {};
+            caps.eCodecType = nvCodec;
+            caps.eChromaFormat = cudaVideoChromaFormat_420;
+            caps.nBitDepthMinus8 = (bitDepth > 8) ? (bitDepth - 8) : 0;
+
+            CUresult capResult = cuvidGetDecoderCaps(&caps);
+            if (capResult != CUDA_SUCCESS || !caps.bIsSupported) {
+                fprintf(stderr, "Decoder: NVDEC does not support %s %d-bit on this GPU, "
+                        "using software decode\n", codecName, bitDepth);
+                useSwDecoder = true;
+            } else {
+                // NVDEC reports support, try to construct the decoder
+                try {
+                    nvDec = std::make_unique<NvDecoder>(
+                        cuContext, srcWidth, srcHeight, true,
+                        nvCodec, nullptr, false, true);
+                    fprintf(stderr, "Decoder: NVDEC hardware\n");
+                } catch (const NVDECException& ex) {
+                    fprintf(stderr, "Decoder: NVDEC init failed (%s), using software decode\n",
+                            ex.what());
+                    useSwDecoder = true;
+                }
+            }
+        }
+    }
+
+    if (useSwDecoder) {
+        AVStream* videoStream = demuxer.GetStream(demuxer.GetVideoStreamIndex());
+        swDec = std::make_unique<SwDecoder>(videoStream->codecpar);
+        if (!swDec->IsValid()) {
+            std::cerr << "Failed to initialize software decoder" << std::endl;
+            return 1;
+        }
+        // Software decoder determines actual bit depth from the codec
+        is10bit = swDec->Is10Bit();
+        if (cfg.swDecode) {
+            fprintf(stderr, "Decoder: FFmpeg software (forced via --sw-decode)\n");
+        }
+    }
+
+    // Unified accessors for decoder pitch
+    auto getDecoderPitch = [&]() -> int {
+        if (nvDec) return nvDec->GetDeviceFramePitch();
+        return swDec->GetDeviceFramePitch();
+    };
 
     // -----------------------------------------------------------------------
     // 3. Load TensorRT engine
@@ -438,7 +519,7 @@ int main(int argc, char** argv) {
             encodePendingFrame();
 
             // -- Color convert: NV12/P010 -> planar RGB FP16 --
-            int decPitch = dec.GetDeviceFramePitch();
+            int decPitch = getDecoderPitch();
             cudaEventRecord(evStart, inferStream);
             if (is10bit) {
                 launchP010ToRgbFp16(
@@ -511,9 +592,13 @@ int main(int argc, char** argv) {
         if (!gotPacket) break;
 
         if (streamIdx == demuxer.GetVideoStreamIndex()) {
-            // Video packet -> NVDEC decoder
+            // Video packet -> decoder (NVDEC or software)
             auto decodeStart = std::chrono::high_resolution_clock::now();
-            dec.Decode(pVideo, nVideoBytes, &ppFrame, &nFrameReturned);
+            if (nvDec) {
+                nvDec->Decode(pVideo, nVideoBytes, &ppFrame, &nFrameReturned);
+            } else {
+                swDec->Decode(pVideo, nVideoBytes, &ppFrame, &nFrameReturned);
+            }
             auto decodeEnd = std::chrono::high_resolution_clock::now();
             totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
 
@@ -534,7 +619,11 @@ int main(int argc, char** argv) {
     // Flush decoder: send empty packet to get buffered frames
     {
         auto decodeStart = std::chrono::high_resolution_clock::now();
-        dec.Decode(nullptr, 0, &ppFrame, &nFrameReturned);
+        if (nvDec) {
+            nvDec->Decode(nullptr, 0, &ppFrame, &nFrameReturned);
+        } else {
+            swDec->Decode(nullptr, 0, &ppFrame, &nFrameReturned);
+        }
         auto decodeEnd = std::chrono::high_resolution_clock::now();
         totalDecodeMs += std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
     }
@@ -589,7 +678,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "\n--- Per-stage timing breakdown (%d frames) ---\n", nFrameDecoded);
         fprintf(stderr, "  Demux (CPU):          %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
                 totalDemuxMs,  totalDemuxMs / nFrameDecoded,  100.0*totalDemuxMs/wallMs);
-        fprintf(stderr, "  Decode (NVDEC+CPU):   %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+        fprintf(stderr, "  Decode (%s):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
+                nvDec ? "NVDEC+CPU" : "SW+upload",
                 totalDecodeMs, totalDecodeMs / nFrameDecoded, 100.0*totalDecodeMs/wallMs);
         fprintf(stderr, "  CSC NV12->RGB (GPU):  %8.1f ms total  %6.3f ms/frame  %5.1f%%\n",
                 totalCsc1Ms,   totalCsc1Ms / nFrameDecoded,   100.0*totalCsc1Ms/wallMs);

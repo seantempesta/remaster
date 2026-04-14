@@ -1,6 +1,8 @@
-# remaster_pipeline -- GPU-Only Video Enhancement
+# remaster_pipeline -- GPU Video Enhancement
 
-Native C++ pipeline: NVDEC decode -> CUDA color convert -> TensorRT inference -> CUDA color convert -> NVENC encode. All frames stay on the GPU -- no CPU round-trips, no Python, no VapourSynth, no stdio pipes.
+Native C++ pipeline: Decode -> CUDA color convert -> TensorRT inference -> CUDA color convert -> NVENC encode. All processed frames stay on the GPU -- no Python, no VapourSynth, no stdio pipes.
+
+Decoding uses NVDEC hardware by default, with automatic fallback to FFmpeg software decode for codecs/profiles NVDEC doesn't support (e.g., H264 High 10-bit on RTX 3060, AV1 on older GPUs, or any format FFmpeg can handle).
 
 ## Architecture
 
@@ -8,12 +10,14 @@ Native C++ pipeline: NVDEC decode -> CUDA color convert -> TensorRT inference ->
 Input Video (MKV/MP4)
     |
     v
-FFmpegDemuxer (container parsing, CPU)
+SimpleDemuxer (FFmpeg container parsing, CPU)
     |
     v  compressed packets
-NvDecoder (NVDEC hardware decode -> GPU NV12/P010)
+NvDecoder (NVDEC hardware)  -or-  SwDecoder (FFmpeg software + GPU upload)
+    |                               |
+    +-------------------------------+
     |
-    v  GPU surface
+    v  GPU surface (NV12 or P010)
 CUDA kernel: NV12/P010 -> Planar RGB FP16 [0,1] (BT.709)
     |
     v  GPU tensor (1x3xHxW fp16)
@@ -26,8 +30,14 @@ CUDA kernel: Planar RGB FP16 -> NV12/P010 (BT.709)
 NvEncoderCuda (NVENC hardware encode -> HEVC)
     |
     v  compressed packets
-Output file (raw HEVC bitstream)
+MkvMuxer (MKV output with audio/subtitle passthrough)
 ```
+
+The decoder selection is automatic:
+1. Check `cuvidGetDecoderCaps` for NVDEC support of the codec + bit depth
+2. If supported, use NVDEC (zero-copy GPU decode, highest throughput)
+3. If not, fall back to FFmpeg software decode (CPU decode + pinned memory upload to GPU)
+4. Use `--sw-decode` to force software decode for testing/debugging
 
 ## Prerequisites
 
@@ -100,6 +110,8 @@ ffmpeg -i episode_enhanced.hevc -i episode.mkv -map 0:v -map 1:a -c copy output.
 | `--cq` | 24 | NVENC constant quality (lower = better, 0-51) |
 | `--preset` | p4 | NVENC preset (p1=fastest .. p7=best quality) |
 | `--10bit` | off | Output 10-bit HEVC |
+| `--no-audio` | off | Skip audio/subtitle passthrough |
+| `--sw-decode` | off | Force FFmpeg software decode (skip NVDEC) |
 
 ## Performance Notes
 
@@ -113,8 +125,12 @@ ffmpeg -i episode_enhanced.hevc -i episode.mkv -map 0:v -map 1:a -c copy output.
 ```
 pipeline_cpp/
   CMakeLists.txt        Build system
-  main.cpp              Pipeline orchestration, CLI, progress reporting
+  main.cpp              Pipeline orchestration, CLI, decoder selection, progress reporting
+  sw_decoder.h/cpp      FFmpeg software decode fallback (planar YUV -> NV12/P010 -> GPU upload)
+  simple_demuxer.h      FFmpeg demuxer (container parsing, BSF filtering)
   trt_inference.h/cpp   TensorRT engine loader and inference wrapper
   color_kernels.h/cu    CUDA kernels for NV12/P010 <-> RGB FP16 conversion
+  mkv_muxer.h           MKV container muxer with audio/subtitle passthrough
+  async_writer.h        Thread-safe async packet writer for MKV muxing
   README.md             This file
 ```
