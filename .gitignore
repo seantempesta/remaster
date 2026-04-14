@@ -1,4 +1,5 @@
 # Data files — too large for git
+data
 data/
 *.mp4
 *.mkv
