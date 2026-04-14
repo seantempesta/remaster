@@ -10,10 +10,11 @@ import numpy as np
 import cv2
 from pathlib import Path
 
-FFMPEG = "C:/Users/sean/src/upscale-experiment/bin/ffmpeg.exe"
-ORIGINAL = "E:/plex/tv/Firefly (2002) Season 1 S01 (1080p BluRay x265 HEVC 10bit AAC Silence)/Firefly (2002) - S01E04 - Shindig (1080p BluRay x265 Silence).mkv"
-REMASTERED = "C:/Users/sean/src/upscale-experiment/data/archive/Firefly_S01E04_student_remaster.mkv"
-ASSETS = Path("C:/Users/sean/src/upscale-experiment/assets")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FFMPEG = str(PROJECT_ROOT / "bin" / "ffmpeg.exe")
+ORIGINAL = os.environ.get("REMASTER_ORIGINAL", "input_original.mkv")
+REMASTERED = os.environ.get("REMASTER_REMASTERED", "input_remastered.mkv")
+ASSETS = PROJECT_ROOT / "assets"
 ASSETS.mkdir(exist_ok=True)
 
 # Timestamps to scan (MM:SS format) - extended range for better content

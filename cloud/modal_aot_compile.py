@@ -7,7 +7,8 @@ but packaged as a C-callable .so file that libtorch or a custom VapourSynth
 plugin can load directly.
 
 Usage:
-  PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_aot_compile.py
+  modal run cloud/modal_aot_compile.py
+  # Windows: prefix with PYTHONUTF8=1 if you get encoding errors
 """
 import modal
 import time

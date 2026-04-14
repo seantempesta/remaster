@@ -28,7 +28,7 @@ Both models are **DRUNet (UNetRes)** -- pure Conv+ReLU residual U-Nets with no a
 | **Architecture** | nc=[16,32,64,128] nb=2 | nc=[64,128,256,512] nb=4 |
 | **Quality (PSNR)** | 49.98 dB | 53.27 dB |
 | **Sharpness** | ~100% of original | 107% of original |
-| **Speed (RTX 3060)** | 39 fps NVEncC / 52 fps TRT FP16 / 55 fps TRT INT8 | ~5 fps |
+| **Speed (RTX 3060)** | 57 fps C++ pipeline / 63 fps TRT FP16 / 64 fps TRT INT8 | ~5 fps |
 | **VRAM** | ~500 MB | ~2 GB |
 | **Checkpoint size** | 4 MB | 125 MB |
 | **Use case** | Deployment / real-time | Quality reference / training |

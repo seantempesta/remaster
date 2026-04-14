@@ -1,57 +1,18 @@
-[submodule "reference-code/SCUNet"]
-	path = reference-code/SCUNet
-	url = https://github.com/cszn/SCUNet.git
 [submodule "reference-code/KAIR"]
 	path = reference-code/KAIR
 	url = https://github.com/cszn/KAIR.git
-[submodule "reference-code/autoresearch"]
-	path = reference-code/autoresearch
-	url = https://github.com/karpathy/autoresearch.git
+[submodule "reference-code/SCUNet"]
+	path = reference-code/SCUNet
+	url = https://github.com/cszn/SCUNet.git
 [submodule "reference-code/DISTS"]
 	path = reference-code/DISTS
 	url = https://github.com/dingkeyan93/DISTS.git
-[submodule "reference-code/vapoursynth"]
-	path = reference-code/vapoursynth
-	url = https://github.com/vapoursynth/vapoursynth.git
-[submodule "reference-code/vs-mlrt"]
-	path = reference-code/vs-mlrt
-	url = https://github.com/AmusementClub/vs-mlrt.git
-[submodule "reference-code/bestsource"]
-	path = reference-code/bestsource
-	url = https://github.com/vapoursynth/bestsource.git
-[submodule "reference-code/TensorRT"]
-	path = reference-code/TensorRT
-	url = https://github.com/NVIDIA/TensorRT.git
-[submodule "reference-code/prodigy"]
-	path = reference-code/prodigy
-	url = https://github.com/konstmish/prodigy.git
 [submodule "reference-code/NVEnc"]
 	path = reference-code/NVEnc
 	url = https://github.com/rigaya/NVEnc
-[submodule "reference-code/VFX-SDK-Samples"]
-	path = reference-code/VFX-SDK-Samples
-	url = https://github.com/NVIDIA-Maxine/VFX-SDK-Samples.git
-[submodule "reference-code/TensorRT-RTX"]
-	path = reference-code/TensorRT-RTX
-	url = https://github.com/NVIDIA/TensorRT-RTX.git
-[submodule "reference-code/ConvNeXt-V2"]
-	path = reference-code/ConvNeXt-V2
-	url = https://github.com/facebookresearch/ConvNeXt-V2
-[submodule "reference-code/ConvNeXt"]
-	path = reference-code/ConvNeXt
-	url = https://github.com/facebookresearch/ConvNeXt
-[submodule "reference-code/FFNeRV"]
-	path = reference-code/FFNeRV
-	url = https://github.com/maincold2/FFNeRV
-[submodule "reference-code/Boosting-NeRV"]
-	path = reference-code/Boosting-NeRV
-	url = https://github.com/Xinjie-Q/Boosting-NeRV
-[submodule "reference-code/HiNeRV"]
-	path = reference-code/HiNeRV
-	url = https://github.com/hmkx/HiNeRV.git
-[submodule "reference-code/PNVC"]
-	path = reference-code/PNVC
-	url = https://github.com/ge1-gao/PNVC.git
-[submodule "reference-code/Upscale-A-Video"]
-	path = reference-code/Upscale-A-Video
-	url = https://github.com/sczhou/Upscale-A-Video.git
+[submodule "reference-code/vs-mlrt"]
+	path = reference-code/vs-mlrt
+	url = https://github.com/AmusementClub/vs-mlrt.git
+[submodule "reference-code/video-sdk-samples"]
+	path = reference-code/video-sdk-samples
+	url = https://github.com/NVIDIA/video-sdk-samples.git

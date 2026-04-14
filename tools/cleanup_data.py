@@ -14,7 +14,7 @@ import os
 import shutil
 import argparse
 
-DATA = "data"  # symlink to E:/upscale-data/
+DATA = "data"
 
 
 # --- Files/dirs to KEEP in place (active training data) ---

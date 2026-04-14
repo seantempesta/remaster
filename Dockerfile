@@ -1,55 +1,69 @@
-# Remaster — GPU video enhancement pipeline
+# Remaster -- GPU video enhancement pipeline
 #
-# Runs the full pipeline in a Linux container with native CUDA + Triton support:
-#   VapourSynth + libtorch (AOT Inductor) + ffmpeg NVENC
+# Removes compression artifacts and recovers detail from 1080p video at 50+ fps.
+# Uses TensorRT inference via a C++ zero-copy pipeline (NVDEC -> TRT -> NVENC).
 #
-# Build:  docker compose build
-# Run:    docker compose run remaster encode input.mkv output.mkv
-# Shell:  docker compose run remaster bash
+# Build:  docker build -t remaster .
+# Run:    docker run --gpus all -v /path/to/videos:/data remaster /data/input.mkv /data/output.mkv
+# Shell:  docker run --gpus all -it --entrypoint bash remaster
+#
+# Requires: NVIDIA Container Toolkit (--gpus all), Linux host with NVIDIA driver 550+
 
-FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
+# =============================================================================
+# Stage 1: Build the C++ pipeline
+# =============================================================================
+FROM nvcr.io/nvidia/tensorrt:26.03-py3 AS builder
 
-# Avoid interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-
-# System dependencies
+# FFmpeg dev libs (muxer/demuxer) + ninja for fast builds
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-dev python3.10-venv python3-pip \
-    git cmake ninja-build pkg-config \
-    ffmpeg \
-    libxxhash-dev zlib1g-dev libbz2-dev liblzma-dev libssl-dev \
-    curl wget \
+        libavformat-dev libavcodec-dev libavutil-dev \
+        ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.10 the default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+WORKDIR /src
 
-# PyTorch + Triton (for torch.compile / AOT Inductor)
-RUN pip install --no-cache-dir \
-    torch==2.11.0 torchvision \
-    --extra-index-url https://download.pytorch.org/whl/cu126
+# Copy only what's needed for the C++ build (ordered by change frequency)
+COPY reference-code/video-sdk-samples/Samples/NvCodec/ /src/reference-code/video-sdk-samples/Samples/NvCodec/
+COPY reference-code/video-sdk-samples/Samples/Utils/   /src/reference-code/video-sdk-samples/Samples/Utils/
+COPY pipeline_cpp/ /src/pipeline_cpp/
 
-# Build tools for AOT Inductor and custom plugins
-ENV CUDA_HOME=/usr/local/cuda
-ENV PATH="${CUDA_HOME}/bin:${PATH}"
+# Build with broad GPU architecture support
+RUN cmake -G Ninja -B /src/pipeline_cpp/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -S /src/pipeline_cpp \
+    && cmake --build /src/pipeline_cpp/build --config Release -j$(nproc)
 
-# Working directory
+# =============================================================================
+# Stage 2: Runtime image
+# =============================================================================
+FROM nvcr.io/nvidia/tensorrt:26.03-py3
+
+# Request NVDEC + NVENC driver libraries from the NVIDIA Container Toolkit
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# FFmpeg runtime libs (muxer/demuxer for the C++ pipeline) + ffprobe for resolution detection
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libavformat60 libavcodec60 libavutil58 \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy project code (lib/ and remaster/ scripts)
-COPY lib/ /app/lib/
-COPY remaster/ /app/remaster/
-COPY reference-code/vs-mlrt/scripts/vsmlrt.py /app/reference-code/vs-mlrt/scripts/vsmlrt.py
+# Copy the compiled binary
+COPY --from=builder /src/pipeline_cpp/build/remaster_pipeline /app/bin/remaster_pipeline
 
-# Copy checkpoints (model weights + ONNX)
-# These are large — use .dockerignore to exclude unnecessary files
-COPY checkpoints/nafnet_w32_mid4/nafnet_best.pth /app/checkpoints/nafnet_w32_mid4/nafnet_best.pth
+# Copy the pre-exported ONNX model (2 MB, resolution-agnostic)
+COPY checkpoints/drunet_student/drunet_student.onnx /app/model/drunet_student.onnx
 
-# Verify CUDA + PyTorch
-RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
+# Entrypoint script
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
 
-# Entry point
-COPY remaster/encode.py /app/remaster/encode.py
-ENTRYPOINT ["python", "remaster/encode.py"]
+# Engine cache directory (mount a volume here for persistence across runs)
+RUN mkdir -p /app/engines
+
+# trtexec is pre-installed in the NGC container
+ENV PATH="/opt/tensorrt/bin:${PATH}"
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -52,39 +52,43 @@ SEED = 42
 # --- Source definitions ---
 # Each source: source videos -> proportional frame extraction
 # Pattern filtering excludes processed files (_nafnet, _gpu, _v2, _v3, etc.)
+#
+# Configure MEDIA_DIR environment variable to point to your video library.
+# Example: export MEDIA_DIR=/path/to/media
+# Sources below use relative paths under MEDIA_DIR.
+
+MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", "media"))
 
 SOURCES = {
     "firefly": {
-        "source_dir": r"E:\plex\tv\Firefly (2002) Season 1 S01 (1080p BluRay x265 HEVC 10bit AAC Silence)",
+        "source_dir": str(MEDIA_DIR / "Firefly-S01"),
         "pattern": "*.mkv",
         "exclude_pattern": r"_(nafnet|gpu|v\d|raw)\.",
         "prefix": "firefly",
     },
     "expanse": {
-        "source_dir": r"E:\plex\tv\The Expanse Season 2  [1080p Bluray x265 q22 S96 Joy]",
+        "source_dir": str(MEDIA_DIR / "Expanse-S02"),
         "pattern": "*.mkv",
         "prefix": "expanse",
     },
     "onepiece": {
-        "source_dir": r"E:\plex\tv\One.Piece.2023.S01.COMPLETE.1080p.NF.WEB-DL.DD5.1.Atmos.H.264-playWEB[TGx]",
+        "source_dir": str(MEDIA_DIR / "OnePiece-S01"),
         "pattern": "*.mkv",
         "prefix": "onepiece",
     },
     "dune2": {
-        "files": [r"E:\plex\movies\Dune.Part.Two.2024.1080p.WEBRip.x265.10bit.AAC-[YTS.MX].mp4"],
+        "source_dir": str(MEDIA_DIR / "movies"),
+        "pattern": "Dune*Part*Two*.mp4",
         "prefix": "dune2",
     },
     "squidgame": {
-        "source_dir": r"E:\plex\tv\Squid Game - Season 2",
+        "source_dir": str(MEDIA_DIR / "SquidGame-S02"),
         "pattern": "*.mkv",
         "prefix": "squidgame",
     },
     "foundation": {
-        "files": [
-            r"E:\plex\tv\foundation.s03e01.1080p.web.h264-successfulcrab[EZTVx.to].mkv",
-            r"E:\plex\tv\Foundation.S03E02.1080p.WEB.h264-ETHEL[EZTVx.to].mkv",
-            r"E:\plex\tv\foundation.s03e04.1080p.web.h264-successfulcrab[EZTVx.to].mkv",
-        ],
+        "source_dir": str(MEDIA_DIR / "Foundation-S03"),
+        "pattern": "*.mkv",
         "prefix": "foundation",
     },
 }

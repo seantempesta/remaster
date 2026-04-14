@@ -15,7 +15,7 @@ Edge-aware degradation:
 Usage:
     # Extract from a directory of episodes
     python tools/extract_synthetic_pairs.py \\
-        --source-dir "E:/plex/tv/Show Name" --pattern "*.mkv" \\
+        --source-dir "/path/to/Show Name" --pattern "*.mkv" \\
         --name synth_showname \\
         --output-dir data/mixed_pairs --val-dir data/mixed_val \\
         --num-frames 400 --num-val 40
@@ -29,7 +29,7 @@ Usage:
 
     # Test mode (10 pairs from first 2 episodes)
     python tools/extract_synthetic_pairs.py \\
-        --source-dir "E:/plex/tv/Show" --pattern "*.mkv" \\
+        --source-dir "/path/to/Show" --pattern "*.mkv" \\
         --name synth_show --output-dir data/test_pairs --test
 """
 import sys

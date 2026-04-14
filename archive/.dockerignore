@@ -1,0 +1,25 @@
+# Ignore everything by default, explicitly include what we need
+*
+
+# Include project code
+!lib/
+!remaster/
+!reference-code/vs-mlrt/scripts/vsmlrt.py
+
+# Include model weights (only the ones we need)
+!checkpoints/nafnet_w32_mid4/nafnet_best.pth
+!checkpoints/nafnet_w32_mid4/*.onnx
+
+# Exclude large/unnecessary files
+tools/
+data/
+*.mkv
+*.mp4
+*.avi
+__pycache__/
+*.pyc
+.git/
+reference-code/vapoursynth/
+reference-code/TensorRT/
+reference-code/torch-tensorrt/
+reference-code/TensorRT-Model-Optimizer/

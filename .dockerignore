@@ -1,25 +1,18 @@
-# Ignore everything by default, explicitly include what we need
+# Exclude everything by default, then whitelist what we need
 *
 
-# Include project code
-!lib/
-!remaster/
-!reference-code/vs-mlrt/scripts/vsmlrt.py
+# C++ pipeline source
+!pipeline_cpp/
+pipeline_cpp/build/
 
-# Include model weights (only the ones we need)
-!checkpoints/nafnet_w32_mid4/nafnet_best.pth
-!checkpoints/nafnet_w32_mid4/*.onnx
+# Video SDK sources (NVDEC decoder + NVENC encoder)
+!reference-code/video-sdk-samples/Samples/NvCodec/
+!reference-code/video-sdk-samples/Samples/Utils/
 
-# Exclude large/unnecessary files
-tools/
-data/
-*.mkv
-*.mp4
-*.avi
-__pycache__/
-*.pyc
-.git/
-reference-code/vapoursynth/
-reference-code/TensorRT/
-reference-code/torch-tensorrt/
-reference-code/TensorRT-Model-Optimizer/
+# Pre-exported ONNX model
+!checkpoints/drunet_student/drunet_student.onnx
+
+# Docker files
+!Dockerfile
+!docker-entrypoint.sh
+!docker-compose.yml

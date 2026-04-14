@@ -4,7 +4,7 @@ Clones NAFNet if needed, downloads SIDD-width64 checkpoint, runs both
 models on frames from data/frames_mid_1080p/, and compares quality + speed.
 
 Usage:
-    conda activate upscale
+    conda activate remaster
     python bench/bench_nafnet.py [--frames N] [--skip-scunet]
 """
 import sys

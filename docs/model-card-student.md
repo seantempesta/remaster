@@ -31,7 +31,7 @@ model-index:
 
 # Remaster DRUNet Student -- Real-Time Video Enhancement
 
-A tiny 1.06M parameter neural network that removes compression artifacts AND recovers detail from 1080p video at 39 fps on an RTX 3060. Distilled from a 32.6M parameter teacher model via knowledge distillation with feature matching.
+A tiny 1.06M parameter neural network that removes compression artifacts AND recovers detail from 1080p video at 57 fps on an RTX 3060. Distilled from a 32.6M parameter teacher model via knowledge distillation with feature matching.
 
 ## Model Details
 
@@ -60,17 +60,18 @@ Channel progression through encoder levels: 16 -> 32 -> 64 -> 128. Downsampling 
 |--------|-------|
 | **PSNR** | 49.98 dB (vs SCUNet GAN + USM targets) |
 | **Sharpness** | ~100% of original |
-| **Speed (FP16, RTX 3060)** | 39 fps (NVEncC pipeline) |
-| **Speed (TRT FP16)** | 52 fps (raw inference) |
-| **Speed (TRT INT8)** | 55+ fps (raw inference) |
+| **Speed (C++ pipeline, RTX 3060)** | 56 fps FP16, 57 fps INT8 |
+| **Speed (TRT FP16, inference only)** | 63 fps (15.8ms GPU) |
+| **Speed (TRT INT8, inference only)** | 64 fps (15.5ms GPU) |
 | **VRAM** | ~500 MB |
-| **Episode (44 min, 1080p)** | 28 minutes |
+| **Episode (44 min, 1080p)** | ~19 minutes |
 
 ### Encoding Speeds
 
 | Pipeline | FPS | Notes |
 |----------|-----|-------|
-| NVEncC + VapourSynth | 39 fps | Recommended, in-process encoder |
+| C++ pipeline (NVDEC+TRT+NVENC) | 57 fps | Fastest, zero-copy GPU |
+| NVEncC + VapourSynth | 39 fps | In-process encoder |
 | Python streaming (torch.compile) | 24 fps | Pure Python, no VapourSynth needed |
 | VapourSynth + ffmpeg pipe | 20 fps | Wider compatibility |
 

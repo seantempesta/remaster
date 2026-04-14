@@ -13,8 +13,8 @@ Logs per-epoch metrics for noise-fit curve analysis:
 Saves checkpoints at intervals for post-hoc analysis of the denoising sweet spot.
 
 Usage:
-  python tools/train_nerv.py --data-dir E:/upscale-data/nerv-test/clip_02 --epochs 300
-  python tools/train_nerv.py --data-dir E:/upscale-data/nerv-test/clip_02 --epochs 300 --model-size 0.75
+  python tools/train_nerv.py --data-dir data/nerv-test/clip_02 --epochs 300
+  python tools/train_nerv.py --data-dir data/nerv-test/clip_02 --epochs 300 --model-size 0.75
 """
 import argparse
 import gc

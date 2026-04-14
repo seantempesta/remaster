@@ -7,7 +7,7 @@ A video remastering pipeline that removes compression artifacts AND recovers det
 | Model | Params | PSNR | Speed (RTX 3060) | Checkpoint |
 |-------|--------|------|-------------------|------------|
 | **DRUNet Teacher** | 32.6M | 53.27 dB | ~5 fps | `checkpoints/drunet_teacher/best.pth` (125MB) |
-| **DRUNet Student** | 1.06M | 49.19 dB | 43 fps FP16, 44 fps INT8 mixed (C++ pipeline) | `checkpoints/drunet_student/final.pth` (4MB) |
+| **DRUNet Student** | 1.06M | 49.19 dB | 56 fps FP16, 57 fps INT8 mixed (C++ pipeline) | `checkpoints/drunet_student/final.pth` (4MB) |
 
 Both are DRUNet (UNetRes from KAIR, MIT license). Same architecture, different sizes:
 - Teacher: nc=[64,128,256,512] nb=4 -- quality ceiling
@@ -31,7 +31,7 @@ the quality of the original Bluray source material.
 ## Architecture
 - **Local inference** runs on Windows with conda env `remaster` (Python 3.12, PyTorch 2.11.0+cu130, CUDA 13.2)
 - **Cloud training** uses [Modal](https://modal.com) for GPU compute — CLI authenticated, account with billing attached
-- **C++ pipeline** (`pipeline_cpp/`) — NVDEC -> TRT -> NVENC zero-copy, 43-44 fps end-to-end
+- **C++ pipeline** (`pipeline_cpp/`) — NVDEC -> TRT -> NVENC zero-copy, 56-57 fps end-to-end
 - **Streaming pipeline** reads video -> processes frames -> writes video (no intermediate files)
 - All scripts are standalone Python — no framework dependencies beyond PyTorch
 
@@ -49,7 +49,7 @@ the quality of the original Bluray source material.
 - `checkpoints/` — active model weights (teacher + student)
 - `checkpoints/_archive/` — old models (NAFNet, PlainNet, v1 DRUNet)
 - `output/` — training artifacts synced from Modal, local validation images
-- `data/` — symlink to E:/upscale-data/ (training pairs, synthetic pairs, clips)
+- `data/` — symlink to external storage (training pairs, synthetic pairs, clips)
 - `remaster/` — production VapourSynth pipeline (encode, playback)
 - `playback/` — mpv + vs-mlrt real-time playback
 - `pipelines/` — older Python streaming pipelines (archive)
@@ -86,30 +86,19 @@ the quality of the original Bluray source material.
 - `tools/export_onnx.py` — Export DRUNet to ONNX (dynamic shapes)
 - `tools/build_int8_engine.py` — INT8 TRT engine with proper calibration from real frames
 - `tools/build_int8_calibration.py` — Generate calibration data from originals
-- `pipeline_cpp/` — C++ NVDEC->TRT->NVENC zero-copy pipeline (44 fps, 10-bit HEVC, audio passthrough)
+- `pipeline_cpp/` — C++ NVDEC->TRT->NVENC zero-copy pipeline (57 fps, 10-bit HEVC, audio passthrough)
 - `bench/compare.py` — PSNR/SSIM metrics and side-by-side comparison
 
 ## Reference Code Submodules (`reference-code/`)
-- `SCUNet/` — Swin-Conv-UNet denoiser (current best approach, patched: thop try/except)
-- `RAFT/` — optical flow estimation
-- `NAFNet/` — NAFNet architecture reference (pretrained weights)
-- `DISTS/` — Deep Image Structure and Texture Similarity (perceptual loss, patched: modern torchvision API)
-- `Video-Depth-Anything/` — temporally consistent depth maps (patched: xformers->SDPA)
-- `sam3/` — SAM 3 (Segment Anything with Concepts) - semantic segmentation (explored, not used for denoising)
-- `dinov3/` — DINOv3 self-supervised vision features (ConvNeXt + ViT, explored for feature matching)
-- `NVEnc/` — NVEncC NVENC encoder with VapourSynth --vpy support (source for reference)
-- `FlashVSR/`, `FlashVSR-Pro/`, `BasicVSR_PlusPlus/` — video SR references
-- `ECBSR/` — Edge-oriented Conv Block SR (reparameterizable training, mobile-first)
-- `SPAN/` — NTIRE 2024 efficient SR winner (reparameterizable Conv3XC, EMA training)
-- `XLSR/` — Quantization-designed SR (Clipped ReLU for INT8, QAT recipe)
-- `KAIR/` — image restoration toolkit reference
-- `vapoursynth/` — VapourSynth core (C++ frame processing runtime)
+- `KAIR/` — DRUNet/UNetRes architecture (MIT license, essential for model definition)
+- `SCUNet/` — Swin-Conv-UNet denoiser (training target generation)
+- `DISTS/` — Deep Image Structure and Texture Similarity (perceptual loss)
+- `video-sdk-samples/` — NVIDIA Video Codec SDK (NVDEC decoder for C++ pipeline)
+- `NVEnc/` — NVEncC NVENC encoder with VapourSynth --vpy support
 - `vs-mlrt/` — ML inference plugin for VapourSynth (TensorRT, ONNX Runtime backends)
-- `bestsource/` — Frame-accurate video source filter for VapourSynth (FFmpeg-based)
-- `Upscale-A-Video/` — Diffusion-based video SR with temporal consistency (CVPR 2024, NTU S-Lab). **Potential alternative to SCUNet for generating high-quality training targets for DRUNet.** Slow (diffusion = iterative) but potentially higher quality than SCUNet GAN. Has flow-guided temporal propagation for frame consistency. Run on Modal with large GPU for target generation, not real-time.
 
 ## Data Directory
-`data/` is a symlink to `E:/upscale-data/` (exFAT storage drive). Git-ignored due to size. Checkpoints remain on C: at `checkpoints/` for fast Modal upload.
+`data/` is a symlink to an external storage drive for large training data. Git-ignored due to size. Checkpoints remain at `checkpoints/` for fast Modal upload.
 
 ```
 data/
@@ -142,7 +131,7 @@ Training data sources (proportional sampling, 1 frame per 500 source frames):
 
 See `docs/research/training-data/plan.md` for details. Built by `tools/build_training_data.py`.
 
-## Current Status (2026-04-08)
+## Current Status (2026-04-14)
 
 ### Architecture
 - **DRUNet** (UNetRes from KAIR, MIT license): Conv+ReLU residual U-Net, 4 levels, no BN/LayerNorm/attention
@@ -197,7 +186,7 @@ tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
     --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw \
     --useCudaGraph --saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine
 
-# C++ pipeline (~43 fps FP16, ~44 fps INT8 mixed, 10-bit HEVC, audio passthrough)
+# C++ pipeline (~56 fps FP16, ~57 fps INT8 mixed, 10-bit HEVC, audio passthrough)
 pipeline_cpp/build/remaster_pipeline.exe \
     -i input.mkv -o output.mkv \
     -e checkpoints/drunet_student/drunet_student_1080p_fp16.engine --cq 20
@@ -222,7 +211,7 @@ python pipelines/remaster.py -i input.mkv -c checkpoints/drunet_student/final.pt
 python tools/build_int8_engine.py
 
 # Quality: 67.2 dB vs FP32 (was 42.7 dB without mixed precision)
-# Speed: 44.2 fps C++ pipeline (vs 42.9 fps FP16)
+# Speed: 57.2 fps C++ pipeline (vs 55.7 fps FP16)
 ```
 
 ### ONNX Export Gotcha
@@ -245,18 +234,18 @@ Current approach: exclude Add ops from INT8 via `op_types_to_exclude=["Add"]`. T
 2. **Recurrent temporal context** -- 9-channel input (prev_cleaned + current + next_noisy). PRD at `docs/research/temporal-context/prd.md`. Expected: +0.3-0.8 dB PSNR + temporal consistency
 3. **dynamo=True ONNX export** -- Untested with TRT 10.16 + strongly typed. May work now (opset 18/20 support improved). Would eliminate the legacy TorchScript dependency.
 
-### Verified Results (2026-04-08)
+### Verified Results (2026-04-14)
 - **Teacher**: 13K iters, PSNR 53.27 dB, 107% sharpness, near-perfect color
 - **Student**: Fine-tuned with full-frame (5K iters, crop_size=0), PSNR 49.98 dB, 1.06M params
-- **C++ pipeline FP16**: ~42 fps end-to-end, 10-bit HEVC MKV, audio passthrough, CUDA graphs
-- **C++ pipeline INT8 mixed**: ~44 fps end-to-end, 67.2 dB quality (legacy builder)
-- **TRT FP16 (strongly typed)**: 42.6 fps trtexec (19.5ms GPU), 68.0 dB vs PyTorch FP32
-- **TRT INT8 mixed (legacy)**: 43.3 fps trtexec (19.2ms GPU), 67.2 dB vs PyTorch FP32
+- **C++ pipeline FP16**: ~56 fps end-to-end, 10-bit HEVC MKV, audio passthrough, CUDA graphs
+- **C++ pipeline INT8 mixed**: ~57 fps end-to-end, 67.2 dB quality (legacy builder)
+- **TRT FP16 (strongly typed)**: 50.7 fps trtexec (15.8ms GPU), 68.0 dB vs PyTorch FP32
+- **TRT INT8 mixed (legacy)**: 51.4 fps trtexec (15.5ms GPU), 67.2 dB vs PyTorch FP32
 - **TRT INT8 pure (ModelOpt Q/DQ)**: 39 fps trtexec (17.9ms GPU), 26.1 dB (Add ops need FP16)
 - **NVEncC pipeline**: 39 fps with audio, VapourSynth in-process
-- **Bottleneck**: TRT inference (~20ms/frame = 50 fps theoretical). NVDEC (500+ fps) and NVENC (200+ fps) are fully hidden via async I/O on separate CUDA streams. The profiler shows 22ms "decode time" but this includes waiting for the previous frame's GPU work — it is NOT an NVDEC bottleneck. Pipeline achieves 42 fps due to ~3ms sync/CPU overhead per frame.
-- **Full episodes**: Firefly S01E05 (~42 min @ ~42 fps = ~24 min encode)
-- **Environment**: Python 3.12, PyTorch 2.11+cu130, CUDA 13.2, TRT 10.16.0, VS R73
+- **Bottleneck**: TRT inference (~16ms/frame = 63 fps theoretical). NVDEC (500+ fps) and NVENC (200+ fps) are fully hidden via async I/O on separate CUDA streams. Pipeline achieves 56-57 fps with ~0.6ms/frame sync/CPU overhead.
+- **Full episodes**: Firefly S01E05 (~42 min @ ~57 fps = ~18 min encode)
+- **Environment**: Python 3.12, PyTorch 2.11+cu130, CUDA 13.2, TRT 10.16.0, VS R73, Driver 595.97
 - **Build tools**: VS Build Tools 2022, CUDA 13.2, CMake 3.31, TRT 10.16 headers
 - **Test suite**: 6/6 pass (FP32/FP16 precision, TRT FP16/INT8, color roundtrip, ONNX)
 - **ModelOpt**: 0.42.0 installed, Polygraphy 0.49.26. Requires cuDNN on PATH (torch/lib/ fix in build_engine.py)
@@ -289,7 +278,7 @@ Project: `remaster` (entity: `seantempesta`). All training runs log to W&B autom
 
 **NEVER run parallel engine builds or calibration** — each TRT build + calibration loads 200 frames (~1.5GB) plus engine builder VRAM. Two parallel builds will use 6+GB RAM and freeze the laptop. Always build/test engines SEQUENTIALLY, one at a time.
 
-**Windows + Modal:** Never use `conda run -n remaster modal run ...` — breaks with UnicodeEncodeError. Use: `PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/remaster/python.exe -m modal run cloud/script.py`. Also applies to `modal volume get` (prints checkmarks that crash on cp1252) — always prefix with `PYTHONUTF8=1`.
+**Windows + Modal:** Never use `conda run -n remaster modal run ...` — breaks with UnicodeEncodeError. Use: `PYTHONUTF8=1 python -m modal run cloud/script.py` (with the remaster conda env activated). Also applies to `modal volume get` (prints checkmarks that crash on cp1252) — always prefix with `PYTHONUTF8=1`.
 
 **Modal Volume paths:** `batch_upload.put_file(local, remote)` — remote is volume-relative (e.g., `/input/file.mp4`). Container access uses mount prefix (`/mnt/data/input/file.mp4`). Must call `vol.reload()` inside container functions before reading uploaded files.
 

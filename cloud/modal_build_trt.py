@@ -6,7 +6,8 @@ during compilation (needs 5.3 GB workspace). We compile on a larger GPU with
 the same SM 8.6 architecture, then download the engine to run locally.
 
 Usage:
-  PYTHONUTF8=1 C:/Users/sean/miniconda3/envs/upscale/python.exe -m modal run cloud/modal_build_trt.py
+  modal run cloud/modal_build_trt.py
+  # Windows: prefix with PYTHONUTF8=1 if you get encoding errors
 
 The engine file will be saved to checkpoints/nafnet_w32_mid4/engines/
 """

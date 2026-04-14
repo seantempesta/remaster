@@ -28,10 +28,10 @@ def find_source_videos():
     """Find original source videos (the actual content we remaster)."""
     videos = []
 
-    # Plex library - the real source material
-    plex_dir = Path("E:/plex/tv")
-    if plex_dir.exists():
-        for mkv in plex_dir.rglob("*.mkv"):
+    # Media library - set MEDIA_DIR env var to your video library
+    media_dir = Path(os.environ.get("MEDIA_DIR", "media"))
+    if media_dir.exists():
+        for mkv in media_dir.rglob("*.mkv"):
             # Skip any remastered/processed versions
             name = mkv.stem.lower()
             if any(skip in name for skip in ["_gpu", "_nafnet", "_student", "_teacher", "remaster", ".raw"]):

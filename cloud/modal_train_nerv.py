@@ -230,7 +230,7 @@ def train_nerv(
 @app.local_entrypoint()
 def main(
     # Data
-    data_dir: str = "E:/upscale-data/nerv-test/micro_gop_01",
+    data_dir: str = "data/nerv-test/micro_gop_01",
     remote_dir: str = "/nerv-data/micro_gop_01",
     skip_upload: bool = False,
     # GPU

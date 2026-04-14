@@ -10,8 +10,9 @@ import numpy as np
 import cv2
 import av
 
-ARCHIVE = "C:/Users/sean/src/upscale-experiment/data/archive"
-ASSETS = "C:/Users/sean/src/upscale-experiment/assets"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ARCHIVE = os.path.join(PROJECT_ROOT, "data", "archive")
+ASSETS = os.path.join(PROJECT_ROOT, "assets")
 
 # Clip pairs: (original, remastered, label)
 CLIPS = [
