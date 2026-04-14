@@ -131,9 +131,9 @@ What it does:
 - **Recovers real detail** — fine texture and edges that were destroyed by lossy encoding
 - **Preserves everything else** — colors, brightness, contrast, grain, artistic look
 
-The model was trained on paired frames: original compressed video as input, with carefully denoised and sharpened versions as targets. It learns to undo specific compression damage, not to "enhance" or "improve" content subjectively.
+The model was trained on paired frames: original compressed video as input, with carefully denoised and sharpened versions as targets. It learns to undo specific compression damage, not to "enhance" or "improve" content subjectively. It cannot shift colors, change exposure, or add content that wasn't there.
 
-Per-frame color and brightness transfer ensures the output always matches the input's visual characteristics. The model can only remove artifacts and sharpen — it cannot shift colors, change exposure, or add content that wasn't there.
+If you notice any unusual color or brightness shifts on specific content, you can enable per-frame color transfer with `--color-transfer`, which forces the output to match the input's color characteristics exactly.
 
 ## How It Works
 

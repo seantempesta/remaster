@@ -96,6 +96,7 @@ Options (passed to the C++ pipeline):
   --cq N          Constant quality (0-51, lower=better, default: 24)
   --preset pN     NVENC preset p1-p7 (default: p4)
   --no-audio      Skip audio/subtitle passthrough
+  --color-transfer  Match output color/brightness to input (for color shifts)
 
 Examples:
   remaster /data/episode.mkv /data/enhanced/episode.mkv

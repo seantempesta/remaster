@@ -49,7 +49,7 @@ struct PipelineConfig {
     bool tenBit      = true;   // 10-bit HEVC output (matches source quality)
     bool noAudio     = false;  // skip audio/subtitle passthrough
     bool swDecode    = false;  // force FFmpeg software decode (skip NVDEC)
-    bool noColorXfer = false;  // disable per-frame color/brightness transfer
+    bool colorXfer   = false;  // enable per-frame color/brightness transfer
 };
 
 static void printUsage() {
@@ -65,7 +65,7 @@ static void printUsage() {
         << "  --10bit          Output 10-bit HEVC\n"
         << "  --no-audio       Skip audio/subtitle passthrough\n"
         << "  --sw-decode      Force FFmpeg software decode (skip NVDEC)\n"
-        << "  --no-color-transfer  Disable per-frame color/brightness matching\n"
+        << "  --color-transfer     Enable per-frame color/brightness matching\n"
         << "  --help   / -h    Show this message\n"
         << std::endl;
 }
@@ -86,7 +86,7 @@ static bool parseArgs(int argc, char** argv, PipelineConfig& cfg) {
         else if (arg == "--10bit")                                   cfg.tenBit = true;
         else if (arg == "--no-audio")                                cfg.noAudio = true;
         else if (arg == "--sw-decode")                              cfg.swDecode = true;
-        else if (arg == "--no-color-transfer")                     cfg.noColorXfer = true;
+        else if (arg == "--color-transfer")                        cfg.colorXfer = true;
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage();
@@ -431,7 +431,7 @@ int main(int argc, char** argv) {
     float* colorWorkspace = nullptr;
     float* inputStatsDevice = nullptr;
     float* outputStatsDevice = nullptr;
-    bool useColorTransfer = !cfg.noColorXfer;
+    bool useColorTransfer = cfg.colorXfer;
     if (useColorTransfer) {
         cudaMalloc(&colorWorkspace, 1024 * 6 * sizeof(float));
         cudaMalloc(&inputStatsDevice, 6 * sizeof(float));
