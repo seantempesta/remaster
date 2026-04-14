@@ -81,3 +81,4 @@ calibration_data.bin
 # C++ build artifacts
 pipeline_cpp/build/
 pipeline_cpp/*.bat
+.obsidian/
