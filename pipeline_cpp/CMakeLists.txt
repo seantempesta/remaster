@@ -171,6 +171,7 @@ add_executable(remaster_pipeline
     trt_inference.cpp
     sw_decoder.cpp
     color_kernels.cu
+    color_transfer.cu
     ${VIDEO_SDK_SOURCES}
 )
 

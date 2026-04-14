@@ -30,6 +30,7 @@
 #include "sw_decoder.h"
 #include "trt_inference.h"
 #include "color_kernels.h"
+#include "color_transfer.h"
 #include "mkv_muxer.h"
 #include "async_writer.h"
 
@@ -48,6 +49,7 @@ struct PipelineConfig {
     bool tenBit      = true;   // 10-bit HEVC output (matches source quality)
     bool noAudio     = false;  // skip audio/subtitle passthrough
     bool swDecode    = false;  // force FFmpeg software decode (skip NVDEC)
+    bool noColorXfer = false;  // disable per-frame color/brightness transfer
 };
 
 static void printUsage() {
@@ -63,6 +65,7 @@ static void printUsage() {
         << "  --10bit          Output 10-bit HEVC\n"
         << "  --no-audio       Skip audio/subtitle passthrough\n"
         << "  --sw-decode      Force FFmpeg software decode (skip NVDEC)\n"
+        << "  --no-color-transfer  Disable per-frame color/brightness matching\n"
         << "  --help   / -h    Show this message\n"
         << std::endl;
 }
@@ -83,6 +86,7 @@ static bool parseArgs(int argc, char** argv, PipelineConfig& cfg) {
         else if (arg == "--10bit")                                   cfg.tenBit = true;
         else if (arg == "--no-audio")                                cfg.noAudio = true;
         else if (arg == "--sw-decode")                              cfg.swDecode = true;
+        else if (arg == "--no-color-transfer")                     cfg.noColorXfer = true;
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage();
@@ -419,6 +423,23 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
+    // 6b. Color transfer workspace (fully async, no host sync)
+    // -----------------------------------------------------------------------
+    // Workspace: 1024 blocks * 6 partial sums = 6144 floats for reduction
+    // Stats buffers: 2 * 6 floats on device (input stats + output stats)
+    // All operations stay on the GPU -- transfer kernel reads stats from device memory.
+    float* colorWorkspace = nullptr;
+    float* inputStatsDevice = nullptr;
+    float* outputStatsDevice = nullptr;
+    bool useColorTransfer = !cfg.noColorXfer;
+    if (useColorTransfer) {
+        cudaMalloc(&colorWorkspace, 1024 * 6 * sizeof(float));
+        cudaMalloc(&inputStatsDevice, 6 * sizeof(float));
+        cudaMalloc(&outputStatsDevice, 6 * sizeof(float));
+        std::cerr << "Color transfer: enabled (preserves input color/brightness)" << std::endl;
+    }
+
+    // -----------------------------------------------------------------------
     // 7. Pipeline loop
     // -----------------------------------------------------------------------
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -536,11 +557,29 @@ int main(int argc, char** argv) {
             }
             cudaEventRecord(evAfterCsc1, inferStream);
 
+            // -- Color transfer: capture input stats before inference (async) --
+            if (useColorTransfer) {
+                launchComputeChannelStats(
+                    buf.rgbIn, srcWidth, srcHeight, padW, padH,
+                    inputStatsDevice, colorWorkspace, inferStream);
+            }
+
             // -- TRT inference (with CUDA graph capture for launch overhead reduction) --
             if (!trt.inferWithGraph(buf.rgbIn, buf.rgbOut, inferStream, bufIdx)) {
                 std::cerr << "\nInference failed at frame " << nFrameDecoded << std::endl;
                 return;
             }
+
+            // -- Color transfer: match output color/brightness to input (async) --
+            if (useColorTransfer) {
+                launchComputeChannelStats(
+                    buf.rgbOut, srcWidth, srcHeight, padW, padH,
+                    outputStatsDevice, colorWorkspace, inferStream);
+                launchApplyColorTransfer(
+                    buf.rgbOut, srcWidth, srcHeight, padW, padH,
+                    inputStatsDevice, outputStatsDevice, inferStream);
+            }
+
             cudaEventRecord(evAfterInfer, inferStream);
 
             // -- Color convert: planar RGB FP16 -> NV12/P010 for encoder --
@@ -717,6 +756,11 @@ int main(int argc, char** argv) {
     cudaEventDestroy(prevEvAfterInfer);
     cudaEventDestroy(prevEvAfterCsc2);
     cudaEventDestroy(pendingDoneEvent);
+
+    // Free color transfer buffers
+    if (colorWorkspace) cudaFree(colorWorkspace);
+    if (inputStatsDevice) cudaFree(inputStatsDevice);
+    if (outputStatsDevice) cudaFree(outputStatsDevice);
 
     // Free pipeline buffers
     for (int i = 0; i < NUM_BUFFERS; i++) {

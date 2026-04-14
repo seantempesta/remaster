@@ -25,6 +25,10 @@ The model is tiny (4 MB, 1M parameters) and runs entirely on the GPU. Everything
 
 Scales linearly with GPU power. A desktop RTX 4090 would be ~4x faster.
 
+![GPU utilization during 4K processing](assets/gpu_utilization_4k.png)
+
+*Processing 4K HDR on an RTX 3060 laptop (6GB VRAM): 95% GPU utilization, all three hardware engines (CUDA, NVDEC, NVENC) running simultaneously, 4.6 GB used. Fits with room to spare.*
+
 ## Quick Start
 
 Requires an NVIDIA GPU and [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows or Linux).
@@ -118,19 +122,44 @@ Measured on RTX 3060 Laptop GPU (6GB VRAM). All pipelines process 1080p 10-bit H
 | NVEncC + VapourSynth | 39 | For VapourSynth users. |
 | Python + torch.compile | 24 | No TensorRT needed. Pure Python. |
 
+## Not AI Slop
+
+Remaster is **not** an AI upscaler, denoiser filter, or content generator. It doesn't hallucinate detail, add fake sharpening halos, or reimagine what a frame "should" look like. It doesn't change the artistic intent of the content.
+
+What it does:
+- **Removes compression artifacts** — banding, blocking, mosquito noise, ringing
+- **Recovers real detail** — fine texture and edges that were destroyed by lossy encoding
+- **Preserves everything else** — colors, brightness, contrast, grain, artistic look
+
+The model was trained on paired frames: original compressed video as input, with carefully denoised and sharpened versions as targets. It learns to undo specific compression damage, not to "enhance" or "improve" content subjectively.
+
+Per-frame color and brightness transfer ensures the output always matches the input's visual characteristics. The model can only remove artifacts and sharpen — it cannot shift colors, change exposure, or add content that wasn't there.
+
 ## How It Works
 
-A neural network (pure Conv+ReLU, no attention) learns to reverse compression damage by training on thousands of paired frames: original compressed video frames as input, with high-quality denoised and sharpened frames as targets. The 4 MB model runs through NVIDIA TensorRT with CUDA graph capture for minimal launch overhead.
+A neural network (pure Conv+ReLU, no attention) learns to reverse compression damage by training on thousands of paired frames: original compressed video as input, high-quality denoised and sharpened frames as targets. The 4 MB model runs through NVIDIA TensorRT with CUDA graph capture for minimal launch overhead.
 
 The full pipeline runs entirely on the GPU with zero CPU round-trips:
 
 ```
 Input Video --> NVDEC (hardware decode) --> CUDA color convert
-  --> TensorRT inference --> CUDA color convert
-  --> NVENC (hardware encode) --> Output MKV
+  --> Capture input color stats
+  --> TensorRT inference (artifact removal + detail recovery)
+  --> Transfer input color/brightness to output
+  --> CUDA color convert --> NVENC (hardware encode) --> Output MKV
 ```
 
 For details on the model architecture, training process, and research notes, see the [technical documentation](docs/architecture.md).
+
+## Current Limitations
+
+- **SDR only** — the pipeline uses BT.709 color space. HDR content (Dolby Vision, HDR10, BT.2020) will process but colors may shift. The color transfer step mitigates this but proper HDR support is planned.
+- **Trained on 1080p** — the model works at any resolution (720p through 4K) but was trained on 1080p HEVC content. Quality improvements are most visible on compressed 1080p sources. High-bitrate 4K sources may show subtler improvements.
+- **Dark scene brightness** — some dark scenes can shift slightly in brightness. The per-frame color transfer helps, but isn't perfect. More training data with dark scenes would improve this.
+- **Residual noise** — the model removes most compression noise but some fine noise remains, particularly in flat gradients. More training pairs and GPU time would help.
+- **Sharpening ceiling** — detail recovery is limited by what information survives compression. Heavily compressed sources (low bitrate streaming) benefit most; high-quality BluRay sources show less dramatic improvement.
+
+This project was built on ~$200 of cloud GPU time. The model could get significantly better with more training data and compute. Contributions of GPU time are welcome — see the [architecture doc](docs/architecture.md) for training details.
 
 ## Documentation
 
