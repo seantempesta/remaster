@@ -241,7 +241,7 @@ python pipelines/remaster.py -i input.mkv -c checkpoints/drunet_student/final.pt
 ### Remaster Library Status (what's been processed)
 Source library lives at `E:/plex/tv/`. Remastered outputs:
 - **24 S02E01** — DONE 2026-05-25 (`E:/plex/tv/24_S02E01_remastered.mkv`, 3.8GB). 8-bit H.264 source. (Only episode of 24 in the library.)
-- **Galaxy Quest (1999)** — processing 2026-08-04 -> `E:/plex/movies/Galaxy Quest ... BONE (AI Remastered).mkv`. 1920x816 HEVC 8-bit BluRay, 102 min. ~55 fps via a purpose-built 1920x816 FP16 engine (~45 min encode). Audio + both subtitle tracks passed through.
+- **Galaxy Quest (1999)** — DONE 2026-08-04 (`E:/plex/movies/Galaxy Quest ... BONE (AI Remastered).mkv`, 4.0GB). 1920x816 HEVC 8-bit BluRay, 102 min. 146,877 frames at 46.8 fps = 52 min (would be ~55 fps on an idle GPU; playback was running concurrently). Purpose-built 1920x816 FP16 engine. Audio + both subtitle tracks preserved, duration matches source exactly.
 - **Rome S01E01-E03** — processing 2026-06-20 via NVEncC -> `E:/plex/tv/Rome (2005) Remastered/Season 1/`. HEVC 10-bit BluRay source under the `Rome (2005) Season 1-2 ... afm72` folder. E04+ were still downloading at the time. Launched via `run_rome.sh` (sequential, one at a time).
 
 Note: full-resolution remastered episodes are large (~3-4GB each) — they live on E:, not committed.
@@ -341,6 +341,8 @@ Project: `remaster` (entity: `seantempesta`). All training runs log to W&B autom
 **ONNX export (PyTorch 2.11):** Must use `dynamo=False` — the default dynamo exporter produces opset 20 IR that TRT miscompiles (14.5 dB). Legacy TorchScript exporter (opset 17) works correctly. Also, dynamo saves weights as external `.data` files that must be merged inline. See `tools/export_onnx.py`.
 
 **vs-mlrt `core.trt.Model` clip precision MUST match the engine input dtype.** The FP16 engine is built with `--inputIOFormats=fp16:chw`, so `encode_nvencc.vpy` must feed the clip as `vs.RGBH` (16-bit half), NOT `vs.RGBS` (32-bit float) — otherwise it fails at runtime with `vapoursynth.Error: operator (): bits per sample mismatch`. (An FP32/INT8-with-fp32-IO engine would want `RGBS`.) This is independent of source bit depth — the resize to RGB happens before inference. Fixed in `encode_nvencc.vpy` 2026-06-20; 2026-08-04 the format is derived from the engine's IO precision in `remaster/vs_remaster.py` (`engine_format()`), so swapping engines can't reintroduce it.
+
+**NVEncC `--seek` is silently ignored with `--vpy` input** (`--frames` works). Every "seek to 20:00 and encode 300 frames" spot-check actually encodes from frame 0 — which on a lot of releases is a black lead-in, so the output looks catastrophically broken (pure black, tiny bitrate) when nothing is wrong. To spot-check a mid-film segment, trim inside the script: `clip = core.std.Trim(clip, first=28800, length=300)`. Verified 2026-08-04.
 
 **Source bit depth:** 8-bit H.264 (e.g. DSNP WEB-DL) and 10-bit HEVC BluRay both work — the vpy converts to RGB float before inference, so the model is bit-depth agnostic. NVEncC re-encodes to 10-bit HEVC (`main10`) regardless. Caveat still applies: RTX 3060 NVDEC cannot decode **H.264 High 10** (10-bit AVC) — those need software decode or an HEVC source.
 
