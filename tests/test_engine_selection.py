@@ -64,6 +64,32 @@ def test_resolve_engine_prefers_native_resolution(vsr, monkeypatch, tmp_path):
         "drunet_student_1920x816_fp16.engine"
 
 
+def test_resolve_engine_finds_engine_rounded_up_to_multiple_of_8(vsr, monkeypatch,
+                                                                 tmp_path):
+    """A 1920x802 source is served by a 1920x808 engine.
+
+    Engines can only be built on multiples of 8, so tools/build_trt_engine.py
+    rounds up. If resolution here searched for the raw 802 it would never match
+    what was built, rebuild forever, and quietly pad up to 1080p instead.
+    """
+    monkeypatch.delenv("REMASTER_ENGINE", raising=False)
+    monkeypatch.setattr(vsr, "ENGINE_DIR", str(tmp_path))
+    (tmp_path / "drunet_student_1920x808_fp16.engine").touch()
+
+    assert Path(vsr.resolve_engine(1920, 802)).name == \
+        "drunet_student_1920x808_fp16.engine"
+
+
+def test_resolve_engine_rounding_matches_the_builder(vsr):
+    """The two must agree, or built engines are never found again."""
+    sys.path.insert(0, str(PROJECT_ROOT / "tools"))
+    import build_trt_engine
+
+    for w, h in [(1920, 802), (1920, 816), (1280, 715), (3840, 2160), (1920, 1080)]:
+        assert (vsr.round_up(w), vsr.round_up(h)) == \
+            (build_trt_engine.round_up(w), build_trt_engine.round_up(h))
+
+
 def test_resolve_engine_falls_back_when_no_native_engine(vsr, monkeypatch, tmp_path):
     monkeypatch.delenv("REMASTER_ENGINE", raising=False)
     monkeypatch.setattr(vsr, "ENGINE_DIR", str(tmp_path))

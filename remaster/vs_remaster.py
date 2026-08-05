@@ -23,6 +23,13 @@ ENGINE_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "drunet_student")
 # Built before the {W}x{H} convention existed; still the padding fallback.
 LEGACY_1080P = "drunet_student_1080p_fp16.engine"
 
+# DRUNet downsamples 3 times, so engine dimensions are always a multiple of 8.
+PAD_FACTOR = 8
+
+
+def round_up(n, factor=PAD_FACTOR):
+    return -(-n // factor) * factor
+
 
 def engine_shape(engine_path):
     """(width, height) the engine was built for, parsed from its filename."""
@@ -60,7 +67,13 @@ def resolve_engine(width, height):
     if override:
         return override
 
-    native = os.path.join(ENGINE_DIR, f"drunet_student_{width}x{height}_fp16.engine")
+    # An engine for this source is built at the source size rounded up to a
+    # multiple of 8, so look for that -- not the raw size. A 1920x802 source
+    # gets a 1920x808 engine, and searching for "1920x802" would never find it
+    # and would silently fall back to padding all the way up to 1080p.
+    native = os.path.join(
+        ENGINE_DIR,
+        f"drunet_student_{round_up(width)}x{round_up(height)}_fp16.engine")
     if os.path.exists(native):
         return native
     return os.path.join(ENGINE_DIR, LEGACY_1080P)

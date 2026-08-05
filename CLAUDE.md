@@ -185,7 +185,12 @@ prebuilt `drunet_student_1080p_fp16.engine`:
 ```bash
 PYTHONUTF8=1 python remaster/encode_nvencc.py "input.mkv" "output.mkv"   # single file
 PYTHONUTF8=1 python remaster/encode_nvencc.py input_dir/ output_dir/      # batch (whole dir)
+PYTHONUTF8=1 python remaster/encode_nvencc.py in.mkv preview.mkv --trim 28800 300
 ```
+A missing engine is now built automatically on first use (rounded up to a
+multiple of 8), so a new resolution costs ~2 min once instead of erroring out.
+`--trim START LENGTH` is the correct way to spot-check a segment — see the
+`--seek` gotcha below.
 **Engines are static-shape — `remaster/vs_remaster.py` picks one by source resolution.**
 All three .vpy scripts (encode_nvencc, encode, play) share that module; it looks for
 `checkpoints/drunet_student/drunet_student_{W}x{H}_fp16.engine` matching the source

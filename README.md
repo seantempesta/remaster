@@ -89,11 +89,10 @@ mkdir -p checkpoints/drunet_student
 wget https://huggingface.co/seantempesta/remaster-drunet/resolve/main/drunet_student.onnx \
     -O checkpoints/drunet_student/drunet_student.onnx
 
-# Build TensorRT engine for your GPU (one-time)
-trtexec --onnx=checkpoints/drunet_student/drunet_student.onnx \
-    --shapes=input:1x3x1080x1920 --fp16 --useCudaGraph \
-    --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw \
-    --saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine
+# Build a TensorRT engine for your GPU (one-time per resolution).
+# Engines are static-shape; this reads the size straight off a video file.
+python tools/build_trt_engine.py --from-video /path/to/input.mkv
+python tools/build_trt_engine.py --list      # what's built already
 
 # Build the C++ pipeline
 cd pipeline_cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
@@ -102,6 +101,19 @@ cd pipeline_cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build bu
 ./build/remaster_pipeline -i input.mkv -o output.mkv \
     -e ../checkpoints/drunet_student/drunet_student_1080p_fp16.engine --cq 20
 ```
+
+If you'd rather skip the C++ build, the VapourSynth path needs no compiler and
+builds any missing engine for you on first use:
+
+```bash
+python remaster/encode_nvencc.py input.mkv output.mkv
+python remaster/encode_nvencc.py season1/ season1-enhanced/     # whole directory
+python remaster/encode_nvencc.py input.mkv preview.mkv --trim 28800 300
+```
+
+`--trim START LENGTH` encodes a short segment for a quick look at the result.
+Use it rather than NVEncC's `--seek`, which is silently ignored for `.vpy`
+input and quietly gives you the first frames of the file instead.
 
 There's also a Python pipeline (24 fps, no C++ or TensorRT needed):
 
@@ -119,8 +131,15 @@ Measured on RTX 3060 Laptop GPU (6GB VRAM). All pipelines process 1080p 10-bit H
 |----------|-----|-------|
 | **Docker** | **53** | Easiest setup. One command. |
 | C++ bare metal | 55 | Maximum speed. Requires build toolchain. |
-| NVEncC + VapourSynth | 39 | For VapourSynth users. |
+| NVEncC + VapourSynth | 47 | For VapourSynth users. No build step. |
 | Python + torch.compile | 24 | No TensorRT needed. Pure Python. |
+
+TensorRT engines are static-shape, so each source resolution gets its own —
+built automatically on first use and cached. Letterboxed films are meaningfully
+cheaper than full-frame 1080p: a 1920x816 movie runs ~55 fps, versus ~43 fps if
+its 816 lines are padded up to 1080. Measured over a full 102-minute feature
+(146,877 frames), sharing the GPU with video playback, the NVEncC path held
+46.8 fps end to end.
 
 ## Not AI Slop
 

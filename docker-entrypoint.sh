@@ -40,12 +40,18 @@ get_or_build_engine() {
     local width=$1 height=$2
     local pad_w=$(pad_to_8 "$width")
     local pad_h=$(pad_to_8 "$height")
-    local engine="${ENGINE_DIR}/drunet_${pad_h}p_fp16.engine"
+    # Key the cache on BOTH dimensions. Keying on height alone collides:
+    # 1920x1080 and 1440x1080 would share an engine, and the second video
+    # silently gets one built for the wrong width.
+    local engine="${ENGINE_DIR}/drunet_student_${pad_w}x${pad_h}_fp16.engine"
 
     if [[ -f "$engine" ]]; then
         log "Engine cached: ${pad_w}x${pad_h}"
     else
         log "Building TRT engine for ${pad_w}x${pad_h} (one-time, ~2 min)..."
+        # Keep the full log next to the engine -- when a build fails this is the
+        # only record of why, and it is gone if the container exits.
+        local build_log="${engine%.engine}.build.log"
         trtexec \
             --onnx="$ONNX_PATH" \
             --shapes=input:1x3x${pad_h}x${pad_w} \
@@ -54,9 +60,13 @@ get_or_build_engine() {
             --outputIOFormats=fp16:chw \
             --useCudaGraph \
             --saveEngine="$engine" \
-            > /dev/null 2>&1
+            > "$build_log" 2>&1 || true
 
-        [[ -f "$engine" ]] || die "Engine build failed. Run with --entrypoint bash to debug."
+        if [[ ! -f "$engine" ]]; then
+            log "--- last 20 lines of $build_log ---"
+            tail -20 "$build_log" >&2 || true
+            die "Engine build failed for ${pad_w}x${pad_h}. Full log: $build_log"
+        fi
         log "Engine built and cached: $engine"
     fi
     echo "$engine"

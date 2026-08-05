@@ -40,11 +40,19 @@ def probe_resolution(video_path):
     return int(m.group(1)), int(m.group(2))
 
 
+def round_up(n, factor=PAD_FACTOR):
+    """Round a dimension up to a multiple of factor.
+
+    remaster/vs_remaster.py resolves engine filenames with the same rounding,
+    so the two must stay in agreement or a built engine is never found again.
+    """
+    return -(-n // factor) * factor
+
+
 def build(width, height, force=False):
     if width % PAD_FACTOR or height % PAD_FACTOR:
         # The .vpy edge-replicate pads up to the engine shape, so round up here.
-        width = -(-width // PAD_FACTOR) * PAD_FACTOR
-        height = -(-height // PAD_FACTOR) * PAD_FACTOR
+        width, height = round_up(width), round_up(height)
         print(f"Rounded up to a multiple of {PAD_FACTOR}: {width}x{height}")
 
     engine = ENGINE_DIR / f"drunet_student_{width}x{height}_fp16.engine"

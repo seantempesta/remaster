@@ -12,9 +12,11 @@ Usage:
 Or use remaster/encode_nvencc.py for a convenient wrapper.
 
 Environment:
-  REMASTER_INPUT   (required) source video path
-  REMASTER_ENGINE  (optional) TRT engine to use, overriding auto-selection
-  REMASTER_DIR     (optional) path to this directory, if __file__ is unavailable
+  REMASTER_INPUT         (required) source video path
+  REMASTER_ENGINE        (optional) TRT engine to use, overriding auto-selection
+  REMASTER_DIR           (optional) path to this directory, if __file__ is unavailable
+  REMASTER_TRIM_START    (optional) first frame to encode
+  REMASTER_TRIM_LENGTH   (optional) how many frames to encode from there
 """
 import os
 import sys
@@ -62,6 +64,16 @@ if not source_loaded:
 
 if not source_loaded:
     raise RuntimeError("No source filter available (L-SMASH-Works or BestSource)")
+
+# ---------------------------------------------------------------------------
+# Optional trim, for spot checks. This has to happen in the script: NVEncC's
+# --seek is silently ignored with --vpy input, so it would encode from frame 0.
+# ---------------------------------------------------------------------------
+trim_start = os.environ.get("REMASTER_TRIM_START")
+if trim_start:
+    length = int(os.environ.get("REMASTER_TRIM_LENGTH", "300"))
+    start = min(int(trim_start), max(0, clip.num_frames - 1))
+    clip = core.std.Trim(clip, first=start, length=min(length, clip.num_frames - start))
 
 # ---------------------------------------------------------------------------
 # Inference + output (NVEncC handles the YUV -> HEVC encode)
