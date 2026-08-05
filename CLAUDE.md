@@ -78,6 +78,8 @@ the quality of the original Bluray source material.
 ### Deployment
 - `remaster/encode_nvencc.py` — **Fastest encoder**: NVEncC + VapourSynth in-process (~36 fps)
 - `remaster/encode_nvencc.vpy` — VapourSynth script for NVEncC (TRT inference, no pipe)
+- `remaster/vs_remaster.py` — shared vpy logic: engine selection by resolution, IO precision, replicate padding
+- `tools/build_trt_engine.py` — build a per-resolution FP16 engine (`--from-video` / `--width/--height` / `--list`)
 - `remaster/encode.py` — VapourSynth + ffmpeg pipe encoder (~20 fps, audio passthrough)
 - `remaster/encode.vpy` — VapourSynth batch encoding (BestSource + TRT engine + y4m)
 - `remaster/play.vpy` — VapourSynth real-time playback for mpv (TRT engine)
@@ -174,6 +176,38 @@ modal run cloud/modal_train.py --arch drunet --nc-list 16,32,64,128 --nb 2 \
 **Data upload:** `--skip-upload` is now the default. Training data persists on the Modal volume between runs. Pass `--no-skip-upload` only if you changed the training data (rebuilt pairs, added new sources, etc.).
 
 ### Deployment Pipeline (Production)
+
+**FASTEST AVAILABLE PATH RIGHT NOW = NVEncC (~40-43 fps).** The C++ pipeline is
+faster (~57 fps) but `pipeline_cpp/build/` was deleted in the disk cleanup, so it
+needs a full VS Build Tools + CUDA + CMake + TRT recompile before it can run. Unless
+you need the last ~15 fps, prefer NVEncC — it has zero build step and reuses the
+prebuilt `drunet_student_1080p_fp16.engine`:
+```bash
+PYTHONUTF8=1 python remaster/encode_nvencc.py "input.mkv" "output.mkv"   # single file
+PYTHONUTF8=1 python remaster/encode_nvencc.py input_dir/ output_dir/      # batch (whole dir)
+```
+**Engines are static-shape — `remaster/vs_remaster.py` picks one by source resolution.**
+All three .vpy scripts (encode_nvencc, encode, play) share that module; it looks for
+`checkpoints/drunet_student/drunet_student_{W}x{H}_fp16.engine` matching the source
+exactly, else falls back to the 1080p engine with edge-replicate padding.
+`REMASTER_ENGINE` (or `--engine` / `-a engine=`) overrides. It also derives the clip
+format from the engine's IO precision (`_fp16` -> `RGBH`, otherwise `RGBS`), so
+swapping engines can't reintroduce the bits-per-sample mismatch below.
+
+Native-resolution engines are meaningfully faster — a letterboxed 1920x816 source
+runs ~55 fps native vs ~43 fps padded up to 1080p. Build one per new resolution:
+```bash
+python tools/build_trt_engine.py --from-video "E:/plex/movies/some movie.mkv"
+```
+`--width/--height` and `--list` also work. Built so far: `1080p`, `1920x816`.
+Logic is covered by `pytest tests/test_engine_selection.py` (no GPU needed).
+
+For an *ordered subset* of a partially-downloaded season (don't let a dir batch touch
+0-byte / still-downloading files), loop over the specific complete files instead of
+passing a directory. Run episodes **sequentially, never in parallel** (6GB VRAM /
+16GB RAM fits exactly one encode). Verified 2026-06-20 on Rome S01 (HEVC 10-bit BluRay)
+at ~43 fps, GPU ~85%.
+
 ```bash
 # Export ONNX (one-time, dynamo=False required for TRT compat)
 python tools/export_onnx.py                    # FP16 ONNX (for FP16 engine)
@@ -203,6 +237,14 @@ python pipelines/remaster.py -i input.mkv -c checkpoints/drunet_student/final.pt
 
 # Real-time playback: configure mpv with remaster/play.vpy
 ```
+
+### Remaster Library Status (what's been processed)
+Source library lives at `E:/plex/tv/`. Remastered outputs:
+- **24 S02E01** — DONE 2026-05-25 (`E:/plex/tv/24_S02E01_remastered.mkv`, 3.8GB). 8-bit H.264 source. (Only episode of 24 in the library.)
+- **Galaxy Quest (1999)** — processing 2026-08-04 -> `E:/plex/movies/Galaxy Quest ... BONE (AI Remastered).mkv`. 1920x816 HEVC 8-bit BluRay, 102 min. ~55 fps via a purpose-built 1920x816 FP16 engine (~45 min encode). Audio + both subtitle tracks passed through.
+- **Rome S01E01-E03** — processing 2026-06-20 via NVEncC -> `E:/plex/tv/Rome (2005) Remastered/Season 1/`. HEVC 10-bit BluRay source under the `Rome (2005) Season 1-2 ... afm72` folder. E04+ were still downloading at the time. Launched via `run_rome.sh` (sequential, one at a time).
+
+Note: full-resolution remastered episodes are large (~3-4GB each) — they live on E:, not committed.
 
 ### INT8 Mixed-Precision Engine
 ```bash
@@ -297,6 +339,10 @@ Project: `remaster` (entity: `seantempesta`). All training runs log to W&B autom
 **PyNvVideoCodec:** Installed (v2.1.0). Zero-copy NVDEC decode to CUDA tensors via `torch.from_dlpack()`. NVENC encode from GPU. Needs `os.add_dll_directory()` for PyTorch CUDA DLLs on Windows. RTX 3060 NVDEC cannot decode H264 High 10 (10-bit) — use HEVC sources. **Stream isolation:** pass `cuda_stream=stream.cuda_stream` to SimpleDecoder and `cudastream=stream.cuda_stream` to CreateEncoder to prevent their internal syncs from blocking other streams.
 
 **ONNX export (PyTorch 2.11):** Must use `dynamo=False` — the default dynamo exporter produces opset 20 IR that TRT miscompiles (14.5 dB). Legacy TorchScript exporter (opset 17) works correctly. Also, dynamo saves weights as external `.data` files that must be merged inline. See `tools/export_onnx.py`.
+
+**vs-mlrt `core.trt.Model` clip precision MUST match the engine input dtype.** The FP16 engine is built with `--inputIOFormats=fp16:chw`, so `encode_nvencc.vpy` must feed the clip as `vs.RGBH` (16-bit half), NOT `vs.RGBS` (32-bit float) — otherwise it fails at runtime with `vapoursynth.Error: operator (): bits per sample mismatch`. (An FP32/INT8-with-fp32-IO engine would want `RGBS`.) This is independent of source bit depth — the resize to RGB happens before inference. Fixed in `encode_nvencc.vpy` 2026-06-20; 2026-08-04 the format is derived from the engine's IO precision in `remaster/vs_remaster.py` (`engine_format()`), so swapping engines can't reintroduce it.
+
+**Source bit depth:** 8-bit H.264 (e.g. DSNP WEB-DL) and 10-bit HEVC BluRay both work — the vpy converts to RGB float before inference, so the model is bit-depth agnostic. NVEncC re-encodes to 10-bit HEVC (`main10`) regardless. Caveat still applies: RTX 3060 NVDEC cannot decode **H.264 High 10** (10-bit AVC) — those need software decode or an HEVC source.
 
 ## Modal Development Guidelines
 

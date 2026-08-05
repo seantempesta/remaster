@@ -16,17 +16,27 @@ Arguments (via vspipe -a):
   hwdecode  (optional)  Hardware decode device: "cuda", "d3d11va", "" for CPU.
                          Default: "" (CPU -- most compatible)
 
-Engine build (one-time, run before first encode):
-  tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe \
-    --onnx=checkpoints/drunet_student/drunet_student.onnx \
-    --shapes=input:1x3x1080x1920 --fp16 \
-    --saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine
+Engines are picked by source resolution; build one for a new resolution with
+  python tools/build_trt_engine.py --width 1920 --height 1080
 """
-import vapoursynth as vs
 import os
 import sys
 
+import vapoursynth as vs
+
 core = vs.core
+
+
+def _remaster_dir():
+    d = os.environ.get("REMASTER_DIR")
+    if d:
+        return d
+    d = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd()
+    return d if os.path.exists(os.path.join(d, "vs_remaster.py")) else os.path.join(d, "remaster")
+
+
+sys.path.insert(0, _remaster_dir())
+import vs_remaster as vsr  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Arguments from vspipe -a "key=value"
@@ -37,34 +47,8 @@ if input_path is None:
 
 hwdecode = globals().get("hwdecode", "")
 engine_override = globals().get("engine", None)
-
-# ---------------------------------------------------------------------------
-# Resolve paths
-# ---------------------------------------------------------------------------
-SCRIPT_DIR = os.getcwd()
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-
-# Auto-detect engine: prefer DRUNet student, fall back to NAFNet
 if engine_override:
-    ENGINE_PATH = engine_override
-else:
-    candidates = [
-        os.path.join(PROJECT_ROOT, "checkpoints", "drunet_student",
-                     "drunet_student_1080p_fp16.engine"),
-    ]
-    ENGINE_PATH = None
-    for c in candidates:
-        if os.path.exists(c):
-            ENGINE_PATH = c
-            break
-    if ENGINE_PATH is None:
-        raise FileNotFoundError(
-            "No TRT engine found. Build one with:\n"
-            '  tools/vs/vs-plugins/vsmlrt-cuda/trtexec.exe '
-            '--onnx=checkpoints/drunet_student/drunet_student.onnx '
-            '--shapes=input:1x3x1080x1920 --fp16 '
-            '--saveEngine=checkpoints/drunet_student/drunet_student_1080p_fp16.engine'
-        )
+    os.environ["REMASTER_ENGINE"] = engine_override
 
 # ---------------------------------------------------------------------------
 # Source: decode any format via BestSource, L-SMASH-Works, or ffms2
@@ -102,47 +86,10 @@ if not source_loaded:
     )
 
 # ---------------------------------------------------------------------------
-# Color space: convert to RGBS (float32 planar RGB) for model input
+# Inference + output
 # ---------------------------------------------------------------------------
-orig_w = clip.width
-orig_h = clip.height
-
-# Detect color matrix from resolution (709 for HD, 470bg for SD)
-matrix = "709" if orig_h > 576 else "470bg"
-
-clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s=matrix)
-
-# ---------------------------------------------------------------------------
-# Pad to model input size (DRUNet: multiple of 8)
-# ---------------------------------------------------------------------------
-PAD_FACTOR = 8
-TARGET_H = ((orig_h + PAD_FACTOR - 1) // PAD_FACTOR) * PAD_FACTOR
-TARGET_W = ((orig_w + PAD_FACTOR - 1) // PAD_FACTOR) * PAD_FACTOR
-
-pad_h = TARGET_H - orig_h
-pad_w = TARGET_W - orig_w
-
-if pad_h > 0 or pad_w > 0:
-    clip = core.std.AddBorders(clip, right=pad_w, bottom=pad_h)
-
-# ---------------------------------------------------------------------------
-# Inference: pre-built TRT engine via core.trt.Model
-# ---------------------------------------------------------------------------
-clip = core.trt.Model(
-    clip,
-    engine_path=ENGINE_PATH,
-    device_id=0,
-    num_streams=4,
-    use_cuda_graph=True,
-    tilesize=[TARGET_W, TARGET_H],
-    overlap=[0, 0],
-)
-
-# ---------------------------------------------------------------------------
-# Crop padding and convert back to YUV for encoding
-# ---------------------------------------------------------------------------
-if pad_h > 0 or pad_w > 0:
-    clip = core.std.Crop(clip, right=pad_w, bottom=pad_h)
+matrix = vsr.matrix_for(clip)
+clip = vsr.enhance(clip, num_streams=4)
 
 # 10-bit YUV420 output -- preserves quality for HEVC encoding
 clip = core.resize.Bicubic(clip, format=vs.YUV420P10, matrix_s=matrix)

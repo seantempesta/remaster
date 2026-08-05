@@ -24,7 +24,7 @@ ENCODE_VPY = str(PROJECT_ROOT / "remaster" / "encode_nvencc.vpy")
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".m2ts", ".webm", ".mov"}
 
 
-def encode_file(input_path, output_path, cq=18, preset="p4"):
+def encode_file(input_path, output_path, cq=18, preset="p4", engine=None):
     """Encode a single file with NVEncC + VapourSynth TRT."""
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
@@ -32,6 +32,11 @@ def encode_file(input_path, output_path, cq=18, preset="p4"):
 
     env = os.environ.copy()
     env["REMASTER_INPUT"] = input_path
+    # NVEncC evaluates the .vpy with its own cwd, so tell it where to import
+    # vs_remaster.py from rather than relying on __file__/cwd guesswork.
+    env["REMASTER_DIR"] = str(PROJECT_ROOT / "remaster")
+    if engine:
+        env["REMASTER_ENGINE"] = os.path.abspath(engine)
     env["PATH"] = VS_DIR + os.pathsep + env.get("PATH", "")
 
     cmd = [
@@ -45,6 +50,7 @@ def encode_file(input_path, output_path, cq=18, preset="p4"):
         "--preset", preset,
         "--vbr-quality", str(cq),
         "--audio-source", f"{input_path}:copy",  # copy audio from original
+        "--sub-source", f"{input_path}",         # carry subtitle tracks through
         "--colormatrix", "bt709",
         "--colorprim", "bt709",
         "--transfer", "bt709",
@@ -82,6 +88,9 @@ def main():
                         help="Constant quality (default: 18)")
     parser.add_argument("--preset", default="p4",
                         help="NVENC preset: p1-p7 (default: p4)")
+    parser.add_argument("--engine",
+                        help="TRT engine to use (default: auto-select by source "
+                             "resolution, see remaster/vs_remaster.py)")
     args = parser.parse_args()
 
     if not os.path.exists(NVENCC):
@@ -102,11 +111,12 @@ def main():
                 ok += 1
                 continue
             print(f"\n[{i}/{len(files)}]")
-            if encode_file(os.path.join(args.input, f), out_path, args.cq, args.preset):
+            if encode_file(os.path.join(args.input, f), out_path,
+                           args.cq, args.preset, args.engine):
                 ok += 1
         print(f"\nBatch: {ok}/{len(files)} succeeded")
     else:
-        if not encode_file(args.input, args.output, args.cq, args.preset):
+        if not encode_file(args.input, args.output, args.cq, args.preset, args.engine):
             sys.exit(1)
 
 
